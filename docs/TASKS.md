@@ -49,7 +49,7 @@
 | N4 | native 单元测试框架 | N/Q | N3 | 2 | GoogleTest 接入，宿主机 clang 构建目标，`scripts/run-native-tests.sh` | `npm`/`hvigor` 之外可独立跑 native 测试；CI 可调用 |
 | X3 | CI 流水线骨架 | Q | X1,N4 | 2 | GitHub Actions / 本地脚本：lint + native test + ArkTS test + assembleHap | 一条命令跑完全部门禁并输出报告 |
 | X4 | 日志与错误映射基础设施 | X | X1,X5 | 1 | `common/Logger.ets`（读 `BuildProfile.LOG_*`，脱敏、5 MiB×3 轮转）、`common/SshError.ets` 中文错误码表 | 日志文件轮转生效；抽样确认无密码/token/私钥字样 |
-| X5 | 构建期配置与明文 HTTP 放行 | X | X1 | 1 | `build-profile.json5` 的 `buildProfileFields`（debug/release 两套）；`AppScope/app.json5` 的 `app.network.securityConfig.domainSettings` 定向放行 `123.161.179.32` | `import BuildProfile from 'BuildProfile'` 能读到 `SYNC_API_URL`；真机能成功请求 `http://123.161.179.32:46926/api/v1`；`cleartextTraffic` 保持 `false`；解包 HAP 确认无服务端密钥 |
+| X5 | 构建期配置与明文 HTTP 放行 | X | X1 | 1 | `build-profile.json5` 的 `buildProfileFields`（debug/release 两套）；`AppScope/app.json5` 明文放行经实测改用 API 20+ 的 `resources/base/profile/network_config.json`（domain-config 定向放行 `123.161.179.32`，全局 cleartext 保持禁止；详见 DESIGN §6.5.2） | `import BuildProfile from 'BuildProfile'` 能读到 `SYNC_API_URL`；真机能成功请求 `http://123.161.179.32:46926/api/v1`；`cleartextTraffic` 保持 `false`；解包 HAP 确认无服务端密钥 |
 
 > **N1 原本是全项目最大的不确定点，现已实测排除。** OpenSSL 3.5.7 交叉编译到 `aarch64-linux-ohos`
 > 零错误零补丁通过，可复现配方见 DESIGN §3.7。本任务从 3 人日降为 1 人日（照配方脚本化 + 补 x86_64 ABI）。
