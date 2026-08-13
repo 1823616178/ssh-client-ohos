@@ -706,31 +706,31 @@ HarmonyOS 的等价机制是 hvigor 的 `buildProfileFields`——在 `entry/bui
 
 #### 6.5.2 ⚠️ HarmonyOS 默认禁止明文 HTTP，必须显式声明
 
-这是桌面端不存在、鸿蒙特有的一道坎。已在本机 SDK 的
-`toolchains/configcheck/configSchema_rich.json` 中核实：`app.json5` 支持 `app.network` 节点，
-含 `cleartextTraffic`（布尔）与 `securityConfig.domainSettings`。不声明的话，
-指向 `http://123.161.179.32:46926` 的请求会被系统直接拦掉。
+这是桌面端不存在、鸿蒙特有的一道坎。**机制更正（X5 实施时实测修正）**：
+最初核实的 `app.json5` 的 `app.network` 节点在本机 hvigor 6.1.1（SDK 6.1.1 / API 24）的构建期 schema
+（`toolchains/modulecheck/app.json`）中并不存在，写入会在 PreBuild 阶段直接报 Schema 校验错误；
+`configcheck/configSchema_rich.json` 里的 `network` 实际挂在 FA 模型遗留的 `deviceConfig` 下，与 Stage 模型无关。
+本项目目标平台（API 23/24）的正确机制是 **API 20+ 引入的 `network_config.json`**
+（见官方《使用HTTP访问网络》「明文HTTP访问权限配置说明」，优先级：component-config > domain-config > base-config）。
 
-**不要用 `cleartextTraffic: true` 全局放开**——那等于给整个应用开明文，包括将来任何第三方 SDK。
-用 `domainSettings` 只对这一个地址开口子：
+**不要用 `base-config.cleartextTrafficPermitted: true` 全局放开**——那等于给整个应用开明文，包括将来任何第三方 SDK。
+用 `domain-config` 只对这一个地址开口子：
 
-```json5
-// AppScope/app.json5
+```json
+// entry/src/main/resources/base/profile/network_config.json（固定路径，自动生效，无需在 module.json5 引用）
 {
-  "app": {
-    "bundleName": "com.jekaku.sshclient",
-    // ...
-    "network": {
-      "cleartextTraffic": false,
-      "securityConfig": {
-        "domainSettings": {
-          "cleartextPermitted": true,
-          "domains": [
-            { "subdomains": false, "name": "123.161.179.32" }
-          ]
-        }
+  "network-security-config": {
+    "base-config": {
+      "cleartextTrafficPermitted": false
+    },
+    "domain-config": [
+      {
+        "domains": [
+          { "include-subdomains": false, "name": "123.161.179.32" }
+        ],
+        "cleartextTrafficPermitted": true
       }
-    }
+    ]
   }
 }
 ```

@@ -9,8 +9,29 @@
   },
   "buildOptionSet": [
     {
+      "name": "debug",
+      "arkOptions": {
+        // 构建期注入的公开配置（DESIGN §6.5.1）：只放非敏感项，HAP 可解包，值即为明文常量
+        "buildProfileFields": {
+          "SYNC_API_URL": "http://123.161.179.32:46926",
+          "LOG_LEVEL": "debug",
+          "LOG_TO_FILE": true,
+          "LOG_MAX_BYTES": 5242880,
+          "LOG_MAX_FILES": 3
+        }
+      }
+    },
+    {
       "name": "release",
       "arkOptions": {
+        // release 与 debug 仅日志级别不同（DESIGN §6.5.1）
+        "buildProfileFields": {
+          "SYNC_API_URL": "http://123.161.179.32:46926",
+          "LOG_LEVEL": "info",
+          "LOG_TO_FILE": true,
+          "LOG_MAX_BYTES": 5242880,
+          "LOG_MAX_FILES": 3
+        },
         "obfuscation": {
           "ruleOptions": {
             "enable": false,
@@ -21,6 +42,27 @@
         }
       }
     },
+  ],
+  // 显式绑定构建模式与配置组：debug 模式用 debug 组，release 模式用 release 组
+  "buildModeBinder": [
+    {
+      "buildModeName": "debug",
+      "mappings": [
+        {
+          "targetName": "default",
+          "buildOptionName": "debug"
+        }
+      ]
+    },
+    {
+      "buildModeName": "release",
+      "mappings": [
+        {
+          "targetName": "default",
+          "buildOptionName": "release"
+        }
+      ]
+    }
   ],
   "targets": [
     {

@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "com.example.ssh_client_ohos",
+    "bundleName": "com.jekaku.sshclient",
     "vendor": "example",
     "versionCode": 1000000,
     "versionName": "1.0.0",
