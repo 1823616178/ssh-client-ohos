@@ -1,0 +1,19 @@
+/node_modules
+oh_modules/
+local.properties
+.idea/
+**/build
+.hvigor/
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# 原生静态库产物与实验探测目录（X1）
+*.a
+.probe/
+prebuilt/
+!**/prebuilt/
+!**/prebuilt/.gitkeep
