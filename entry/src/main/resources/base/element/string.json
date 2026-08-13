@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "SSH 终端客户端"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "SSH 终端客户端"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "SSH 客户端"
     }
   ]
 }

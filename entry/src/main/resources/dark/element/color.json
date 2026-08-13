@@ -3,6 +3,50 @@
     {
       "name": "start_window_background",
       "value": "#000000"
+    },
+    {
+      "name": "app_bg",
+      "value": "#0E131D"
+    },
+    {
+      "name": "app_surface",
+      "value": "#151C2A"
+    },
+    {
+      "name": "app_surface_hover",
+      "value": "#1E2839"
+    },
+    {
+      "name": "app_border",
+      "value": "#26314A"
+    },
+    {
+      "name": "app_text",
+      "value": "#E8EEFB"
+    },
+    {
+      "name": "app_text_dim",
+      "value": "#9AA7C0"
+    },
+    {
+      "name": "app_text_faint",
+      "value": "#6B7891"
+    },
+    {
+      "name": "app_accent",
+      "value": "#4D8DFF"
+    },
+    {
+      "name": "app_success",
+      "value": "#34C77B"
+    },
+    {
+      "name": "app_warn",
+      "value": "#F5A524"
+    },
+    {
+      "name": "app_danger",
+      "value": "#F4605F"
     }
   ]
 }
