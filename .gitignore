@@ -12,8 +12,8 @@ local.properties
 /.appanalyzer
 
 # 原生静态库产物与实验探测目录（X1）
+# prebuilt/ 下的内容全部忽略（.a / 头文件都是构建产物），只保留目录占位 .gitkeep
 *.a
 .probe/
-prebuilt/
-!**/prebuilt/
+**/prebuilt/*
 !**/prebuilt/.gitkeep
