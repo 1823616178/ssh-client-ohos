@@ -4,6 +4,8 @@ import modelTest from './Model.test';
 import settingsRepositoryTest from './SettingsRepository.test';
 import sshErrorTest from './SshError.test';
 import sshTerminalTest from './SshTerminal.test';
+import terminalRenderTest from './TerminalRender.test';
+import frameSchedulerTest from './FrameScheduler.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -12,4 +14,6 @@ export default function testsuite() {
   settingsRepositoryTest();
   sshErrorTest();
   sshTerminalTest();
+  terminalRenderTest();
+  frameSchedulerTest();
 }
