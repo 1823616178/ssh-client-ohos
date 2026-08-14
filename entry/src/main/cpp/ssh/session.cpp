@@ -287,8 +287,17 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
             } else {
                 peerLost(SshSessionError::kDisconnectedByPeer, "对端关闭连接");
             }
+            return;
         }
-        // 本态未注册 EPOLLIN，不会有可读事件进来（认证读包是 N8 的事）
+        // N8：认证类操作进行中时按 libssh2 声明的阻塞方向挂了 EPOLLIN/OUT
+        // （见 updateFdInterest），事件到来即续跑驱动；established 态的通道读写是 N10 的事
+        if (state() == SshSessionState::kAuthenticating) {
+            if (authMethodsCallback_) {
+                driveAuthMethodsQuery();
+            } else if (authOp_) {
+                driveAuth();
+            }
+        }
         return;
     case SshSessionState::kClosing:
         if ((events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
@@ -317,7 +326,9 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
 
 void SshSession::beginHandshake()
 {
-    session_ = ::libssh2_session_init_ex(nullptr, nullptr, nullptr, nullptr);
+    // abstract 传 this：N8 keyboard-interactive 认证的 libssh2 C 回调
+    // （kbdIntResponseCb，auth.cpp）经它找回会话实例
+    session_ = ::libssh2_session_init_ex(nullptr, nullptr, nullptr, this);
     if (session_ == nullptr) {
         failWith(SshSessionError::kInternal, "libssh2_session_init 失败");
         return;
@@ -352,7 +363,7 @@ void SshSession::driveHandshake()
         if (!verifyHostKey()) {
             return;
         }
-        transitionTo(SshSessionState::kAuthenticating); // N6 边界：待认证
+        transitionTo(SshSessionState::kAuthenticating); // 握手完成、待认证（N8 认证入口）
         updateFdInterest();
         return;
     }
@@ -503,8 +514,24 @@ void SshSession::updateFdInterest()
     case SshSessionState::kClosing:
         mask |= EPOLLOUT; // disconnect 报文待冲刷
         break;
+    case SshSessionState::kAuthenticating:
+        // N8：认证类操作进行中时按 libssh2 声明的阻塞方向挂事件；
+        // 无操作时只留 RDHUP 做断线检测（与 established 相同）
+        if (hasAuthPending()) {
+            const int dirs = ::libssh2_session_block_directions(session_);
+            if ((dirs & LIBSSH2_SESSION_BLOCK_INBOUND) != 0) {
+                mask |= EPOLLIN;
+            }
+            if ((dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND) != 0) {
+                mask |= EPOLLOUT;
+            }
+            if ((dirs & (LIBSSH2_SESSION_BLOCK_INBOUND | LIBSSH2_SESSION_BLOCK_OUTBOUND)) == 0) {
+                mask |= EPOLLIN; // 防御：方向未知时监听可读，事件来了再驱动一次
+            }
+        }
+        break;
     default:
-        break; // authenticating/established：只留 RDHUP 做断线检测
+        break; // established：只留 RDHUP 做断线检测
     }
     thread_.loop().modifyFd(fd_, mask);
 }
@@ -550,6 +577,9 @@ void SshSession::peerLost(SshSessionError error, const std::string &message)
 void SshSession::releaseResources()
 {
     cancelTimers();
+    // N8：先清认证状态——摘认证定时器并清零内存中的凭据副本（auth.cpp）；
+    // 必须在 session_ 释放之前（认证上下文引用它）
+    clearAuthState();
     if (session_ != nullptr) {
         // libssh2_session_free 可能尝试冲刷剩余报文（仍会写 fd），先于 close 调用
         ::libssh2_session_free(session_);
@@ -609,6 +639,11 @@ const char *toString(SshSessionError error)
     case SshSessionError::kHandshakeFailed:   return "handshake_failed";
     case SshSessionError::kHandshakeTimeout:  return "handshake_timeout";
     case SshSessionError::kHostKeyMismatch:   return "host_key_mismatch";
+    case SshSessionError::kAuthFailedPassword:    return "auth_failed_password";
+    case SshSessionError::kAuthFailedKey:         return "auth_failed_key";
+    case SshSessionError::kAuthFailedPassphrase:  return "auth_failed_passphrase";
+    case SshSessionError::kAuthFailedInteractive: return "auth_failed_interactive";
+    case SshSessionError::kAuthTimeout:           return "auth_timeout";
     case SshSessionError::kDisconnectedByPeer: return "disconnected_by_peer";
     case SshSessionError::kSocketError:       return "socket_error";
     case SshSessionError::kInternal:          return "internal";

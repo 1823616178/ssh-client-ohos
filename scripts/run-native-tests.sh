@@ -112,12 +112,14 @@ case "$TARGET" in
   host)
     BUILD_DIR="$BUILD_ROOT/host"
     # N6：ssh/ 会话层单测需要宿主机版 libssh2（prebuilt/ 是 OHOS target，不能链）；
-    # 集成测试另需测试用 sshd。setup-host-deps.sh 幂等补齐两者，产物不进仓库。
+    # 集成测试另需测试用 sshd；N8 起还需认证测试环境（root 常驻 sshd + 测试用户，
+    # 无 root 时仅告警、认证用例 GTEST_SKIP）。setup-host-deps.sh 幂等（已就绪秒过），
+    # 每次运行前都过一遍，保证认证 sshd 挂掉能自愈；产物不进仓库。
     HOST_DEPS_ROOT="${HOST_DEPS_ROOT:-$HOME/ohos-probe/build/host-deps}"
     if [ ! -f "$HOST_DEPS_ROOT/libssh2/lib/libssh2.a" ]; then
-      log "宿主版 libssh2 缺失，运行 scripts/setup-host-deps.sh 补齐"
-      bash "$PROJECT_ROOT/scripts/setup-host-deps.sh"
+      log "宿主版 libssh2 缺失，setup-host-deps.sh 将补齐（首次较慢）"
     fi
+    bash "$PROJECT_ROOT/scripts/setup-host-deps.sh"
     HOST_LIBSSH2_CMAKE_ARGS=(-DSSH_TESTS_HOST_LIBSSH2="$HOST_DEPS_ROOT/libssh2")
     SAN_CMAKE_ARGS=()
     if [ -n "$SANITIZE" ]; then

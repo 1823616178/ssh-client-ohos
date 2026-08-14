@@ -14,6 +14,7 @@ set(NATIVE_SOURCES
     # ssh/
     ssh/session.cpp
     ssh/hostkey.cpp
+    ssh/auth.cpp
     # term/
     # crypto/
     crypto/aad.cpp

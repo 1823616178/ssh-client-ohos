@@ -4,17 +4,21 @@
  * 状态机（终态：kClosed / kDisconnected / kError）：
  *
  *     idle → connecting(tcp) → handshaking → authenticating → established
- *                ↓                 ↓    ↘         ↓              ↓
- *              error             error  (N7)  disconnected   disconnected
+ *                ↓                 ↓    ↘       ↓      ↓            ↓
+ *              error             error  (N7)  error  disconnected  disconnected
  *                ↓(close)          ↓     closing → closed（主机密钥被拒）
+ *                                （authenticating：认证失败停留可重试，超时/超限 → error）
  *                               （任意非终态 close → closing → closed）
  *
  *   - N7 主机密钥 TOFU 校验点：握手成功后、进入 authenticating 前
  *     （libssh2 握手完成后才能取主机密钥）。上层回调拒绝（指纹不匹配/用户否认）时
  *     不进入 authenticating，发 SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE 后走
  *     closing → closed 断开，错误码 kHostKeyMismatch 经 lastError() 可读；
- *   - authenticating 是「待认证」边界：N6 到此为止，密码/公钥认证是 N8；
- *   - established 由 N8 认证成功后进入，本任务仅保留状态位与迁移校验；
+ *   - N8 认证（密码/公钥/keyboard-interactive）：authenticate* / queryAuthMethods
+ *     在 authenticating 态受理，非阻塞驱动在循环线程续跑（EAGAIN 重挂 epoll）；
+ *     成功 → established；失败 → 停留 authenticating 允许重试（authMaxAttempts 上限），
+ *     细分错误码经 AuthCallback 与 lastError() 双通道回报。驱动实现独立在 auth.cpp，
+ *     纯逻辑辅助（错误映射/方式解析/抗优化清零）在 auth.h/cpp；
  *   - error 终态细分原因由 lastError() / lastErrorMessage() 提供
  *     （统一错误码体系是 N13，这里先用会话内枚举）。
  *
@@ -36,15 +40,21 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "../io/EventLoop.h"
 #include "hostkey.h"
 
-// 前向声明 libssh2 会话结构，避免把 <libssh2.h> 漏进公共头
+// 前向声明 libssh2 会话结构与 keyboard-interactive 回调结构，
+// 避免把 <libssh2.h> 漏进公共头
 // （tag 名与 libssh2 1.11.x 的 typedef 保持一致，pin 版本升级时需核对）
 struct _LIBSSH2_SESSION;
+struct _LIBSSH2_USERAUTH_KBDINT_PROMPT;
+struct _LIBSSH2_USERAUTH_KBDINT_RESPONSE;
 
 namespace sshclient {
 namespace io {
@@ -56,8 +66,8 @@ enum class SshSessionState {
     kIdle,
     kConnecting,     // TCP 非阻塞连接进行中
     kHandshaking,    // libssh2_session_handshake 驱动中（含算法协商）
-    kAuthenticating, // 握手完成、待认证（N6 边界；N8 在此之上做认证）
-    kEstablished,    // 认证成功（N8 才进入，本任务不到达）
+    kAuthenticating, // 握手完成、待认证（N8 认证在此驱动，成功后进 established）
+    kEstablished,    // 认证成功（N8 authenticate* 成功时进入）
     kClosing,        // 优雅关闭中（libssh2_session_disconnect 冲刷）
     kClosed,         // 终态：主动关闭完成
     kDisconnected,   // 终态：对端关闭 / 连接异常断开
@@ -73,6 +83,14 @@ enum class SshSessionError {
     kHandshakeTimeout,   // SSH 握手超时
     kHostKeyMismatch,    // N7：主机密钥被上层拒绝（指纹不匹配/首连未获信任）；
                          // 终态为 closed（closing → closed 主动断开），此码经 lastError() 读取
+    // ---- N8 认证错误：单次失败时经 AuthCallback 回报并同步到 lastError()（会话仍停
+    //      留 authenticating 供重试）；达到 authMaxAttempts / 认证超时后进 error 终态 ----
+    kAuthFailedPassword,    // 密码认证被拒（密码错误/用户不存在/密码过期）
+    kAuthFailedKey,         // 公钥被服务器拒绝（密钥未授权/签名未通过验证）
+    kAuthFailedPassphrase,  // 私钥本地加载/解密失败（短语错误、短语缺失或私钥无法解析；
+                            // 细分路径与 libssh2 1.11.1 的吞错行为见 auth.h mapAuthError 详注）
+    kAuthFailedInteractive, // keyboard-interactive 应答被服务器拒绝
+    kAuthTimeout,           // 单次认证尝试超时（authTimeoutMs，终态 error）
     kDisconnectedByPeer, // 对端关闭（FIN/RST）
     kSocketError,        // 底层 socket 错误
     kInternal,           // 内部错误（资源创建失败等）
@@ -82,6 +100,9 @@ struct SshSessionOptions {
     uint32_t connectTimeoutMs = 10000;    // TCP 连接超时
     uint32_t handshakeTimeoutMs = 15000;  // SSH 握手整体超时
     uint32_t closeFlushTimeoutMs = 2000;  // 优雅关闭时 disconnect 报文冲刷上限
+    uint32_t authTimeoutMs = 15000;       // N8：单次认证尝试超时（到时按终态 error 处理——
+                                          // 对端 15 s 不应答通常意味着链路异常，重试无益）
+    uint32_t authMaxAttempts = 3;         // N8：认证失败重试上限，达到后转 error 终态
 
     // N7 主机密钥 TOFU 决策回调（构造后不可变，无并发问题）：
     // 握手成功后、进入 authenticating 前在事件循环线程同步调用，须快速返回
@@ -90,6 +111,51 @@ struct SshSessionOptions {
     // 生产必须设置回调，与 ArkTS SQLite 的 known_hosts（DESIGN §5.1）比对后决策。
     HostKeyCallback hostKeyCallback;
 };
+
+// ---------------------------------------------------------------- N8 认证 API 类型
+
+// 认证方式枚举（顺序无协议含义，仅作标识）
+enum class AuthMethod {
+    kPassword,
+    kPublicKey,
+    kKeyboardInteractive,
+};
+
+// keyboard-interactive 服务端单条提示（RFC 4256）：text 为提示语原文
+// （如 "Password: "），echo 指示输入是否可回显
+struct KbdIntPrompt {
+    std::string text;
+    bool echo = false;
+};
+
+// keyboard-interactive 应答提供者：收到服务端提示列表，返回逐条应答
+// （条数不足时剩余按空串应答，通常导致认证失败）。
+// 在事件循环线程、libssh2 认证回调内同步调用，必须快速返回——2FA 弹窗属异步
+// 交互，上层应先集齐答案再发起认证，或在回调外完成交互后重试（与
+// HostKeyCallback 同一契约模式，不得阻塞事件循环）。
+using KbdIntResponseProvider =
+    std::function<std::vector<std::string>(const std::vector<KbdIntPrompt> &prompts)>;
+
+// 单次认证尝试的结果（AuthCallback 在事件循环线程触发，恰好一次）
+struct AuthResult {
+    AuthMethod method;
+    bool success = false;
+    SshSessionError error = SshSessionError::kNone; // 细分错误码；success 时 kNone
+    std::string message;      // libssh2 原始错误描述（诊断用）
+    unsigned attemptsLeft = 0; // 失败时的剩余可重试次数；0 = 已达上限，会话将进 error 终态
+};
+using AuthCallback = std::function<void(const AuthResult &result)>;
+
+// 服务端声明支持的认证方式（queryAuthMethods 的回报；解析逻辑见 auth.h parseAuthMethodList）
+struct AuthMethodSet {
+    bool password = false;
+    bool publicKey = false;
+    bool keyboardInteractive = false;
+    std::vector<std::string> unsupported; // 服务端声明但本端不识别的方式（hostbased 等）
+    std::string raw;                      // 服务端返回的原始逗号分隔串（诊断/日志用）
+};
+// nullopt = 探测失败（详情见 lastErrorMessage / 日志）
+using AuthMethodsCallback = std::function<void(std::optional<AuthMethodSet> methods)>;
 
 class SshSession {
 public:
@@ -120,6 +186,30 @@ public:
     // 尚未握手/连接失败返回 nullopt。
     std::optional<HostKeyInfo> hostKeyInfo() const;
 
+    // ---- N8 认证（任意线程调用；仅 kAuthenticating 态受理，否则返回 false）----
+    // 受理语义：凭据被立即复制进会话内部状态，调用方 buffer 随即被 secureZero
+    // 清零（「用完即清零」，此后不再被引用；公钥数据等非敏感参数除外——公钥本就会
+    // 出现在服务器 authorized_keys 里，无需清零）；返回 false（未受理）时 buffer
+    // 原样保留。内部凭据副本在尝试结束（成功/失败/超时/关闭）时同样清零。
+    // 结果经 callback 在事件循环线程回报恰好一次：成功 → 状态转 established；
+    // 失败 → 停留 authenticating 可再次调用重试，attemptsLeft 耗尽（authMaxAttempts）
+    // 或单次尝试超时（authTimeoutMs）→ 转 error 终态。
+    // 同一时刻只允许一个认证类操作（含 queryAuthMethods）在进行：并发受理返回 false。
+    bool authenticatePassword(std::string &password, AuthCallback callback);
+    // 私钥/短语从内存加载（libssh2_userauth_publickey_frommemory）。
+    // publicKeyData 为 .pub 公钥文件内容（"ssh-ed25519 AAAA..." 文本）；传空串时
+    // libssh2 自行从私钥提取公钥（OpenSSH 格式内嵌公钥）。两条路径下短语错误都
+    // 归一化为 kAuthFailedPassphrase（libssh2 1.11.1 两条路径的原始错误码不同且
+    // 都会吞掉真实的 KEYFILE_AUTH_FAILED，归一化逻辑见 auth.h mapAuthError 详注）；
+    // 推荐显式传入公钥数据：少一次私钥解密，错误语义更贴近真实原因。
+    // passphrase 为空串表示无私钥短语。
+    // 受理即复制三个 buffer 并清零 privateKeyData / passphrase（公钥非敏感，不清零）。
+    bool authenticatePublicKey(std::string &privateKeyData, std::string &publicKeyData,
+                               std::string &passphrase, AuthCallback callback);
+    bool authenticateKeyboardInteractive(KbdIntResponseProvider provider, AuthCallback callback);
+    // 探测服务端支持的认证方式（libssh2_userauth_list 非阻塞驱动；与认证尝试互斥）
+    bool queryAuthMethods(AuthMethodsCallback callback);
+
     // 迁移合法性表（静态纯函数，供单测直接校验状态机边界）
     static bool isLegalTransition(SshSessionState from, SshSessionState to);
 
@@ -138,6 +228,36 @@ private:
     void peerLost(SshSessionError error, const std::string &message); // 收尾 → disconnected
     void releaseResources(); // 摘 fd、关 socket、释放 libssh2 会话（循环线程）
     void cancelTimers();
+
+    // ---- N8 认证驱动（循环线程；实现在 auth.cpp，避免 session.cpp 臃肿）----
+    // 进行中的认证尝试：方式、凭据副本（受理时复制并清零调用方 buffer）、超时定时器。
+    // 析构在 auth.cpp 定义——secureZero 清零内存凭据（成功/失败/中止路径都经由此处）。
+    struct AuthOp {
+        AuthMethod method = AuthMethod::kPassword;
+        std::string password;            // kPassword 的密码副本
+        std::string privateKey;          // kPublicKey 的私钥字节副本
+        std::string publicKey;           // kPublicKey 的 .pub 公钥文本（可空=从私钥提取）
+        std::string passphrase;          // kPublicKey 的私钥短语副本（可空）
+        KbdIntResponseProvider provider; // kKeyboardInteractive 的应答提供者
+        AuthCallback callback;
+        io::EventLoop::TimerId timer = 0;
+        ~AuthOp();
+    };
+    void beginAuthOp();            // 受理装配：接管 authOpStaging_、挂超时、首驱
+    void driveAuth();              // 驱动当前认证尝试（EAGAIN 续跑，一次调用推进一步）
+    void beginAuthMethodsQuery(AuthMethodsCallback callback); // 受理装配方式探测
+    void driveAuthMethodsQuery();  // 驱动 userauth_list 探测
+    void finishAuthMethodsQuery(std::optional<AuthMethodSet> result); // 探测收尾回报
+    void clearAuthState();         // 摘认证定时器、清零内存凭据、释放受理位（幂等）
+    bool hasAuthPending() const { return authOp_ != nullptr || authMethodsCallback_ != nullptr; }
+    // keyboard-interactive 的 libssh2 C 回调桥：static 成员以满足 C 回调签名，
+    // 经 session abstract（beginHandshake 时传入 this）找回实例
+    static void kbdIntResponseCb(const char *name, int nameLen,
+                                 const char *instruction, int instructionLen, int numPrompts,
+                                 const _LIBSSH2_USERAUTH_KBDINT_PROMPT *prompts,
+                                 _LIBSSH2_USERAUTH_KBDINT_RESPONSE *responses, void **abstract);
+    void onKbdIntPrompts(int numPrompts, const _LIBSSH2_USERAUTH_KBDINT_PROMPT *prompts,
+                         _LIBSSH2_USERAUTH_KBDINT_RESPONSE *responses);
 
     io::SessionThread &thread_;
     SshSessionOptions options_;
@@ -172,6 +292,19 @@ private:
     // N7 主机密钥被拒时改写为 9（host key not verifiable）再进 closing。
     int disconnectReason_ = 11;
     std::string disconnectDesc_ = "client closing";
+
+    // ---- N8 认证状态 ----
+    // authOp_ / authMethodsCallback_ 仅事件循环线程访问；
+    // authBusy_ 是认证类操作的受理占位（任意线程 CAS，循环线程释放），
+    // 语义与 connectAdmitted_ 相同；authOpStaging_ 由受理线程在 post 前写入、
+    // 循环线程在 beginAuthOp 接管（happens-before 依据与 connect 参数相同，
+    // 且受理位的 release/acquire 链保证上一次操作的读取先于本次写入）
+    std::atomic<bool> authBusy_{false};
+    std::unique_ptr<AuthOp> authOpStaging_; // 受理线程 → 循环线程的交接槽
+    std::unique_ptr<AuthOp> authOp_;        // 进行中的认证尝试（EAGAIN 续跑上下文）
+    AuthMethodsCallback authMethodsCallback_; // 进行中的方式探测回调（与 authOp_ 互斥）
+    io::EventLoop::TimerId authMethodsTimer_ = 0;
+    unsigned authFailedAttempts_ = 0; // 已连续失败的认证次数（对照 options_.authMaxAttempts）
 };
 
 const char *toString(SshSessionState state);
