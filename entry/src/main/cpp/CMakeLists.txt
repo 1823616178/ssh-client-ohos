@@ -11,6 +11,8 @@ project(ssh_client_ohos CXX)
 set(NATIVE_SOURCES
     napi_init.cpp
     # bridge/
+    bridge/data_aggregator.cpp
+    bridge/session_bridge.cpp
     # ssh/
     ssh/session.cpp
     ssh/hostkey.cpp

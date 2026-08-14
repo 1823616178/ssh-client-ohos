@@ -5,9 +5,10 @@
 # 入口脚本是 scripts/run-native-tests.sh（检测/下载 GoogleTest、配置、构建、运行）。
 #
 # 关键约定——纯逻辑与 NAPI 解耦：
-#   被测代码（crypto/ term/ io/ ssh/ 下的纯逻辑）只依赖 C/C++ 标准库与
+#   被测代码（crypto/ term/ io/ ssh/ 下的纯逻辑，以及 bridge/ 下不含 napi 的
+#   纯逻辑件：handle_table.h / data_aggregator.*）只依赖 C/C++ 标准库与
 #   prebuilt 第三方库头文件，禁止 include <napi/native_api.h> / <hilog/log.h>；
-#   NAPI 胶水只允许出现在 bridge/ 与 napi_init.cpp。
+#   NAPI 胶水只允许出现在 bridge/session_bridge.* 与 napi_init.cpp。
 #   同一份纯逻辑源码同时编进 libssh_core.so 与本测试目标，保证两侧行为一致。
 cmake_minimum_required(VERSION 3.16)
 project(ssh_core_tests CXX)
@@ -59,6 +60,7 @@ set(TESTED_SOURCES
     ${CPP_ROOT}/crypto/aad.cpp
     ${CPP_ROOT}/io/EventLoop.cpp
     ${CPP_ROOT}/io/SessionThread.cpp
+    ${CPP_ROOT}/bridge/data_aggregator.cpp
     ${CPP_ROOT}/ssh/session.cpp
     ${CPP_ROOT}/ssh/hostkey.cpp
     ${CPP_ROOT}/ssh/auth.cpp
@@ -104,6 +106,7 @@ add_executable(ssh_core_tests
     auth_test.cpp
     agent_test.cpp
     channel_test.cpp
+    bridge_logic_test.cpp
     ${TESTED_SOURCES}
 )
 target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR})

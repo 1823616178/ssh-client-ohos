@@ -16,6 +16,9 @@
 
 #include <cstdio>
 
+// N11：会话桥接（异步方法 + TSFN 事件流 + 句柄表），实现见 bridge/session_bridge.cpp
+#include "bridge/session_bridge.h"
+
 namespace {
 
 // 安全地把 C 字符串包成 napi_string；nullptr 或失败一律返回空串
@@ -76,6 +79,9 @@ napi_value Init(napi_env env, napi_value exports)
     if (napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc) != napi_ok) {
         OH_LOG_ERROR(LOG_APP, "napi_define_properties failed");
     }
+    // N11：注册会话桥接方法（createSession/connect/authenticate*/openShell/exec/
+    // write/resize/closeChannel/closeSession）并挂 env 销毁清理钩子
+    sshclient::bridge::RegisterSessionBridge(env, exports);
     return exports;
 }
 
