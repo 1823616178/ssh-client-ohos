@@ -47,6 +47,7 @@ const KEY_HAPTIC_ENABLED: string = 'hapticEnabled';
 const KEY_KEY_BAR_LAYOUT: string = 'keyBarLayout';
 const KEY_LAST_SESSION_ID: string = 'lastSessionId';
 const KEY_SYNC_POLL_INTERVAL_MINUTES: string = 'syncPollIntervalMinutes';
+const KEY_HOST_GROUP_COLLAPSED: string = 'hostGroupCollapsed';
 
 /**
  * 键定义表：所有设置键的唯一声明处。
@@ -61,7 +62,8 @@ export const SETTING_DEFS: SettingDef[] = [
   { key: KEY_HAPTIC_ENABLED, type: 'boolean', defaultValue: true, comment: '触感反馈开关（§4.4）' },
   { key: KEY_KEY_BAR_LAYOUT, type: 'string', defaultValue: '', comment: '功能键条布局（JSON 串，空串 = 内置默认布局）' },
   { key: KEY_LAST_SESSION_ID, type: 'string', defaultValue: '', comment: '上次会话 id（§5.1），空串 = 无' },
-  { key: KEY_SYNC_POLL_INTERVAL_MINUTES, type: 'number', defaultValue: 15, comment: '同步轮询间隔（分钟，§6.4 默认 15）' }
+  { key: KEY_SYNC_POLL_INTERVAL_MINUTES, type: 'number', defaultValue: 15, comment: '同步轮询间隔（分钟，§6.4 默认 15）' },
+  { key: KEY_HOST_GROUP_COLLAPSED, type: 'string', defaultValue: '{}', comment: '主机分组折叠状态（JSON 串 groupId→boolean，U1；空对象 = 全部展开）' }
 ];
 
 export class SettingsRepository {
@@ -176,6 +178,15 @@ export class SettingsRepository {
 
   static setSyncPollIntervalMinutes(value: number): void {
     SettingsRepository.writeValue(KEY_SYNC_POLL_INTERVAL_MINUTES, value);
+  }
+
+  /** 主机分组折叠状态（JSON 串：groupId→true 表示折叠，U1）；'{}' = 全部展开 */
+  static getHostGroupCollapsed(): string {
+    return SettingsRepository.readString(KEY_HOST_GROUP_COLLAPSED);
+  }
+
+  static setHostGroupCollapsed(collapsedJson: string): void {
+    SettingsRepository.writeValue(KEY_HOST_GROUP_COLLAPSED, collapsedJson);
   }
 
   // ---- 内部读写辅助 ----

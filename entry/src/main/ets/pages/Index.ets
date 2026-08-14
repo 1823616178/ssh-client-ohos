@@ -1,12 +1,18 @@
 import { BuildConfig } from '../common/constants/BuildConfig';
 import { Tokens } from '../theme/Tokens';
 import { SshNativeSession, SshEvent } from '../napi/SshNative';
+import { HostListPage } from './HostListPage';
 import libsshCore from 'libssh_core.so';
 import { util } from '@kit.ArkTS';
 
+/** 调试区分隔线宽（vp）：Token 表无分隔线项，沿用 KeyBar 局部常量惯例 */
+const DEBUG_DIVIDER_WIDTH_VP = 1;
+
 /**
- * 首页：当前作为 Design Token（X2）、构建期配置（X5）与 NAPI 桥接层（N11）的
- * 演示与验证点。颜色与尺寸一律取自 Tokens。
+ * 首页：U1 起主体为 HostListPage（主机列表）。
+ * 原 Design Token（X2）/构建期配置（X5）/NAPI 桥接（N11）演示面板收敛为底部
+ * 「调试」折叠区（默认折叠），保留原组件 id（SyncApiUrl / NativeResult / SshSmokeLog）
+ * 与全部冒烟逻辑，验证点可达性不受影响。
  * 「测试原生库」为 N3 验证点：调用 libssh_core.so 展示四个原生依赖版本。
  * 「连接冒烟」为 N11/M1 出口雏形：主机/端口/用户/密码 → 创建会话 → 连接 →
  * 密码认证 → 开 shell → 写一条命令 → 把 stateChange 与 shell 输出显示出来。
@@ -19,6 +25,8 @@ struct Index {
   @State message: string = `同步服务器: ${BuildConfig.SYNC_API_URL}`;
   // N3 验证点：原生依赖版本信息或错误文本
   @State nativeResult: string = '';
+  // 调试折叠区开关（默认折叠，U1 起首页主体为主机列表）
+  @State debugExpanded: boolean = false;
 
   // ---- N11 连接冒烟（表单值不需要响应式，用普通成员即可）----
   private host: string = '';
@@ -113,139 +121,178 @@ struct Index {
   }
 
   build() {
-    Scroll() {
+    Column() {
+      // U1 首页主体：主机列表（包裹层 layoutWeight 提供有界高度，HostListPage 根节点填满）
       Column() {
-        // 卡片：app_surface + radius_md + space_md
-        Column() {
-          Text($r('app.string.app_name'))
-            .fontSize(Tokens.fontSize.headline)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(Tokens.Color.text)
-
-          Text(this.message)
-            .id('SyncApiUrl')
-            .fontSize(Tokens.fontSize.body)
-            .fontColor(Tokens.Color.textDim)
-            .margin({ top: Tokens.space.sm })
-
-          // 强调色元素：app_accent
-          Text('立即连接')
-            .fontSize(Tokens.fontSize.title)
-            .fontColor(Color.White)
-            .backgroundColor(Tokens.Color.accent)
-            .borderRadius(Tokens.radius.sm)
-            .padding({
-              left: Tokens.space.lg,
-              right: Tokens.space.lg,
-              top: Tokens.space.xs,
-              bottom: Tokens.space.xs
-            })
-            .margin({ top: Tokens.space.lg })
-
-          // N3 验证点：调用原生库，展示 libssh2/OpenSSL/vterm/argon2 版本
-          Button('测试原生库')
-            .fontSize(Tokens.fontSize.body)
-            .fontColor(Color.White)
-            .backgroundColor(Tokens.Color.accent)
-            .borderRadius(Tokens.radius.sm)
-            .margin({ top: Tokens.space.lg })
-            .onClick(() => {
-              try {
-                this.nativeResult = [
-                  `libssh2: ${libsshCore.getLibssh2Version()}`,
-                  `OpenSSL: ${libsshCore.getOpensslVersion()}`,
-                  `libvterm: ${libsshCore.getVtermVersion()}`,
-                  `argon2: ${libsshCore.getArgon2Version()}`
-                ].join('\n');
-              } catch (e) {
-                this.nativeResult = `原生调用失败: ${JSON.stringify(e)}`;
-              }
-            })
-
-          if (this.nativeResult.length > 0) {
-            Text(this.nativeResult)
-              .id('NativeResult')
-              .fontSize(Tokens.fontSize.body)
-              .fontColor(Tokens.Color.textDim)
-              .margin({ top: Tokens.space.sm })
-          }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .backgroundColor(Tokens.Color.surface)
-        .borderRadius(Tokens.radius.md)
-        .padding(Tokens.space.md)
-        .width('100%')
-
-        // N11 验证点：连接冒烟表单（M1 出口 demo 雏形，保持极简）
-        Column() {
-          Text('连接冒烟（N11）')
-            .fontSize(Tokens.fontSize.title)
-            .fontColor(Tokens.Color.text)
-
-          TextInput({ placeholder: '主机（如 192.168.1.1）' })
-            .fontSize(Tokens.fontSize.body)
-            .margin({ top: Tokens.space.sm })
-            .onChange((value: string) => {
-              this.host = value;
-            })
-          TextInput({ placeholder: '端口', text: '22' })
-            .fontSize(Tokens.fontSize.body)
-            .margin({ top: Tokens.space.sm })
-            .onChange((value: string) => {
-              this.port = value;
-            })
-          TextInput({ placeholder: '用户名' })
-            .fontSize(Tokens.fontSize.body)
-            .margin({ top: Tokens.space.sm })
-            .onChange((value: string) => {
-              this.user = value;
-            })
-          TextInput({ placeholder: '密码' })
-            .type(InputType.Password)
-            .fontSize(Tokens.fontSize.body)
-            .margin({ top: Tokens.space.sm })
-            .onChange((value: string) => {
-              this.password = value;
-            })
-
-          Row() {
-            Button('连接')
-              .fontSize(Tokens.fontSize.body)
-              .fontColor(Color.White)
-              .backgroundColor(Tokens.Color.accent)
-              .borderRadius(Tokens.radius.sm)
-              .onClick(() => {
-                this.connectSmoke();
-              })
-            Button('关闭')
-              .fontSize(Tokens.fontSize.body)
-              .fontColor(Tokens.Color.text)
-              .backgroundColor(Tokens.Color.surfaceHover)
-              .borderRadius(Tokens.radius.sm)
-              .margin({ left: Tokens.space.md })
-              .onClick(() => {
-                this.closeSmoke();
-              })
-          }
-          .margin({ top: Tokens.space.md })
-
-          if (this.sshLog.length > 0) {
-            Text(this.sshLog)
-              .id('SshSmokeLog')
-              .fontSize(Tokens.fontSize.caption)
-              .fontColor(Tokens.Color.textDim)
-              .margin({ top: Tokens.space.sm })
-          }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .backgroundColor(Tokens.Color.surface)
-        .borderRadius(Tokens.radius.md)
-        .padding(Tokens.space.md)
-        .width('100%')
-        .margin({ top: Tokens.space.md })
+        HostListPage()
       }
       .width('100%')
-      .padding(Tokens.space.md)
+      .layoutWeight(1)
+
+      // 调试折叠区：原 N3/N11/X5 演示面板（默认折叠；id 全部保留，验证点可达）
+      Column() {
+        Row() {
+          Text('调试面板')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.textDim)
+          Blank()
+          Text(this.debugExpanded ? '▾' : '▸')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.textFaint)
+        }
+        .width('100%')
+        .padding(Tokens.space.sm)
+        .onClick(() => {
+          this.debugExpanded = !this.debugExpanded;
+        })
+
+        if (this.debugExpanded) {
+          Scroll() {
+            Column() {
+              // 卡片：app_surface + radius_md + space_md
+              Column() {
+                Text($r('app.string.app_name'))
+                  .fontSize(Tokens.fontSize.headline)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(Tokens.Color.text)
+
+                Text(this.message)
+                  .id('SyncApiUrl')
+                  .fontSize(Tokens.fontSize.body)
+                  .fontColor(Tokens.Color.textDim)
+                  .margin({ top: Tokens.space.sm })
+
+                // 强调色元素：app_accent
+                Text('立即连接')
+                  .fontSize(Tokens.fontSize.title)
+                  .fontColor(Color.White)
+                  .backgroundColor(Tokens.Color.accent)
+                  .borderRadius(Tokens.radius.sm)
+                  .padding({
+                    left: Tokens.space.lg,
+                    right: Tokens.space.lg,
+                    top: Tokens.space.xs,
+                    bottom: Tokens.space.xs
+                  })
+                  .margin({ top: Tokens.space.lg })
+
+                // N3 验证点：调用原生库，展示 libssh2/OpenSSL/vterm/argon2 版本
+                Button('测试原生库')
+                  .fontSize(Tokens.fontSize.body)
+                  .fontColor(Color.White)
+                  .backgroundColor(Tokens.Color.accent)
+                  .borderRadius(Tokens.radius.sm)
+                  .margin({ top: Tokens.space.lg })
+                  .onClick(() => {
+                    try {
+                      this.nativeResult = [
+                        `libssh2: ${libsshCore.getLibssh2Version()}`,
+                        `OpenSSL: ${libsshCore.getOpensslVersion()}`,
+                        `libvterm: ${libsshCore.getVtermVersion()}`,
+                        `argon2: ${libsshCore.getArgon2Version()}`
+                      ].join('\n');
+                    } catch (e) {
+                      this.nativeResult = `原生调用失败: ${JSON.stringify(e)}`;
+                    }
+                  })
+
+                if (this.nativeResult.length > 0) {
+                  Text(this.nativeResult)
+                    .id('NativeResult')
+                    .fontSize(Tokens.fontSize.body)
+                    .fontColor(Tokens.Color.textDim)
+                    .margin({ top: Tokens.space.sm })
+                }
+              }
+              .alignItems(HorizontalAlign.Start)
+              .backgroundColor(Tokens.Color.surface)
+              .borderRadius(Tokens.radius.md)
+              .padding(Tokens.space.md)
+              .width('100%')
+
+              // N11 验证点：连接冒烟表单（M1 出口 demo 雏形，保持极简）
+              Column() {
+                Text('连接冒烟（N11）')
+                  .fontSize(Tokens.fontSize.title)
+                  .fontColor(Tokens.Color.text)
+
+                TextInput({ placeholder: '主机（如 192.168.1.1）' })
+                  .fontSize(Tokens.fontSize.body)
+                  .margin({ top: Tokens.space.sm })
+                  .onChange((value: string) => {
+                    this.host = value;
+                  })
+                TextInput({ placeholder: '端口', text: '22' })
+                  .fontSize(Tokens.fontSize.body)
+                  .margin({ top: Tokens.space.sm })
+                  .onChange((value: string) => {
+                    this.port = value;
+                  })
+                TextInput({ placeholder: '用户名' })
+                  .fontSize(Tokens.fontSize.body)
+                  .margin({ top: Tokens.space.sm })
+                  .onChange((value: string) => {
+                    this.user = value;
+                  })
+                TextInput({ placeholder: '密码' })
+                  .type(InputType.Password)
+                  .fontSize(Tokens.fontSize.body)
+                  .margin({ top: Tokens.space.sm })
+                  .onChange((value: string) => {
+                    this.password = value;
+                  })
+
+                Row() {
+                  Button('连接')
+                    .fontSize(Tokens.fontSize.body)
+                    .fontColor(Color.White)
+                    .backgroundColor(Tokens.Color.accent)
+                    .borderRadius(Tokens.radius.sm)
+                    .onClick(() => {
+                      this.connectSmoke();
+                    })
+                  Button('关闭')
+                    .fontSize(Tokens.fontSize.body)
+                    .fontColor(Tokens.Color.text)
+                    .backgroundColor(Tokens.Color.surfaceHover)
+                    .borderRadius(Tokens.radius.sm)
+                    .margin({ left: Tokens.space.md })
+                    .onClick(() => {
+                      this.closeSmoke();
+                    })
+                }
+                .margin({ top: Tokens.space.md })
+
+                if (this.sshLog.length > 0) {
+                  Text(this.sshLog)
+                    .id('SshSmokeLog')
+                    .fontSize(Tokens.fontSize.caption)
+                    .fontColor(Tokens.Color.textDim)
+                    .margin({ top: Tokens.space.sm })
+                }
+              }
+              .alignItems(HorizontalAlign.Start)
+              .backgroundColor(Tokens.Color.surface)
+              .borderRadius(Tokens.radius.md)
+              .padding(Tokens.space.md)
+              .width('100%')
+              .margin({ top: Tokens.space.md })
+            }
+            .width('100%')
+            .padding({
+              left: Tokens.space.md,
+              right: Tokens.space.md,
+              bottom: Tokens.space.md
+            })
+          }
+          .scrollBar(BarState.Off)
+          .width('100%')
+          .height('45%')
+        }
+      }
+      .width('100%')
+      .backgroundColor(Tokens.Color.appBg)
+      .border({ width: { top: DEBUG_DIVIDER_WIDTH_VP }, color: Tokens.Color.border })
     }
     .width('100%')
     .height('100%')

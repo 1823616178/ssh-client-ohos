@@ -24,7 +24,8 @@ const EXPECTED_DEFS: ExpectedDef[] = [
   { key: 'hapticEnabled', type: 'boolean', defaultValue: true },
   { key: 'keyBarLayout', type: 'string', defaultValue: '' },
   { key: 'lastSessionId', type: 'string', defaultValue: '' },
-  { key: 'syncPollIntervalMinutes', type: 'number', defaultValue: 15 }
+  { key: 'syncPollIntervalMinutes', type: 'number', defaultValue: 15 },
+  { key: 'hostGroupCollapsed', type: 'string', defaultValue: '{}' }
 ];
 
 function findDef(key: string): SettingDef | null {
