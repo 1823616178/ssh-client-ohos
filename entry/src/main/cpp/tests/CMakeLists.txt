@@ -12,6 +12,15 @@
 cmake_minimum_required(VERSION 3.16)
 project(ssh_core_tests CXX)
 
+# 可选 sanitizer（仅宿主机模式有意义）：SANITIZE=address 时由
+# scripts/run-native-tests.sh 注入 -DSSH_TESTS_SANITIZE=address；
+# 放在 FetchContent 之前，googletest 一并插桩，避免 ASan 误报漏报
+set(SSH_TESTS_SANITIZE "" CACHE STRING "宿主机测试 sanitizer：空 | address")
+if(SSH_TESTS_SANITIZE STREQUAL "address")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -48,14 +57,22 @@ set(CPP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # NATIVE_SOURCES（同一份文件，两处编译）。
 set(TESTED_SOURCES
     ${CPP_ROOT}/crypto/aad.cpp
+    ${CPP_ROOT}/io/EventLoop.cpp
+    ${CPP_ROOT}/io/SessionThread.cpp
 )
 
 add_executable(ssh_core_tests
     aad_test.cpp
+    event_loop_test.cpp
+    session_thread_test.cpp
     ${TESTED_SOURCES}
 )
 target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT})
-target_link_libraries(ssh_core_tests PRIVATE ${GTEST_LIBS})
+
+# std::thread / std::mutex 需要 pthread（OHOS musl 与宿主 Linux 均适用）
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(ssh_core_tests PRIVATE ${GTEST_LIBS} Threads::Threads)
 
 # 交叉编译（ohos target）时测试二进制无法在宿主机执行，不能在建后跑 --gtest_list_tests
 if(NOT CMAKE_CROSSCOMPILING)

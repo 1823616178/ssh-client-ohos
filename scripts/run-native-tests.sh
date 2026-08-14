@@ -6,6 +6,7 @@
 #
 # 用法（WSL / Linux CI 内）：
 #   bash scripts/run-native-tests.sh                     # 宿主机 clang 构建并运行全部测试
+#   SANITIZE=address bash scripts/run-native-tests.sh    # 宿主机 + AddressSanitizer（独立构建目录）
 #   TARGET=ohos-x86_64 bash scripts/run-native-tests.sh  # 交叉编译 x86_64-linux-ohos，只编不跑
 # Windows 侧驱动：
 #   wsl -d Ubuntu -- bash /mnt/c/Users/lx182/DevEcoStudioProjects/ssh_client_ohos/scripts/run-native-tests.sh
@@ -17,6 +18,7 @@
 #   GOOGLETEST_SRC   本地 googletest 源码树或 tarball 路径；设置后跳过一切下载
 #   SYSTEM_GTEST     ON 时用 find_package 找系统 GTest（需宿主机已装），默认 OFF 走 FetchContent
 #   OHOS_NDK         OHOS NDK native 目录（仅 TARGET=ohos-x86_64 用），默认 ~/ohos-probe/ndk/native
+#   SANITIZE         宿主机 sanitizer：空（默认）| address（走独立构建目录 host-asan，不含交叉目标）
 #   JOBS             并行编译数    默认 nproc
 #   CC / CXX         宿主机编译器  默认优先 clang/clang++（与 OHOS 工具链同族），缺失回退 gcc/g++
 #
@@ -36,6 +38,7 @@ CPP_DIR="$PROJECT_ROOT/entry/src/main/cpp"
 BUILD_ROOT="${BUILD_ROOT:-$CPP_DIR/tests/build}"
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/ohos-probe/build/downloads}"
 SYSTEM_GTEST="${SYSTEM_GTEST:-OFF}"
+SANITIZE="${SANITIZE:-}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 GTEST_VER=1.15.2
 
@@ -108,8 +111,15 @@ ensure_gtest
 case "$TARGET" in
   host)
     BUILD_DIR="$BUILD_ROOT/host"
-    log "配置（宿主机，CC=$CC CXX=$CXX，gtest $GTEST_VER）→ $BUILD_DIR"
-    cmake -S "$CPP_DIR/tests" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug "${GTEST_CMAKE_ARGS[@]}"
+    SAN_CMAKE_ARGS=()
+    if [ -n "$SANITIZE" ]; then
+      [ "$SANITIZE" = "address" ] || die "未知 SANITIZE='$SANITIZE'（可选：address）"
+      BUILD_DIR="$BUILD_ROOT/host-asan" # 与普通构建分离，互不污染缓存
+      SAN_CMAKE_ARGS=(-DSSH_TESTS_SANITIZE=address)
+    fi
+    log "配置（宿主机，CC=$CC CXX=$CXX，gtest $GTEST_VER${SANITIZE:+，sanitizer=$SANITIZE}）→ $BUILD_DIR"
+    cmake -S "$CPP_DIR/tests" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
+      "${GTEST_CMAKE_ARGS[@]}" "${SAN_CMAKE_ARGS[@]}"
     log "构建（-j$JOBS）"
     cmake --build "$BUILD_DIR" -j "$JOBS"
     log "运行全部测试（junit XML → $BUILD_DIR/test-results.xml）"
@@ -119,6 +129,7 @@ case "$TARGET" in
     ;;
 
   ohos-x86_64)
+    [ -z "$SANITIZE" ] || die "SANITIZE 仅支持宿主机模式（交叉目标无对应 sanitizer 运行时）"
     OHOS_NDK="${OHOS_NDK:-$HOME/ohos-probe/ndk/native}"
     TOOLCHAIN="$OHOS_NDK/build/cmake/ohos.toolchain.cmake"
     [ -f "$TOOLCHAIN" ] || die "找不到 OHOS 工具链文件 $TOOLCHAIN（设 OHOS_NDK 指向 NDK native 目录）"

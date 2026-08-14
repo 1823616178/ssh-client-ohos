@@ -16,6 +16,8 @@ set(NATIVE_SOURCES
     # crypto/
     crypto/aad.cpp
     # io/
+    io/EventLoop.cpp
+    io/SessionThread.cpp
 )
 
 add_library(ssh_core SHARED ${NATIVE_SOURCES})
