@@ -21,6 +21,8 @@
  * 材料在 $HOME/ohos-probe/build/host-deps/auth/（端口/测试用户/随机密码/密钥对；
  * 密码与私钥绝不进 git 仓库）。环境变量可覆盖：SSH_TEST_AUTH_DIR / SSH_TEST_AUTH_PORT /
  * SSH_TEST_USER / SSH_TEST_PASSWORD / SSH_TEST_KEY_PASSPHRASE。
+ * 环境加载器（AuthTestEnv / LoadAuthTestEnv / ReachAuthenticating 等）自 N9 起
+ * 移入 sshd_testkit.h，与 agent_test.cpp 共用。
  */
 #include <gtest/gtest.h>
 
@@ -62,36 +64,6 @@ namespace {
 
 // ---------------------------------------------------------------- 结果收集器
 
-class AuthResultBox {
-public:
-    // 直接可转 AuthCallback（在事件循环线程执行）
-    void operator()(const sshclient::ssh::AuthResult &result)
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            result_ = result;
-        }
-        cv_.notify_all();
-    }
-
-    bool wait(std::chrono::milliseconds timeout)
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        return cv_.wait_for(lock, timeout, [&] { return result_.has_value(); });
-    }
-
-    std::optional<AuthResult> result() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return result_;
-    }
-
-private:
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::optional<AuthResult> result_;
-};
-
 class AuthMethodsBox {
 public:
     void operator()(std::optional<AuthMethodSet> methods)
@@ -122,126 +94,6 @@ private:
     std::optional<AuthMethodSet> methods_;
     bool arrived_ = false;
 };
-
-// ---------------------------------------------------------------- 认证环境定位
-
-struct AuthTestEnv {
-    uint16_t port = 0;
-    std::string user;
-    std::string password;        // 测试用户密码（随机串，来自 auth/test-password）
-    std::string passphrase;      // 私钥短语（随机串，来自 auth/key-passphrase）
-    std::string keyNoPassphrase; // 不带短语的 ed25519 私钥字节
-    std::string keyWithPassphrase; // 带短语的 ed25519 私钥字节
-    std::string pubNoPassphrase;   // 对应 .pub 公钥文本
-    std::string pubWithPassphrase;
-};
-
-std::string ReadFileOrEmpty(const std::string &path)
-{
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        return "";
-    }
-    std::string content;
-    char buf[4096];
-    size_t n = 0;
-    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
-        content.append(buf, n);
-    }
-    std::fclose(f);
-    return content;
-}
-
-// 密码/短语文件容差处理：剥掉尾部空白/换行（手写或编辑器保存时可能带 \n）
-std::string TrimTail(const std::string &s)
-{
-    const size_t end = s.find_last_not_of(" \t\r\n");
-    return end == std::string::npos ? "" : s.substr(0, end + 1);
-}
-
-// 加载认证测试环境：环境变量优先，默认 setup-host-deps.sh 的 auth/ 产物目录；
-// 缺一即返回 false（调用方 GTEST_SKIP）。并对端口做一次 TCP 探测确认 daemon 存活。
-bool LoadAuthTestEnv(AuthTestEnv *out)
-{
-#ifndef SSH_TESTS_INTEGRATION
-    (void)out;
-    return false;
-#else
-    const char *home = std::getenv("HOME");
-    const char *dirEnv = std::getenv("SSH_TEST_AUTH_DIR");
-    std::string dir;
-    if (dirEnv != nullptr && dirEnv[0] != '\0') {
-        dir = dirEnv;
-    } else if (home != nullptr) {
-        dir = std::string(home) + "/ohos-probe/build/host-deps/auth";
-    } else {
-        return false;
-    }
-
-    const char *portEnv = std::getenv("SSH_TEST_AUTH_PORT");
-    const std::string portStr =
-        portEnv != nullptr && portEnv[0] != '\0' ? portEnv : TrimTail(ReadFileOrEmpty(dir + "/port"));
-    if (portStr.empty()) {
-        return false;
-    }
-    out->port = static_cast<uint16_t>(std::atoi(portStr.c_str()));
-    if (out->port == 0) {
-        return false;
-    }
-
-    const char *userEnv = std::getenv("SSH_TEST_USER");
-    out->user = userEnv != nullptr && userEnv[0] != '\0'
-                    ? userEnv
-                    : TrimTail(ReadFileOrEmpty(dir + "/test-user"));
-    const char *passEnv = std::getenv("SSH_TEST_PASSWORD");
-    out->password = passEnv != nullptr && passEnv[0] != '\0'
-                        ? passEnv
-                        : TrimTail(ReadFileOrEmpty(dir + "/test-password"));
-    const char *phraseEnv = std::getenv("SSH_TEST_KEY_PASSPHRASE");
-    out->passphrase = phraseEnv != nullptr && phraseEnv[0] != '\0'
-                          ? phraseEnv
-                          : TrimTail(ReadFileOrEmpty(dir + "/key-passphrase"));
-    out->keyNoPassphrase = ReadFileOrEmpty(dir + "/id_ed25519");
-    out->keyWithPassphrase = ReadFileOrEmpty(dir + "/id_ed25519_pass");
-    out->pubNoPassphrase = ReadFileOrEmpty(dir + "/id_ed25519.pub");
-    out->pubWithPassphrase = ReadFileOrEmpty(dir + "/id_ed25519_pass.pub");
-
-    if (out->user.empty() || out->password.empty() || out->passphrase.empty() ||
-        out->keyNoPassphrase.empty() || out->keyWithPassphrase.empty() ||
-        out->pubNoPassphrase.empty() || out->pubWithPassphrase.empty()) {
-        return false;
-    }
-
-    // TCP 探测：daemon 挂掉时尽早 GTEST_SKIP 而不是逐个用例超时
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return false;
-    }
-    struct sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(out->port);
-    const bool ok = ::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0;
-    ::close(fd);
-    return ok;
-#endif
-}
-
-// 连接并驱动到 authenticating；超时/失败返回 false（调用方 ASSERT）
-bool ReachAuthenticating(SshSession &session, StateRecorder &rec, const AuthTestEnv &env)
-{
-    return session.connect("127.0.0.1", env.port, env.user) &&
-           rec.waitFor(SshSessionState::kAuthenticating, 20s);
-}
-
-void SkipIfNoAuthEnv(const AuthTestEnv &env, bool loaded)
-{
-    if (!loaded) {
-        GTEST_SKIP() << "认证测试环境未就绪（跑 scripts/setup-host-deps.sh；"
-                        "无 root/WSL 时本用例按约定跳过）";
-    }
-    (void)env;
-}
 
 } // namespace
 

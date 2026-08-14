@@ -10,6 +10,7 @@
 #include <openssl/crypto.h>
 
 #include "../io/SessionThread.h"
+#include "agent.h"
 
 // 与 session.cpp 同款：native 统一日志基建（hilog 封装）是后续任务，先落 stderr
 #define SSH_LOG(...)                               \
@@ -174,6 +175,25 @@ bool SshSession::authenticatePublicKey(std::string &privateKeyData, std::string 
     authOpStaging_ = std::move(op);
     thread_.post([this] { beginAuthOp(); });
     return true;
+}
+
+bool SshSession::authenticateAgent(const std::string &keyId, SshAgent &agent,
+                                   AuthCallback callback)
+{
+    // 先从 agent 取材料快照再受理：agent 未解锁/无此 keyId/已超时清除时不动用
+    // authBusy_ 受理位、不消耗认证重试计数、不回调，直接返回 false
+    // （未取到材料即无敏感副本产生，无残留）
+    auto material = agent.getKeyMaterial(keyId);
+    if (!material.has_value()) {
+        SSH_LOG("agent 认证拒绝受理：keyId 未解锁或已超时清除");
+        return false;
+    }
+    std::string publicKey; // 留空：由 libssh2 从私钥提取公钥（OpenSSH 格式内嵌）
+    const bool admitted = authenticatePublicKey(material->privateKey, publicKey,
+                                                material->passphrase, std::move(callback));
+    // 受理成功：私钥/短语快照已被 authenticatePublicKey 清零（受理即清零）；
+    // 未受理（状态竞态/已有操作进行中）：material 析构兜底清零
+    return admitted;
 }
 
 bool SshSession::authenticateKeyboardInteractive(KbdIntResponseProvider provider,

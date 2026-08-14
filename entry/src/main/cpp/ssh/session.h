@@ -157,6 +157,9 @@ struct AuthMethodSet {
 // nullopt = 探测失败（详情见 lastErrorMessage / 日志）
 using AuthMethodsCallback = std::function<void(std::optional<AuthMethodSet> methods)>;
 
+// N9：应用内 SSH Agent（内存密钥托管），完整定义见 agent.h
+class SshAgent;
+
 class SshSession {
 public:
     // 状态迁移回调：(from, to)，在事件循环线程触发；每次合法迁移恰好一次
@@ -206,6 +209,15 @@ public:
     // 受理即复制三个 buffer 并清零 privateKeyData / passphrase（公钥非敏感，不清零）。
     bool authenticatePublicKey(std::string &privateKeyData, std::string &publicKeyData,
                                std::string &passphrase, AuthCallback callback);
+    // N9：应用内 agent 认证（agent.h）：从 agent 取 keyId 托管的私钥/短语快照，
+    // 走 authenticatePublicKey 的同一驱动路径——公钥数据留空，由 libssh2 从私钥
+    // 提取（OpenSSH 格式内嵌公钥；两条路径的短语错误归一化见上方注释）。
+    // 受理语义与 authenticatePublicKey 相同：快照复制进 AuthOp 后，agent 侧与
+    // 本方法内的临时副本随即清零。返回 false = 未受理：会话不在 authenticating /
+    // 已有认证类操作进行中 / agent 未解锁或无此 keyId（含超时已惰性清除）——
+    // agent 侧取钥失败不算一次认证尝试（不消耗 authMaxAttempts），不回调 callback，
+    // 材料快照已在本地清零。
+    bool authenticateAgent(const std::string &keyId, SshAgent &agent, AuthCallback callback);
     bool authenticateKeyboardInteractive(KbdIntResponseProvider provider, AuthCallback callback);
     // 探测服务端支持的认证方式（libssh2_userauth_list 非阻塞驱动；与认证尝试互斥）
     bool queryAuthMethods(AuthMethodsCallback callback);
