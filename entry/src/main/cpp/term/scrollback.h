@@ -25,11 +25,19 @@
  * 本文件是纯逻辑实现：只依赖 C++ 标准库与 grid.h（Cell 布局），
  * 禁止 include <napi/native_api.h> / <hilog/log.h> / <vterm.h>。
  * 同时被 OHOS 产物（../CMakeLists.txt）与宿主机单测（../tests/CMakeLists.txt）编译。
+ *
+ * 线程安全（T3 起）：全部公共方法内部持锁，任意线程可调——
+ * 写路径（pushLine/popLine/clear/resizeCols）在会话循环线程，T3 的
+ * getScrollbackWindow 经 copyWindow 在 ArkTS 线程读。临界区为整段 memcpy
+ * （百行级 ≈ 数十微秒），循环线程被阻塞的时长可忽略。
+ * 例外：getLine 返回内部槽位指针，锁管不住返回值的使用期——保持原契约
+ * 「下一次写后即失效」，只允许循环线程/测试这类知根底的调用方使用。
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "grid.h"
@@ -45,14 +53,16 @@ public:
 
     ScrollbackBuffer(int cols, size_t capacity = kDefaultCapacity);
 
-    int cols() const { return cols_; }
-    size_t capacity() const { return capacity_; }
-    size_t size() const { return size_; } // 当前有效行数 = min(totalPushed, capacity)
+    // 访问器同样持锁（T3：ArkTS 线程经 getScrollbackWindow/发布快照读取，
+    // 与循环线程的 pushLine/resizeCols 并发）
+    int cols() const { std::lock_guard<std::mutex> lock(mutex_); return cols_; }
+    size_t capacity() const { std::lock_guard<std::mutex> lock(mutex_); return capacity_; }
+    size_t size() const { std::lock_guard<std::mutex> lock(mutex_); return size_; } // 当前有效行数 = min(totalPushed, capacity)
 
     // 推入计数（有效窗口右端）；popLine 弹回主屏时同步 -1，见头注释
-    uint64_t totalPushed() const { return totalPushed_; }
+    uint64_t totalPushed() const { std::lock_guard<std::mutex> lock(mutex_); return totalPushed_; }
     // 有效窗口左端（最老可查行的 absoluteIndex）
-    uint64_t oldestIndex() const { return totalPushed_ - size_; }
+    uint64_t oldestIndex() const { std::lock_guard<std::mutex> lock(mutex_); return oldestIndexLocked(); }
 
     // 推入一行到环形尾：拷贝 min(count, cols) 格，不足补零值 Cell（codepoint 0）；
     // count 超过 cols 截断（调用方 bug 的防御，正常路径 count == cols）。O(1)。
@@ -61,7 +71,8 @@ public:
     // 窗口查询：absoluteIndex ∈ [oldestIndex(), totalPushed())，O(1)。
     // 越界返回 nullptr（定义行为：调用方跨 NAPI，窗口边界探测是正常用法）。
     // 返回指针指向环形槽位内部内存：下一次 pushLine/popLine/clear/resizeCols 后即失效，
-    // 调用方不得跨 feed 持有（要留存走 copyWindow 拷出）
+    // 调用方不得跨 feed 持有（要留存走 copyWindow 拷出）。
+    // 线程契约：锁只保护本调用本身，返回值使用期不受保护——仅循环线程/测试可用
     const Cell *getLine(uint64_t absoluteIndex) const;
 
     // 批量窗口拷贝：out[i] 对应 absoluteIndex = startIndex + i，恒写满 count 行；
@@ -81,14 +92,17 @@ public:
     void resizeCols(int newCols, const Cell &blank);
 
     // 内部存储字节数：恒等于 capacity × cols × sizeof(Cell)（预分配定长，内存上界）
-    size_t storageBytes() const { return cells_.size() * sizeof(Cell); }
+    size_t storageBytes() const { std::lock_guard<std::mutex> lock(mutex_); return cells_.size() * sizeof(Cell); }
 
 private:
     size_t slotOf(uint64_t absoluteIndex) const
     {
         return static_cast<size_t>(absoluteIndex % static_cast<uint64_t>(capacity_));
     }
+    // 调用方已持锁前提下的有效窗口左端（方法内部复用，避免递归加锁）
+    uint64_t oldestIndexLocked() const { return totalPushed_ - size_; }
 
+    mutable std::mutex mutex_; // 全方法级保护（T3 跨线程拷贝，见头注「线程安全」）
     int cols_;
     size_t capacity_;
     size_t size_ = 0;

@@ -18,6 +18,8 @@
 
 // N11：会话桥接（异步方法 + TSFN 事件流 + 句柄表），实现见 bridge/session_bridge.cpp
 #include "bridge/session_bridge.h"
+// T3：终端桥接（零拷贝快照 + 终端事件），实现见 bridge/terminal_bridge.cpp
+#include "bridge/terminal_bridge.h"
 
 namespace {
 
@@ -82,6 +84,10 @@ napi_value Init(napi_env env, napi_value exports)
     // N11：注册会话桥接方法（createSession/connect/authenticate*/openShell/exec/
     // write/resize/closeChannel/closeSession）并挂 env 销毁清理钩子
     sshclient::bridge::RegisterSessionBridge(env, exports);
+    // T3：注册终端桥接方法（attachTerminal/beginFrame/endFrame/getRevision/
+    // selfTestGrid/copyGridRows/getScrollbackWindow/writeTerminal/resizeTerminal/
+    // detachTerminal）；终端事件经 N11 的 stateTsfn 上抛，清理随会话钩子走
+    sshclient::bridge::RegisterTerminalBridge(env, exports);
     return exports;
 }
 

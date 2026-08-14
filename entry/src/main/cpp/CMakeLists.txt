@@ -13,6 +13,7 @@ set(NATIVE_SOURCES
     # bridge/
     bridge/data_aggregator.cpp
     bridge/session_bridge.cpp
+    bridge/terminal_bridge.cpp
     # ssh/
     ssh/session.cpp
     ssh/hostkey.cpp
@@ -23,6 +24,7 @@ set(NATIVE_SOURCES
     term/grid.cpp
     term/vterm_screen.cpp
     term/scrollback.cpp
+    term/frame_sync.cpp
     # crypto/
     crypto/aad.cpp
     # io/

@@ -233,6 +233,8 @@ int VtermBridge::onSetTermProp(VTermProp prop, VTermValue *val, void *user)
         return 1;
     case VTERM_PROP_MOUSE:
         b->mouseMode_ = static_cast<MouseMode>(val->number);
+        if (b->mouseModeCallback_)
+            b->mouseModeCallback_(b->mouseMode_);
         return 1;
     case VTERM_PROP_FOCUSREPORT:
         b->focusReport_ = val->boolean != 0;

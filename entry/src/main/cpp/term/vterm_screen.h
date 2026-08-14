@@ -85,6 +85,8 @@ public:
     void setTitleCallback(std::function<void(const std::string &)> cb) { titleCallback_ = std::move(cb); }
     void setIconNameCallback(std::function<void(const std::string &)> cb) { iconNameCallback_ = std::move(cb); }
     void setBellCallback(std::function<void()> cb) { bellCallback_ = std::move(cb); }
+    // T3：鼠标上报模式变更（DECSET 1000/1002/1003 开关）上抛，供 UI 切换手势行为
+    void setMouseModeCallback(std::function<void(MouseMode)> cb) { mouseModeCallback_ = std::move(cb); }
 
     // 配色注入：16 色调色板（ARGB）；256 扩展色按 xterm 公式推导，不可单独注入
     void setPalette(const std::array<uint32_t, 16> &argb) { palette_ = argb; }
@@ -142,6 +144,7 @@ private:
     std::function<void(const std::string &)> titleCallback_;
     std::function<void(const std::string &)> iconNameCallback_;
     std::function<void()> bellCallback_;
+    std::function<void(MouseMode)> mouseModeCallback_;
 };
 
 } // namespace term

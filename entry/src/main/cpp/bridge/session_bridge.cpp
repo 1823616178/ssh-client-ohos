@@ -39,54 +39,17 @@
 #include "../ssh/session.h"
 #include "data_aggregator.h"
 #include "handle_table.h"
+// T3：bridge 模块内部共享件（BridgeEvent/TsfnBridge/SessionHandle/g_table/
+// napi 小工具的全定义在 internal.h，供 terminal_bridge.cpp 复用）
+#include "internal.h"
 
 namespace sshclient {
 namespace bridge {
-namespace {
-
-// ---------------------------------------------------------------- 事件载体
-
-enum class EventKind {
-    kStateChange,
-    kHostKey,
-    kAuthResult,
-    kChannelOpen,
-    kChannelData,
-    kChannelClose,
-    kError,
-};
-
-// 各字段按 kind 取用（命名含义见 CallJs 的组包分支）；统一结构避免按类型拆堆对象
-struct BridgeEvent {
-    EventKind kind;
-    uint32_t channelId = 0; // kChannelOpen / kChannelData / kChannelClose
-    int stream = 0;         // kChannelData：0=stdout 1=stderr
-    long number = 0;        // attemptsLeft / exitStatus / droppedCount / kStateChange 终态的统一错误码（N13）
-    bool success = false;   // kAuthResult / kChannelOpen / kStateChange 终态的 reconnectHint 值
-    bool hasHint = false;   // kStateChange：终态（disconnected/error/closed）附重连提示（N12）
-    std::string text1;      // from / keyType / method / openError / closeReason / code
-    std::string text2;      // to / sha256 / authError / openMessage / exitSignal / message
-    std::string text3;      // md5 / authMessage / closeMessage / kStateChange 终态的 errorCodeName
-    std::string text4;      // randomart / kStateChange 终态的 errorMessage（N13）
-    std::string bytes;      // kChannelData 聚合批次（原始字节，可能切断 UTF-8 序列）
-};
 
 // ---------------------------------------------------------------- TSFN 上下文
 
 // 数据队列上限：256 批 × 16 KiB ≈ 4 MiB/会话的背压天花板
 constexpr size_t kDataQueueMaxBatches = 256;
-
-struct TsfnBridge {
-    napi_threadsafe_function tsfn = nullptr;
-    // 生产者入口开关：teardown 首先关掉它，此后 EnqueueEvent 即弃即收
-    std::atomic<bool> accepting{true};
-    // inFlight：已入队未消费的堆事件；TSFN abort/env 销毁导致事件不再投递时，
-    // 由 finalize 统一回收，保证任何路径都不泄漏
-    std::mutex mutex;
-    std::unordered_set<BridgeEvent *> inFlight;
-    // 数据队列连续丢弃计数（仅循环线程写）：用于「丢弃边沿」补发 error 事件
-    uint64_t droppedSinceOk = 0;
-};
 
 void StopAccepting(TsfnBridge *ctx)
 {
@@ -163,6 +126,8 @@ void SetBytesProp(napi_env env, napi_value obj, const char *name, const std::str
     }
 }
 
+namespace {
+
 // TSFN 的 JS 侧投递回调（ArkTS 线程执行）
 void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
 {
@@ -237,6 +202,36 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
         SetStrProp(env, obj, "message", evt->text2);
         SetNumProp(env, obj, "count", static_cast<double>(evt->number));
         break;
+    // ---- T3 终端事件（terminal 句柄经 double 传递，2^53 内精确）----
+    case EventKind::kTerminalOpen:
+        SetStrProp(env, obj, "type", "terminalOpen");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "error", evt->text1);
+        SetStrProp(env, obj, "message", evt->text2);
+        break;
+    case EventKind::kTerminalClose:
+        SetStrProp(env, obj, "type", "terminalClose");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        SetStrProp(env, obj, "reason", evt->text1);
+        SetNumProp(env, obj, "exitStatus", static_cast<double>(evt->number));
+        SetStrProp(env, obj, "exitSignal", evt->text2);
+        SetStrProp(env, obj, "message", evt->text3);
+        break;
+    case EventKind::kTerminalBell:
+        SetStrProp(env, obj, "type", "terminalBell");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        break;
+    case EventKind::kTerminalTitle:
+        SetStrProp(env, obj, "type", "terminalTitle");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        SetStrProp(env, obj, "title", evt->text1);
+        break;
+    case EventKind::kTerminalMouseMode:
+        SetStrProp(env, obj, "type", "terminalMouseMode");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        SetNumProp(env, obj, "mouseMode", static_cast<double>(evt->number));
+        break;
     }
 
     napi_value undefined = nullptr;
@@ -263,107 +258,87 @@ void TsfnFinalize(napi_env /*env*/, void *finalizeData, void * /*hint*/)
     delete ctx;
 }
 
-// ---------------------------------------------------------------- 会话句柄
+} // namespace
 
-struct ChannelEntry {
-    std::unique_ptr<ssh::SshChannel> channel;
-    DataAggregator aggOut;   // stdout 聚合
-    DataAggregator aggErr;   // stderr 聚合
-    bool flushArmed = false; // 聚合冲刷定时器在途（仅循环线程访问）
-};
+// ---------------------------------------------------------------- 会话句柄方法
+//（SessionHandle 全定义在 internal.h，T3 起与 terminal_bridge.cpp 共享）
 
-struct SessionHandle {
-    napi_env env = nullptr;
-    uint64_t handle = 0;
+SessionHandle::~SessionHandle()
+{
+    // 防御：正常路径已被 Teardown 收尾（CAS 幂等，此处空操作）；
+    // 仅 createSession 半途失败等异常路径才真正在本析构里执行
+    Teardown();
+}
 
-    // 成员声明顺序保证析构顺序（反向）：thread 最后析构，
-    // 满足「SessionThread 寿命长于 SshSession/SshChannel」的契约（ssh/session.h 头注）
-    io::SessionThread thread;
-    std::unique_ptr<ssh::SshSession> session;
-    // 通道表：map 节点指针稳定；JS 线程经 shared_ptr 副本短时持有条目做
-    // write/resize/close，循环线程的 deferred erase / teardown 的 clear 不与其竞争
-    std::mutex channelsMutex;
-    std::map<uint32_t, std::shared_ptr<ChannelEntry>> channels;
-    std::atomic<uint32_t> nextChannelId{1}; // 会话内单调递增，不复用
-
-    // 两条 TSFN 上下文：由各自 TSFN 的 finalize 释放，本对象不 delete
-    TsfnBridge *stateBridge = nullptr;
-    TsfnBridge *dataBridge = nullptr;
-
-    // N12：每会话重连退避策略（ArkTS 线程经 setReconnectPolicy 写、
-    // nextReconnectDelaySec 读；与既有方法同一 ArkTS 串行调用约定，无需加锁）
-    ssh::BackoffSchedule reconnectPolicy;
-
-    std::atomic<bool> tornDown{false};
-
-    ~SessionHandle()
-    {
-        // 防御：正常路径已被 Teardown 收尾（CAS 幂等，此处空操作）；
-        // 仅 createSession 半途失败等异常路径才真正在本析构里执行
-        Teardown();
+// 幂等回收（顺序即任务约定的「先停线程再释放」）：
+//   1. 关 TSFN 入口：此后循环线程事件即弃即收；
+//   2. 优雅关闭会话并等终态（close 自带冲刷上限；idle 空操作）；
+//      ——期间通道经 onSessionLost 收到终态回调（T3 终端通道同此路径）；
+//   3. 停循环线程（wakeup → join → 清遗留任务），此后不再有任何回调；
+//   4. 析构通道、终端（T3）与会话（SshChannel 析构约定：终止回调已送达；
+//      终端本体的统一回收点见 internal.h 头注）；
+//   5. 释放 TSFN：release 模式让已入队事件继续投递完；env 销毁等
+//      无法投递的场景由 finalize 兜底回收 inFlight。
+void SessionHandle::Teardown()
+{
+    bool expected = false;
+    if (!tornDown.compare_exchange_strong(expected, true)) {
+        return;
     }
+    StopAccepting(stateBridge);
+    StopAccepting(dataBridge);
 
-    // 幂等回收（顺序即任务约定的「先停线程再释放」）：
-    //   1. 关 TSFN 入口：此后循环线程事件即弃即收；
-    //   2. 优雅关闭会话并等终态（close 自带冲刷上限；idle 空操作）；
-    //   3. 停循环线程（wakeup → join → 清遗留任务），此后不再有任何回调；
-    //   4. 析构通道与会话（SshChannel 析构约定：终止回调已送达）；
-    //   5. 释放 TSFN：release 模式让已入队事件继续投递完；env 销毁等
-    //      无法投递的场景由 finalize 兜底回收 inFlight。
-    void Teardown()
-    {
-        bool expected = false;
-        if (!tornDown.compare_exchange_strong(expected, true)) {
-            return;
-        }
-        StopAccepting(stateBridge);
-        StopAccepting(dataBridge);
-
-        if (session) {
-            if (session->state() != ssh::SshSessionState::kIdle) {
-                session->close();
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-                while (!IsTerminal(session->state()) && std::chrono::steady_clock::now() < deadline) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                }
-                if (!IsTerminal(session->state())) {
-                    // 超时兜底：不再等。下方 thread.stop 后 SshSession 析构会直接
-                    // 回收 libssh2 会话与 fd（session.h 析构约定）；通道侧若有未释放
-                    // 句柄，SshChannel 析构仅告警不崩（正常不会走到：close 冲刷上限 2s）
-                    OH_LOG_WARN(LOG_APP, "会话关闭等待终态超时，走兜底回收");
-                }
+    if (session) {
+        if (session->state() != ssh::SshSessionState::kIdle) {
+            session->close();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+            while (!IsTerminal(session->state()) && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (!IsTerminal(session->state())) {
+                // 超时兜底：不再等。下方 thread.stop 后 SshSession 析构会直接
+                // 回收 libssh2 会话与 fd（session.h 析构约定）；通道侧若有未释放
+                // 句柄，SshChannel 析构仅告警不崩（正常不会走到：close 冲刷上限 2s）
+                OH_LOG_WARN(LOG_APP, "会话关闭等待终态超时，走兜底回收");
             }
         }
-
-        thread.stop();
-
-        {
-            std::lock_guard<std::mutex> lock(channelsMutex);
-            channels.clear();
-        }
-        session.reset();
-
-        if (dataBridge != nullptr && dataBridge->tsfn != nullptr) {
-            napi_release_threadsafe_function(dataBridge->tsfn, napi_tsfn_release);
-        }
-        if (stateBridge != nullptr && stateBridge->tsfn != nullptr) {
-            napi_release_threadsafe_function(stateBridge->tsfn, napi_tsfn_release);
-        }
     }
 
-    static bool IsTerminal(ssh::SshSessionState st)
+    thread.stop();
+
     {
-        return st == ssh::SshSessionState::kClosed || st == ssh::SshSessionState::kDisconnected ||
-               st == ssh::SshSessionState::kError;
+        std::lock_guard<std::mutex> lock(channelsMutex);
+        channels.clear();
     }
-};
+    {
+        // T3：回收全部终端本体。先摘全局句柄表（此后 ArkTS 的 terminal 句柄
+        // 调用全部落空），再清本会话终端表——TerminalHandle 析构此时安全：
+        // 循环线程已 join 无回调、通道已终态、session 尚未 reset（下方才做）
+        std::lock_guard<std::mutex> lock(terminalsMutex);
+        for (const auto &kv : terminals) {
+            ForgetTerminal(kv.first);
+        }
+        terminals.clear();
+    }
+    session.reset();
+
+    if (dataBridge != nullptr && dataBridge->tsfn != nullptr) {
+        napi_release_threadsafe_function(dataBridge->tsfn, napi_tsfn_release);
+    }
+    if (stateBridge != nullptr && stateBridge->tsfn != nullptr) {
+        napi_release_threadsafe_function(stateBridge->tsfn, napi_tsfn_release);
+    }
+}
+
+bool SessionHandle::IsTerminal(ssh::SshSessionState st)
+{
+    return st == ssh::SshSessionState::kClosed || st == ssh::SshSessionState::kDisconnected ||
+           st == ssh::SshSessionState::kError;
+}
 
 // ---------------------------------------------------------------- 全局注册表
 
 HandleTable<SessionHandle> g_table;
-std::mutex g_teardownMutex;
-std::condition_variable g_teardownCv;
-int g_activeTeardowns = 0; // 进行中的异步 teardown 计数（g_teardownMutex 保护）
 
 // ---------------------------------------------------------------- 事件发送（循环线程）
 
@@ -371,6 +346,12 @@ void SendStateEvent(SessionHandle *sh, BridgeEvent *evt)
 {
     EnqueueEvent(sh->stateBridge, evt);
 }
+
+namespace {
+
+std::mutex g_teardownMutex;
+std::condition_variable g_teardownCv;
+int g_activeTeardowns = 0; // 进行中的异步 teardown 计数（g_teardownMutex 保护）
 
 void SendDataEvent(SessionHandle *sh, BridgeEvent *evt)
 {
@@ -531,7 +512,10 @@ ssh::AuthCallback MakeAuthCallback(SessionHandle *sh, const char *method)
     };
 }
 
+} // namespace
+
 // ---------------------------------------------------------------- napi 参数读取
+//（以下小工具与 LookupLive 声明在 internal.h，T3 起与 terminal_bridge 共享）
 
 napi_value MakeBool(napi_env env, bool v)
 {
@@ -1050,8 +1034,6 @@ void OnEnvCleanup(void * /*arg*/)
     std::unique_lock<std::mutex> lock(g_teardownMutex);
     g_teardownCv.wait(lock, [] { return g_activeTeardowns == 0; });
 }
-
-} // namespace
 
 void RegisterSessionBridge(napi_env env, napi_value exports)
 {

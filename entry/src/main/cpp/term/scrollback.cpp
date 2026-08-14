@@ -21,6 +21,7 @@ ScrollbackBuffer::ScrollbackBuffer(int cols, size_t capacity)
 
 void ScrollbackBuffer::pushLine(const Cell *cells, size_t count)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     Cell *slot = &cells_[slotOf(totalPushed_) * static_cast<size_t>(cols_)];
     const size_t n = std::min(count, static_cast<size_t>(cols_));
     std::memcpy(slot, cells, n * sizeof(Cell));
@@ -38,14 +39,16 @@ const Cell *ScrollbackBuffer::getLine(uint64_t absoluteIndex) const
 {
     // 越界返回 nullptr 是定义行为而非调用方 bug：调用方跨 NAPI，窗口边界探测
     // （如「最老行再往上还有没有」）是正常用法，不能 assert 中止
-    if (absoluteIndex < oldestIndex() || absoluteIndex >= totalPushed_)
+    std::lock_guard<std::mutex> lock(mutex_); // 只保护本次查询，返回值使用期见头注
+    if (absoluteIndex < oldestIndexLocked() || absoluteIndex >= totalPushed_)
         return nullptr;
     return &cells_[slotOf(absoluteIndex) * static_cast<size_t>(cols_)];
 }
 
 size_t ScrollbackBuffer::copyWindow(uint64_t startIndex, size_t count, Cell *out) const
 {
-    const uint64_t oldest = oldestIndex();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const uint64_t oldest = oldestIndexLocked();
     size_t copied = 0;
     for (size_t i = 0; i < count; ++i) {
         const uint64_t idx = startIndex + static_cast<uint64_t>(i);
@@ -66,6 +69,7 @@ size_t ScrollbackBuffer::copyWindow(uint64_t startIndex, size_t count, Cell *out
 
 bool ScrollbackBuffer::popLine(Cell *out)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (size_ == 0)
         return false;
     --totalPushed_;
@@ -77,12 +81,14 @@ bool ScrollbackBuffer::popLine(Cell *out)
 
 void ScrollbackBuffer::clear()
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     size_ = 0; // totalPushed_ 不动：窗口 [totalPushed_, totalPushed_) 为空，序号保持单调
 }
 
 void ScrollbackBuffer::resizeCols(int newCols, const Cell &blank)
 {
     assert(newCols > 0);
+    std::lock_guard<std::mutex> lock(mutex_);
     if (newCols == cols_)
         return;
 

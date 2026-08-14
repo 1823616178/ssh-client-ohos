@@ -15,8 +15,9 @@ import libsshCore from 'libssh_core.so';
  * .so 默认导入在 ArkTS 编译器下是 any（arkts-no-any-unknown 会拦截
  * 由其推断出的变量声明），这里用显式接口收口全部原生方法。
  * 签名须与 types/libssh_core/index.d.ts 保持一致（改一侧必须同步另一侧）。
+ * 导出原因：nativeCore() 的返回类型须在调用方（SshTerminal.ets）可见
  */
-interface LibSshCoreModule {
+export interface LibSshCoreModule {
   createSession(onEvent: (event: SshEvent) => void): number;
   connect(handle: number, host: string, port: number, username: string): boolean;
   authenticatePassword(handle: number, password: string): boolean;
@@ -35,9 +36,43 @@ interface LibSshCoreModule {
   getOpensslVersion(): string;
   getVtermVersion(): string;
   getArgon2Version(): string;
+  // ---- T3 终端零拷贝快照（语义见 types/libssh_core/index.d.ts）----
+  attachTerminal(sessionHandle: number, termType: string, cols: number, rows: number): number;
+  detachTerminal(terminalHandle: number): boolean;
+  beginFrame(terminalHandle: number): NativeTerminalFrame | null;
+  endFrame(terminalHandle: number, seenRevision: number): boolean;
+  getRevision(terminalHandle: number): number;
+  selfTestGrid(terminalHandle: number): ArrayBuffer | null;
+  copyGridRows(terminalHandle: number, startRow: number, count: number): ArrayBuffer | null;
+  getScrollbackWindow(terminalHandle: number, startIndex: number, count: number): ArrayBuffer | null;
+  writeTerminal(terminalHandle: number, data: ArrayBuffer | string): boolean;
+  resizeTerminal(terminalHandle: number, cols: number, rows: number): boolean;
+}
+
+/** T3：native beginFrame 组包的原始帧对象（字段随 napi 组包，可选字段可能缺省） */
+export interface NativeTerminalFrame {
+  grid?: ArrayBuffer;
+  gridZeroCopy: boolean;
+  revision: number;
+  cols: number;
+  rows: number;
+  cursorRow: number;
+  cursorCol: number;
+  cursorVisible: boolean;
+  altScreen: boolean;
+  mouseMode: number;
+  bellCount: number;
+  scrollbackOldest: number;
+  scrollbackTotal: number;
+  dirty?: ArrayBuffer;
 }
 
 const native: LibSshCoreModule = libsshCore;
+
+/** T3：同进程内共享的 native 绑定（SshTerminal.ets 复用，避免第二处 .so 导入） */
+export function nativeCore(): LibSshCoreModule {
+  return native;
+}
 
 /** 会话状态（与 native SshSessionState 的 toString 输出一致） */
 export type SshSessionStateName =
@@ -86,6 +121,13 @@ export interface SshEvent {
   exitSignal?: string;
   code?: string;
   count?: number;
+  /** T3：终端事件携带的终端句柄（terminalOpen/terminalClose/terminalBell/
+   *  terminalTitle/terminalMouseMode），均随所属会话的 onEvent 上抛 */
+  terminal?: number;
+  /** T3：terminalTitle 事件的标题文本 */
+  title?: string;
+  /** T3：terminalMouseMode 事件的模式（0=关 1=点击 2=拖动 3=任意移动） */
+  mouseMode?: number;
 }
 
 export type SshEventListener = (event: SshEvent) => void;
@@ -189,6 +231,14 @@ export class SshNativeSession {
 
   private get alive(): boolean {
     return this.handle > 0;
+  }
+
+  /**
+   * T3：native 会话句柄（attachTerminal 的入参）。
+   * 仅供同模块的 SshTerminal 装配使用，业务层不应直接触碰
+   */
+  get nativeHandle(): number {
+    return this.handle;
   }
 }
 

@@ -69,6 +69,7 @@ set(TESTED_SOURCES
     ${CPP_ROOT}/term/grid.cpp
     ${CPP_ROOT}/term/vterm_screen.cpp
     ${CPP_ROOT}/term/scrollback.cpp
+    ${CPP_ROOT}/term/frame_sync.cpp
 )
 
 # ---- N6 ssh/ 会话层的 libssh2 依赖 ----
@@ -132,6 +133,7 @@ add_executable(ssh_core_tests
     term_grid_test.cpp
     vterm_screen_test.cpp
     scrollback_test.cpp
+    frame_sync_test.cpp
     ${TESTED_SOURCES}
 )
 target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR} ${VTERM_INCLUDE_DIR})

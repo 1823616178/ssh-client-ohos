@@ -15,8 +15,34 @@ CellGrid::CellGrid(int cols, int rows, uint32_t defaultFgArgb, uint32_t defaultB
 {
     assert(cols > 0 && rows > 0);
     const Cell blank = blankCell();
-    cells_.assign(static_cast<size_t>(cols_) * static_cast<size_t>(rows_), blank);
+    cells_ = std::make_shared<std::vector<Cell>>(
+        static_cast<size_t>(cols_) * static_cast<size_t>(rows_), blank);
     dirty_.assign(static_cast<size_t>(rows_ + 63) / 64, 0);
+}
+
+CellGrid::CellGrid(const CellGrid &other)
+    : cols_(other.cols_),
+      rows_(other.rows_),
+      defaultFgArgb_(other.defaultFgArgb_),
+      defaultBgArgb_(other.defaultBgArgb_),
+      cells_(std::make_shared<std::vector<Cell>>(*other.cells_)), // 深拷贝，不共享存储
+      dirty_(other.dirty_),
+      revision_(other.revision_)
+{
+}
+
+CellGrid &CellGrid::operator=(const CellGrid &other)
+{
+    if (this == &other)
+        return *this;
+    cols_ = other.cols_;
+    rows_ = other.rows_;
+    defaultFgArgb_ = other.defaultFgArgb_;
+    defaultBgArgb_ = other.defaultBgArgb_;
+    cells_ = std::make_shared<std::vector<Cell>>(*other.cells_);
+    dirty_ = other.dirty_;
+    revision_ = other.revision_;
+    return *this;
 }
 
 Cell CellGrid::blankCell() const
@@ -38,7 +64,7 @@ size_t CellGrid::index(int row, int col) const
 
 void CellGrid::putCell(int row, int col, const Cell &cell)
 {
-    cells_[index(row, col)] = cell;
+    (*cells_)[index(row, col)] = cell;
     setDirty(row);
     ++revision_;
 }
@@ -58,7 +84,7 @@ void CellGrid::fillCells(int row0, int col0, int row1, int col1, const Cell &cel
     col1 = std::min(col1, cols_);
     for (int r = row0; r < row1; ++r) {
         for (int c = col0; c < col1; ++c)
-            cells_[static_cast<size_t>(r) * static_cast<size_t>(cols_) + static_cast<size_t>(c)] = cell;
+            (*cells_)[static_cast<size_t>(r) * static_cast<size_t>(cols_) + static_cast<size_t>(c)] = cell;
         if (col0 < col1)
             setDirty(r);
         revision_ += static_cast<uint64_t>(std::max(col1 - col0, 0));
@@ -79,12 +105,12 @@ void CellGrid::copyCells(int destRow, int destCol, int srcRow, int srcCol, int r
     // 源/目标允许重叠（滚动 moverect 就是重叠场景）：先快照源区域再整体写回
     std::vector<Cell> snapshot(static_cast<size_t>(rowCount) * static_cast<size_t>(colCount));
     for (int r = 0; r < rowCount; ++r) {
-        const Cell *src = &cells_[index(srcRow + r, srcCol)];
+        const Cell *src = &(*cells_)[index(srcRow + r, srcCol)];
         std::memcpy(&snapshot[static_cast<size_t>(r) * static_cast<size_t>(colCount)],
                     src, static_cast<size_t>(colCount) * sizeof(Cell));
     }
     for (int r = 0; r < rowCount; ++r) {
-        Cell *dest = &cells_[index(destRow + r, destCol)];
+        Cell *dest = &(*cells_)[index(destRow + r, destCol)];
         std::memcpy(dest, &snapshot[static_cast<size_t>(r) * static_cast<size_t>(colCount)],
                     static_cast<size_t>(colCount) * sizeof(Cell));
         setDirty(destRow + r);
@@ -106,11 +132,14 @@ void CellGrid::resize(int newCols, int newRows)
     const int keepCols = std::min(cols_, newCols);
     for (int r = 0; r < keepRows; ++r) {
         std::memcpy(&next[static_cast<size_t>(r) * static_cast<size_t>(newCols)],
-                    &cells_[index(r, 0)],
+                    &(*cells_)[index(r, 0)],
                     static_cast<size_t>(keepCols) * sizeof(Cell));
     }
 
-    cells_ = std::move(next);
+    // 换入新存储：旧 vector 不被释放——cellsStorage() 流出的 shared_ptr 副本
+    //（T3 external arraybuffer 的保活句柄）继续持有它，直到 ArkTS 侧 GC 触发
+    // finalize 才回收；此后本网格的写入只落到新存储，旧存储内容冻结（稳定旧快照）
+    cells_ = std::make_shared<std::vector<Cell>>(std::move(next));
     cols_ = newCols;
     rows_ = newRows;
     dirty_.assign(static_cast<size_t>(rows_ + 63) / 64, 0);

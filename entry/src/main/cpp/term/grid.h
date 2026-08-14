@@ -20,11 +20,20 @@
  * 否则脏行位图与 revision 会与实际内容脱节。
  * 两条例外路径：bumpRevision（光标移动等非内容性视觉变化，只抬 revision）
  * 与 raiseRevisionFloor（整体重建后保 revision 单调不减），均不写单元格。
+ *
+ * 存储所有权（T3 零拷贝快照的生命周期保护）：
+ *   单元格存储为 shared_ptr<std::vector<Cell>>。resize 换入新 vector，
+ *   旧 vector 由 cellsStorage() 流出的 shared_ptr 副本保活——T3 把旧存储
+ *   包成 napi external arraybuffer 后，native 侧 resize/释放都不再回收旧内存，
+ *   ArkTS 持有的旧 buffer 读到的是仍存活的旧内容（可能旧尺寸），不崩；
+ *   旧 vector 的最后引用由 external buffer 的 finalize 回调释放（GC 触发）。
+ *   拷贝语义保持值语义（深拷贝存储），不共享——避免历史调用方意外联动。
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace sshclient {
@@ -64,6 +73,12 @@ public:
     // 默认前/背景色由上层外观系统注入（native 侧先为可配构造参数）
     CellGrid(int cols, int rows, uint32_t defaultFgArgb, uint32_t defaultBgArgb);
 
+    // 值语义深拷贝（存储 shared_ptr 不共享，见头注「存储所有权」）
+    CellGrid(const CellGrid &other);
+    CellGrid &operator=(const CellGrid &other);
+    CellGrid(CellGrid &&) = default;
+    CellGrid &operator=(CellGrid &&) = default;
+
     int cols() const { return cols_; }
     int rows() const { return rows_; }
     uint32_t defaultFgArgb() const { return defaultFgArgb_; }
@@ -73,12 +88,17 @@ public:
     Cell blankCell() const;
 
     // 越界是调用方 bug：debug 下 assert，release 下未定义（与 vector::operator[] 同级约定）
-    const Cell *cellAt(int row, int col) const { return &cells_[index(row, col)]; }
-    Cell *cellAt(int row, int col) { return &cells_[index(row, col)]; } // 写后须 touchCell
+    const Cell *cellAt(int row, int col) const { return &(*cells_)[index(row, col)]; }
+    Cell *cellAt(int row, int col) { return &(*cells_)[index(row, col)]; } // 写后须 touchCell
 
     // 连续内存起点与字节数（T3 零拷贝快照直接暴露这段内存）
-    const uint8_t *data() const { return reinterpret_cast<const uint8_t *>(cells_.data()); }
-    size_t byteSize() const { return cells_.size() * sizeof(Cell); }
+    const uint8_t *data() const { return reinterpret_cast<const uint8_t *>(cells_->data()); }
+    size_t byteSize() const { return cells_->size() * sizeof(Cell); }
+
+    // 当前单元格存储的共享所有权句柄（T3 零拷贝快照用）：与网格当前存储指向
+    // 同一 vector；此后 resize/setDefaultColors 换入新存储，本返回值仍保活旧 vector
+    //（配合 napi external arraybuffer 的 finalize 延迟回收，见头注）
+    std::shared_ptr<const std::vector<Cell>> cellsStorage() const { return cells_; }
 
     // 标准写路径：写一格 + 脏行置位 + revision +1
     void putCell(int row, int col, const Cell &cell);
@@ -125,7 +145,9 @@ private:
     int rows_;
     uint32_t defaultFgArgb_;
     uint32_t defaultBgArgb_;
-    std::vector<Cell> cells_;       // cols*rows 连续内存，行优先
+    // cols*rows 连续内存，行优先；shared_ptr 持有的原因见头注「存储所有权」（T3）。
+    // 永不为空（构造即分配）；resize 换入新 vector，旧 vector 由流出的副本保活
+    std::shared_ptr<std::vector<Cell>> cells_;
     std::vector<uint64_t> dirty_;   // (rows+63)/64 个 word
     uint64_t revision_ = 0;
 };
