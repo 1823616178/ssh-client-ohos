@@ -16,7 +16,7 @@
 - **M1 剩余**：Q1 大部分已由「WSL 免 root sshd + native 测试 + ci-local.sh 门禁」覆盖，Docker 多算法 sshd 与 x86_64 模拟器用例待补
 - **阻塞**：X0（签名，需人工）；N3b/T0 spike 与全部真机验收依赖 X0（含 T4 的 ≥50fps / CPU≈0 / 4 实例验收）
 - **验证基线**：`scripts/run-native-tests.sh` 116/116（含真实 sshd 集成）、ASan 干净、`scripts/ci-local.sh` 四阶段全绿
-- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）；T4 帧调度自动休眠需 U4 把会话事件接到 `notifyContentDirty()`（`FrameSchedulerCore.ets` 头注）；T4 光标/字符 blink 闪烁定时留给 A3
+- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）；**hvigor 本地单测经 Previewer.exe 执行，该进程在某些 Windows 会话无法启动（0xC0000142，桌面堆/会话级问题，需注销重登或重启），ci-local.sh 阶段 2 已加超时快速失败（`e2fda54`）；Previewer 恢复后需补跑 `hvigorw test` 留绿证（T5 起的新增用例只有编译绿证）**；T4 帧调度自动休眠需 U4 把会话事件接到 `notifyContentDirty()`（`FrameSchedulerCore.ets` 头注）；T4 光标/字符 blink 闪烁定时留给 A3
 
 ---
 
