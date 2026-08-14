@@ -16,6 +16,7 @@ import terminalGesturesTest from './TerminalGestures.test';
 import databaseSchemaTest from './DatabaseSchema.test';
 import daoTest from './Dao.test';
 import credentialStoreTest from './CredentialStore.test';
+import sessionManagerTest from './SessionManager.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -37,4 +38,5 @@ export default function testsuite() {
   databaseSchemaTest();
   daoTest();
   credentialStoreTest();
+  sessionManagerTest();
 }

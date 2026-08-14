@@ -2,7 +2,9 @@ import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.Ab
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { Logger } from '../common/utils/Logger';
+import { AppDatabase } from '../repository/AppDatabase';
 import { SettingsRepository } from '../repository/SettingsRepository';
+import { SessionManager } from '../service/SessionManager';
 import { registerTerminalFonts } from '../theme/FontService';
 
 const DOMAIN = 0x0000;
@@ -15,6 +17,8 @@ export default class EntryAbility extends UIAbility {
     // 初始化应用设置（C3）：获取 preferences store，并对缺失键写入默认值（不覆盖已有值）
     SettingsRepository.init(this.context);
     SettingsRepository.ensureDefaults();
+    // 初始化数据库（C1）：打开/迁移 ssh_client.db，失败只记日志不阻断启动
+    AppDatabase.init(this.context);
     // 注册终端内置字体（T5）：JetBrains Mono + Sarasa Term SC；失败只记日志不阻断启动
     registerTerminalFonts();
     try {
@@ -26,6 +30,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    // 应用退出/系统回收：优雅关闭全部 SSH 会话（C4，DESIGN §7.5；幂等，native 后台完成回收）
+    SessionManager.get().closeAll();
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
   }
 
