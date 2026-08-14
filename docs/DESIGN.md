@@ -245,8 +245,7 @@ cmake -DCMAKE_TOOLCHAIN_FILE="$OHOS_NDK/build/cmake/ohos.toolchain.cmake" \
   -DENABLE_ZLIB_COMPRESSION=ON
 ```
 
-产物按 ABI 归档到 `entry/libs/{arm64-v8a,x86_64}/`（静态库放 `third_party/prebuilt/`，
-最终只产出一个 `libssh_core.so`）。ABI 只发 **arm64-v8a**（真机）与 **x86_64**（模拟器/CI 单测），不发 armv7。
+产物按 ABI 归档到 `entry/src/main/cpp/prebuilt/{arm64-v8a,x86_64}/`（lib/ 与 include/，最终只产出一个 `libssh_core.so`，详见 `docs/NATIVE-BUILD.md`）。ABI 只发 **arm64-v8a**（真机）与 **x86_64**（模拟器/CI 单测），不发 armv7。
 
 `entry/build-profile.json5` 接入：
 
