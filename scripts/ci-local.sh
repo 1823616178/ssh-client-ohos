@@ -123,9 +123,24 @@ stage_lint() {
 # ---------- 阶段 2：ArkTS 单元测试 ----------
 stage_arkts_test() {
   local logfile="$LOG_DIR/stage2.log"
-  run_hvigor test > "$logfile" 2>&1 || return 1
-  # ⚠️ hvigorw test 的退出码不可信：测试失败仍可能 BUILD SUCCESSFUL。
-  # 必须 grep 日志判真伪失败（已知失败标志："Error in"、"FAILED"）。
+  # ⚠️ 双保险：
+  # 1) hvigorw test 不以退出码门禁测试失败（失败仍 BUILD SUCCESSFUL），必须 grep 日志判真伪失败；
+  # 2) 本地单测经 Previewer.exe 执行，该进程在某些 Windows 会话里无法启动（0xC0000142），
+  #    运行器无超时会永久挂起——故外层包 timeout，且强制要求日志出现 BUILD SUCCESSFUL，
+  #    挂起/中断一律判失败并给出提示。
+  timeout "${HVIGOR_TEST_TIMEOUT:-360}" node "$HVIGORW_JS" test --mode module -p product=default --no-daemon \
+    > "$logfile" 2>&1
+  local rc=$?
+  if [ $rc -eq 124 ]; then
+    echo "[ci] hvigorw test 超时（${HVIGOR_TEST_TIMEOUT:-360}s）：疑似 Previewer.exe 无法启动（0xC0000142 桌面堆/会话问题）。" >&2
+    echo "[ci] 处理建议：重启或注销重登 Windows 会话后重试；日志：$logfile" >&2
+    return 1
+  fi
+  [ $rc -eq 0 ] || return 1
+  if ! grep -q "BUILD SUCCESSFUL" "$logfile"; then
+    echo "[ci] hvigorw test 日志缺少 BUILD SUCCESSFUL（运行被中断或 Previewer 未就绪）：$logfile" >&2
+    return 1
+  fi
   if grep -qE "Error in|FAILED" "$logfile"; then
     echo "[ci] hvigor 退出码为 0 但日志中发现测试失败标志：" >&2
     grep -E "Error in|FAILED" "$logfile" | head -20 >&2
