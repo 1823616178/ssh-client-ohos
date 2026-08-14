@@ -528,6 +528,20 @@ bool ReachAuthenticating(sshclient::ssh::SshSession &session, StateRecorder &rec
            rec.waitFor(sshclient::ssh::SshSessionState::kAuthenticating, 20s);
 }
 
+// 连接 + 密码认证驱动到 established（N10 起通道测试用）；超时/失败返回 false
+bool ReachEstablished(sshclient::ssh::SshSession &session, StateRecorder &rec,
+                      const AuthTestEnv &env)
+{
+    if (!ReachAuthenticating(session, rec, env)) {
+        return false;
+    }
+    AuthResultBox box;
+    std::string password = env.password; // 受理即清零，须用副本
+    return session.authenticatePassword(password, std::ref(box)) && box.wait(10s) &&
+           box.result().has_value() && box.result()->success &&
+           rec.waitFor(sshclient::ssh::SshSessionState::kEstablished, 5s);
+}
+
 void SkipIfNoAuthEnv(const AuthTestEnv &env, bool loaded)
 {
     if (!loaded) {

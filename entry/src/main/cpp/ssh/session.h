@@ -160,6 +160,10 @@ using AuthMethodsCallback = std::function<void(std::optional<AuthMethodSet> meth
 // N9：应用内 SSH Agent（内存密钥托管），完整定义见 agent.h
 class SshAgent;
 
+// N10：shell/exec 通道（channel.h）；经 friend 访问会话内部（libssh2 句柄、
+// fd 事件分发、通道注册表），线程契约见 channel.h 头注
+class SshChannel;
+
 class SshSession {
 public:
     // 状态迁移回调：(from, to)，在事件循环线程触发；每次合法迁移恰好一次
@@ -241,6 +245,13 @@ private:
     void releaseResources(); // 摘 fd、关 socket、释放 libssh2 会话（循环线程）
     void cancelTimers();
 
+    // ---- N10 通道支撑（全部仅事件循环线程调用；SshChannel 经 friend 访问）----
+    friend class SshChannel;
+    void registerChannel(SshChannel *channel);   // established 态装配时注册
+    void unregisterChannel(SshChannel *channel); // 通道收尾时注销（幂等）
+    void driveChannels();      // established 态 fd 事件分发：泵送全部注册通道
+    void notifyChannelsSessionLost(); // releaseResources 前置：全部通道 kError 清理
+
     // ---- N8 认证驱动（循环线程；实现在 auth.cpp，避免 session.cpp 臃肿）----
     // 进行中的认证尝试：方式、凭据副本（受理时复制并清零调用方 buffer）、超时定时器。
     // 析构在 auth.cpp 定义——secureZero 清零内存凭据（成功/失败/中止路径都经由此处）。
@@ -317,6 +328,11 @@ private:
     AuthMethodsCallback authMethodsCallback_; // 进行中的方式探测回调（与 authOp_ 互斥）
     io::EventLoop::TimerId authMethodsTimer_ = 0;
     unsigned authFailedAttempts_ = 0; // 已连续失败的认证次数（对照 options_.authMaxAttempts）
+
+    // ---- N10 通道注册表（仅事件循环线程访问）----
+    // established 态的 fd 事件经 driveChannels 泵送到每个通道；会话断开/关闭时
+    // 经 notifyChannelsSessionLost 全部清理。通道完成收尾（finishClose）后自行注销。
+    std::vector<SshChannel *> channels_;
 };
 
 const char *toString(SshSessionState state);

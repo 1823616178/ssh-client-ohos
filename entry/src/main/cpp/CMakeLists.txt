@@ -16,6 +16,7 @@ set(NATIVE_SOURCES
     ssh/hostkey.cpp
     ssh/auth.cpp
     ssh/agent.cpp
+    ssh/channel.cpp
     # term/
     # crypto/
     crypto/aad.cpp

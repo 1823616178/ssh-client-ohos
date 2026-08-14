@@ -14,6 +14,9 @@
 #include <libssh2.h>
 
 #include "../io/SessionThread.h"
+#include "channel.h"
+
+#include <algorithm>
 
 // glibc 在 -std=c++17（非 gnu++17）下不暴露 EPOLLRDHUP；musl（OHOS）无条件定义。
 // 值为内核 ABI 常量 0x2000，与定义来源无关。
@@ -73,7 +76,12 @@ SshSession::~SshSession()
     // 终态迁移前 releaseResources() 已回收 fd_/session_，这里只是兜底，
     // 绝不在运行中的循环上并发 removeFd。
     if (session_ != nullptr) {
-        ::libssh2_session_free(session_);
+        if (::libssh2_session_free(session_) == LIBSSH2_ERROR_EAGAIN && fd_ >= 0) {
+            // 同 releaseResources 的 EAGAIN 防护：close 后重试使残留 flush 立即失败
+            ::close(fd_);
+            fd_ = -1;
+            ::libssh2_session_free(session_);
+        }
         session_ = nullptr;
     }
     if (fd_ >= 0) {
@@ -290,13 +298,16 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
             return;
         }
         // N8：认证类操作进行中时按 libssh2 声明的阻塞方向挂了 EPOLLIN/OUT
-        // （见 updateFdInterest），事件到来即续跑驱动；established 态的通道读写是 N10 的事
+        // （见 updateFdInterest），事件到来即续跑驱动；
+        // N10：established 态的 fd 事件分发到全部注册通道（打开续跑/读写/关闭握手）
         if (state() == SshSessionState::kAuthenticating) {
             if (authMethodsCallback_) {
                 driveAuthMethodsQuery();
             } else if (authOp_) {
                 driveAuth();
             }
+        } else if (!channels_.empty()) {
+            driveChannels();
         }
         return;
     case SshSessionState::kClosing:
@@ -530,8 +541,22 @@ void SshSession::updateFdInterest()
             }
         }
         break;
+    case SshSessionState::kEstablished:
+        // N10：有注册通道时常开 EPOLLIN（通道数据/EOF/close/窗口调整等入向报文）；
+        // EPOLLOUT 仅在某通道最近一次 EAGAIN 为发送方向（OUTBOUND）停滞时挂——
+        // 对端停读导致的窗口耗尽是 INBOUND 停滞，挂 EPOLLOUT 会 LT 空转
+        if (!channels_.empty()) {
+            mask |= EPOLLIN;
+            for (const SshChannel *ch : channels_) {
+                if (ch->wantsOutboundBlocked()) {
+                    mask |= EPOLLOUT;
+                    break;
+                }
+            }
+        }
+        break;
     default:
-        break; // established：只留 RDHUP 做断线检测
+        break; // 其余状态：只留 RDHUP 做断线检测
     }
     thread_.loop().modifyFd(fd_, mask);
 }
@@ -580,9 +605,26 @@ void SshSession::releaseResources()
     // N8：先清认证状态——摘认证定时器并清零内存中的凭据副本（auth.cpp）；
     // 必须在 session_ 释放之前（认证上下文引用它）
     clearAuthState();
+    // N10：再清通道——全部注册通道收到 kError 关闭通知并释放 libssh2 句柄；
+    // 同样必须在 session_free 之前（通道句柄引用会话）
+    notifyChannelsSessionLost();
     if (session_ != nullptr) {
         // libssh2_session_free 可能尝试冲刷剩余报文（仍会写 fd），先于 close 调用
-        ::libssh2_session_free(session_);
+        if (::libssh2_session_free(session_) == LIBSSH2_ERROR_EAGAIN) {
+            // 发送缓冲满/对端停读时 free 以 EAGAIN 拒绝释放内存（1.11 行为：
+            // 通道 close 报文冲不出去则整个会话对象图都不释放）。内存不能泄——
+            // 先摘 fd 并 close，让残留 flush 以真实错误（EBADF/EPIPE）快速失败
+            //（channel_free 对非 EAGAIN 错误放行，见 libssh2 channel.c），再重试
+            if (fd_ >= 0) {
+                if (fdRegistered_) {
+                    thread_.loop().removeFd(fd_);
+                    fdRegistered_ = false;
+                }
+                ::close(fd_);
+                fd_ = -1;
+            }
+            ::libssh2_session_free(session_);
+        }
         session_ = nullptr;
     }
     if (fd_ >= 0) {
@@ -609,6 +651,56 @@ void SshSession::cancelTimers()
         thread_.loop().cancelTimer(closeFlushTimer_);
         closeFlushTimer_ = 0;
     }
+}
+
+// ------------------------------------------------------------------ N10 通道分发（循环线程）
+
+void SshSession::registerChannel(SshChannel *channel)
+{
+    channels_.push_back(channel);
+    updateFdInterest(); // 首个通道注册后即开 EPOLLIN
+}
+
+void SshSession::unregisterChannel(SshChannel *channel)
+{
+    const auto it = std::find(channels_.begin(), channels_.end(), channel);
+    if (it != channels_.end()) {
+        channels_.erase(it);
+    }
+    updateFdInterest(); // 无通道后回到只挂 RDHUP 的断线检测
+}
+
+void SshSession::driveChannels()
+{
+    // 多轮泵送直到一轮无任何进展：A 通道的读会把 B 通道的报文搬进 libssh2
+    // 内部队列（socket 上未必再有新数据，不会再触发 EPOLLIN），单轮可能漏掉；
+    // 有进展的轮次必然消费了真实字节或推进了状态，轮数封顶纯作防御
+    for (int pass = 0; pass < 8; ++pass) {
+        bool progress = false;
+        const std::vector<SshChannel *> snapshot = channels_; // 泵送中通道可能注销
+        for (SshChannel *ch : snapshot) {
+            if (std::find(channels_.begin(), channels_.end(), ch) == channels_.end()) {
+                continue;
+            }
+            if (ch->pump()) {
+                progress = true;
+            }
+        }
+        if (!progress) {
+            break;
+        }
+    }
+    updateFdInterest();
+}
+
+void SshSession::notifyChannelsSessionLost()
+{
+    // 快照防回调内注销；onSessionLost 负责释放各通道的 libssh2 句柄并发通知
+    const std::vector<SshChannel *> snapshot = channels_;
+    for (SshChannel *ch : snapshot) {
+        ch->onSessionLost();
+    }
+    channels_.clear();
 }
 
 // ------------------------------------------------------------------ 字符串化
