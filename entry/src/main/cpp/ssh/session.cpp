@@ -124,6 +124,12 @@ std::string SshSession::lastErrorMessage() const
     return errorMessage_;
 }
 
+std::optional<HostKeyInfo> SshSession::hostKeyInfo() const
+{
+    std::lock_guard<std::mutex> lock(hostKeyMutex_);
+    return hostKeyInfo_;
+}
+
 bool SshSession::isLegalTransition(SshSessionState from, SshSessionState to)
 {
     using S = SshSessionState;
@@ -133,7 +139,9 @@ bool SshSession::isLegalTransition(SshSessionState from, SshSessionState to)
     case S::kConnecting:
         return to == S::kHandshaking || to == S::kError || to == S::kClosed;
     case S::kHandshaking:
-        return to == S::kAuthenticating || to == S::kError || to == S::kClosed;
+        // kClosing：N7 主机密钥被拒时发协议层 disconnect 后优雅断开（见 verifyHostKey）
+        return to == S::kAuthenticating || to == S::kError || to == S::kClosed ||
+               to == S::kClosing;
     case S::kAuthenticating:
         // kEstablished 由 N8 认证成功进入；本任务内不会走到
         return to == S::kEstablished || to == S::kClosing || to == S::kDisconnected ||
@@ -290,8 +298,10 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
             return;
         }
         if ((events & EPOLLOUT) != 0) {
-            const int rc = ::libssh2_session_disconnect_ex(
-                session_, SSH_DISCONNECT_BY_APPLICATION, "client closing", "");
+            // 用成员里的 reason/desc：N7 主机密钥被拒时是 HOST_KEY_NOT_VERIFIABLE，
+            // 主动 close() 时是默认的 BY_APPLICATION
+            const int rc = ::libssh2_session_disconnect_ex(session_, disconnectReason_,
+                                                           disconnectDesc_.c_str(), "");
             if (rc != LIBSSH2_ERROR_EAGAIN) {
                 releaseResources();
                 transitionTo(SshSessionState::kClosed);
@@ -318,7 +328,7 @@ void SshSession::beginHandshake()
     // 默认集已覆盖 aes256-gcm@openssh.com / aes128-gcm / aes256-ctr、
     // curve25519-sha256 / ecdh-sha2-nistp* 、ssh-ed25519 / ecdsa-sha2-nistp256 /
     // rsa-sha2-512 等主流算法；chacha20-poly1305 不在其中（风险 R-7 已知，备选后端兜底）。
-    // 主机密钥校验（TOFU）是 N7，本任务不校验。
+    // 主机密钥校验（TOFU）在握手完成的瞬间进行，见 driveHandshake → verifyHostKey。
 
     transitionTo(SshSessionState::kHandshaking);
     handshakeTimer_ = thread_.loop().runAfter(options_.handshakeTimeoutMs, [this] {
@@ -335,6 +345,13 @@ void SshSession::driveHandshake()
     if (rc == 0) {
         thread_.loop().cancelTimer(handshakeTimer_);
         handshakeTimer_ = 0;
+        // N7 主机密钥校验点：libssh2 握手完成后才能取主机密钥，故 TASKS 验收标准
+        // 「指纹变更时不继续握手」落地为——校验不过则不进入 authenticating，
+        // 发 SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE 主动断开（closing → closed），
+        // 并以 kHostKeyMismatch 作为 lastError() 的返回方向（对应验收的 HOST_KEY_MISMATCH）。
+        if (!verifyHostKey()) {
+            return;
+        }
         transitionTo(SshSessionState::kAuthenticating); // N6 边界：待认证
         updateFdInterest();
         return;
@@ -350,6 +367,68 @@ void SshSession::driveHandshake()
     failWith(SshSessionError::kHandshakeFailed,
              std::string("SSH 握手失败: ") +
                  (errmsg != nullptr ? std::string(errmsg, errmsgLen) : std::string("未知错误")));
+}
+
+// ---------------------------------------------------------------- 主机密钥校验（循环线程，N7）
+
+bool SshSession::verifyHostKey()
+{
+    std::optional<HostKeyInfo> info = extractHostKey(session_);
+    if (!info.has_value()) {
+        // 握手刚完成却取不到主机密钥：无法自证身份，fail-closed 按不匹配处理
+        abortHostKeyMismatch("主机密钥提取失败（握手后 hostkey 不可用）");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(hostKeyMutex_);
+        hostKeyInfo_ = *info; // 含被拒场景也要留档，供上层做指纹对比视图
+    }
+
+    HostKeyDecision decision = HostKeyDecision::kAccept;
+    if (options_.hostKeyCallback) {
+        // 循环线程上同步调用；回调契约（快速返回、异步确认走先拒后重连）见 hostkey.h
+        decision = options_.hostKeyCallback(*info);
+    } else {
+        // 默认策略（仅适合开发联调）：首连放行并报告指纹。
+        // 生产路径必须注入回调与 known_hosts 比对，否则中间人替换密钥不会被发现。
+        SSH_LOG("主机密钥未比对（默认 TOFU 放行）: %s %s", info->keyType.c_str(),
+                info->fingerprintSha256.c_str());
+    }
+    if (decision == HostKeyDecision::kReject) {
+        abortHostKeyMismatch(std::string("主机密钥被上层拒绝: ") + info->keyType + " " +
+                             info->fingerprintSha256);
+        return false;
+    }
+    return true;
+}
+
+void SshSession::abortHostKeyMismatch(const std::string &message)
+{
+    {
+        std::lock_guard<std::mutex> lock(errorMutex_);
+        error_ = SshSessionError::kHostKeyMismatch;
+        errorMessage_ = message;
+    }
+    SSH_LOG("中止连接（主机密钥不可信）：%s", message.c_str());
+    // 与主动 close() 同一优雅收尾路径：发协议层 disconnect 告知对端原因
+    // （RFC 4253 原因码 9 host key not verifiable），状态 closing → closed。
+    disconnectReason_ = SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE;
+    disconnectDesc_ = "host key rejected";
+    transitionTo(SshSessionState::kClosing);
+    closeFlushTimer_ = thread_.loop().runAfter(options_.closeFlushTimeoutMs, [this] {
+        if (state() == SshSessionState::kClosing) {
+            releaseResources();
+            transitionTo(SshSessionState::kClosed);
+        }
+    });
+    const int rc = ::libssh2_session_disconnect_ex(session_, disconnectReason_,
+                                                   disconnectDesc_.c_str(), "");
+    if (rc != LIBSSH2_ERROR_EAGAIN) {
+        releaseResources(); // 内部 cancelTimers() 一并摘掉 closeFlushTimer_
+        transitionTo(SshSessionState::kClosed);
+        return;
+    }
+    updateFdInterest(); // EAGAIN：挂 EPOLLOUT 等可写，由 kClosing 分支重试
 }
 
 // ------------------------------------------------------------------ 关闭路径（循环线程）
@@ -385,8 +464,8 @@ void SshSession::doClose()
         }
     });
 
-    const int rc = ::libssh2_session_disconnect_ex(session_, SSH_DISCONNECT_BY_APPLICATION,
-                                                   "client closing", "");
+    const int rc = ::libssh2_session_disconnect_ex(session_, disconnectReason_,
+                                                   disconnectDesc_.c_str(), "");
     if (rc != LIBSSH2_ERROR_EAGAIN) {
         releaseResources();
         transitionTo(SshSessionState::kClosed);
@@ -529,6 +608,7 @@ const char *toString(SshSessionError error)
     case SshSessionError::kConnectTimeout:    return "connect_timeout";
     case SshSessionError::kHandshakeFailed:   return "handshake_failed";
     case SshSessionError::kHandshakeTimeout:  return "handshake_timeout";
+    case SshSessionError::kHostKeyMismatch:   return "host_key_mismatch";
     case SshSessionError::kDisconnectedByPeer: return "disconnected_by_peer";
     case SshSessionError::kSocketError:       return "socket_error";
     case SshSessionError::kInternal:          return "internal";

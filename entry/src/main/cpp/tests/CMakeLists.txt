@@ -60,6 +60,7 @@ set(TESTED_SOURCES
     ${CPP_ROOT}/io/EventLoop.cpp
     ${CPP_ROOT}/io/SessionThread.cpp
     ${CPP_ROOT}/ssh/session.cpp
+    ${CPP_ROOT}/ssh/hostkey.cpp
 )
 
 # ---- N6 ssh/ 会话层的 libssh2 依赖 ----
@@ -96,6 +97,7 @@ add_executable(ssh_core_tests
     event_loop_test.cpp
     session_thread_test.cpp
     ssh_session_test.cpp
+    hostkey_test.cpp
     ${TESTED_SOURCES}
 )
 target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR})

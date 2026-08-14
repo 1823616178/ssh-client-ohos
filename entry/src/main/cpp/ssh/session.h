@@ -4,10 +4,15 @@
  * 状态机（终态：kClosed / kDisconnected / kError）：
  *
  *     idle → connecting(tcp) → handshaking → authenticating → established
- *                ↓                 ↓              ↓              ↓
- *              error             error      disconnected   disconnected
- *                ↓(close)          ↓(close)      （任意非终态 close → closing → closed）
+ *                ↓                 ↓    ↘         ↓              ↓
+ *              error             error  (N7)  disconnected   disconnected
+ *                ↓(close)          ↓     closing → closed（主机密钥被拒）
+ *                               （任意非终态 close → closing → closed）
  *
+ *   - N7 主机密钥 TOFU 校验点：握手成功后、进入 authenticating 前
+ *     （libssh2 握手完成后才能取主机密钥）。上层回调拒绝（指纹不匹配/用户否认）时
+ *     不进入 authenticating，发 SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE 后走
+ *     closing → closed 断开，错误码 kHostKeyMismatch 经 lastError() 可读；
  *   - authenticating 是「待认证」边界：N6 到此为止，密码/公钥认证是 N8；
  *   - established 由 N8 认证成功后进入，本任务仅保留状态位与迁移校验；
  *   - error 终态细分原因由 lastError() / lastErrorMessage() 提供
@@ -35,6 +40,7 @@
 #include <string>
 
 #include "../io/EventLoop.h"
+#include "hostkey.h"
 
 // 前向声明 libssh2 会话结构，避免把 <libssh2.h> 漏进公共头
 // （tag 名与 libssh2 1.11.x 的 typedef 保持一致，pin 版本升级时需核对）
@@ -65,6 +71,8 @@ enum class SshSessionError {
     kConnectTimeout,     // TCP connect 超时
     kHandshakeFailed,    // SSH 握手/算法协商失败
     kHandshakeTimeout,   // SSH 握手超时
+    kHostKeyMismatch,    // N7：主机密钥被上层拒绝（指纹不匹配/首连未获信任）；
+                         // 终态为 closed（closing → closed 主动断开），此码经 lastError() 读取
     kDisconnectedByPeer, // 对端关闭（FIN/RST）
     kSocketError,        // 底层 socket 错误
     kInternal,           // 内部错误（资源创建失败等）
@@ -74,6 +82,13 @@ struct SshSessionOptions {
     uint32_t connectTimeoutMs = 10000;    // TCP 连接超时
     uint32_t handshakeTimeoutMs = 15000;  // SSH 握手整体超时
     uint32_t closeFlushTimeoutMs = 2000;  // 优雅关闭时 disconnect 报文冲刷上限
+
+    // N7 主机密钥 TOFU 决策回调（构造后不可变，无并发问题）：
+    // 握手成功后、进入 authenticating 前在事件循环线程同步调用，须快速返回
+    // （回调契约与异步 UI 确认的正确编排见 hostkey.h 注释）。
+    // 为空 = 默认策略：放行并仅记日志报告指纹 —— TOFU 首连语义，仅适合开发联调；
+    // 生产必须设置回调，与 ArkTS SQLite 的 known_hosts（DESIGN §5.1）比对后决策。
+    HostKeyCallback hostKeyCallback;
 };
 
 class SshSession {
@@ -100,6 +115,11 @@ public:
     SshSessionError lastError() const;
     std::string lastErrorMessage() const;
 
+    // N7：当前主机密钥信息（任意线程，mutex 保护）。握手成功后可用——
+    // 包括被上层拒绝的会话（此时状态走 closing/closed，供对比视图展示）；
+    // 尚未握手/连接失败返回 nullopt。
+    std::optional<HostKeyInfo> hostKeyInfo() const;
+
     // 迁移合法性表（静态纯函数，供单测直接校验状态机边界）
     static bool isLegalTransition(SshSessionState from, SshSessionState to);
 
@@ -109,6 +129,8 @@ private:
     void onSocketEvent(int fd, uint32_t events);
     void beginHandshake();
     void driveHandshake();
+    bool verifyHostKey(); // N7：提取+回调决策；false = 已走 abortHostKeyMismatch 中止
+    void abortHostKeyMismatch(const std::string &message); // 记错误码 → closing → closed
     void doClose();
     void updateFdInterest();
     void transitionTo(SshSessionState to);
@@ -128,6 +150,10 @@ private:
     SshSessionError error_ = SshSessionError::kNone;
     std::string errorMessage_;
 
+    // N7 主机密钥信息：循环线程写（握手成功后）、任意线程读
+    mutable std::mutex hostKeyMutex_;
+    std::optional<HostKeyInfo> hostKeyInfo_;
+
     // connect 受理占位（CAS 防多线程重复 connect）；参数在 post 前写入，
     // 经 EventLoop::post 的互斥锁与循环线程构成 happens-before
     std::atomic<bool> connectAdmitted_{false};
@@ -142,6 +168,10 @@ private:
     io::EventLoop::TimerId connectTimer_ = 0;
     io::EventLoop::TimerId handshakeTimer_ = 0;
     io::EventLoop::TimerId closeFlushTimer_ = 0;
+    // 优雅告别时发给对端的 disconnect 原因（RFC 4253 原因码；11 = by application）。
+    // N7 主机密钥被拒时改写为 9（host key not verifiable）再进 closing。
+    int disconnectReason_ = 11;
+    std::string disconnectDesc_ = "client closing";
 };
 
 const char *toString(SshSessionState state);

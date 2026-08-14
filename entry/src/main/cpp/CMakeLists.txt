@@ -13,6 +13,7 @@ set(NATIVE_SOURCES
     # bridge/
     # ssh/
     ssh/session.cpp
+    ssh/hostkey.cpp
     # term/
     # crypto/
     crypto/aad.cpp
