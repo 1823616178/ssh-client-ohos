@@ -28,11 +28,13 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
 #include "../io/EventLoop.h"
 #include "../io/SessionThread.h"
 #include "../ssh/auth.h" // secureZero（OPENSSL_cleanse 封装）
 #include "../ssh/channel.h"
+#include "../ssh/reconnect_policy.h" // N12：BackoffSchedule（每会话重连退避策略）
 #include "../ssh/session.h"
 #include "data_aggregator.h"
 #include "handle_table.h"
@@ -59,10 +61,11 @@ struct BridgeEvent {
     uint32_t channelId = 0; // kChannelOpen / kChannelData / kChannelClose
     int stream = 0;         // kChannelData：0=stdout 1=stderr
     long number = 0;        // attemptsLeft / exitStatus / droppedCount
-    bool success = false;   // kAuthResult / kChannelOpen
+    bool success = false;   // kAuthResult / kChannelOpen / kStateChange 终态的 reconnectHint 值
+    bool hasHint = false;   // kStateChange：终态（disconnected/error/closed）附重连提示（N12）
     std::string text1;      // from / keyType / method / openError / closeReason / code
     std::string text2;      // to / sha256 / authError / openMessage / exitSignal / message
-    std::string text3;      // md5 / authMessage / closeMessage
+    std::string text3;      // md5 / authMessage / closeMessage / kStateChange 终态的 errorCode
     std::string text4;      // randomart
     std::string bytes;      // kChannelData 聚合批次（原始字节，可能切断 UTF-8 序列）
 };
@@ -179,6 +182,13 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
         SetStrProp(env, obj, "type", "stateChange");
         SetStrProp(env, obj, "from", evt->text1);
         SetStrProp(env, obj, "to", evt->text2);
+        // N12：终态附自动重连提示（reconnectHint）与错误码（errorCode，kNone 时省略）
+        if (evt->hasHint) {
+            SetBoolProp(env, obj, "reconnectHint", evt->success);
+            if (!evt->text3.empty()) {
+                SetStrProp(env, obj, "errorCode", evt->text3);
+            }
+        }
         break;
     case EventKind::kHostKey:
         SetStrProp(env, obj, "type", "hostKey");
@@ -274,6 +284,10 @@ struct SessionHandle {
     // 两条 TSFN 上下文：由各自 TSFN 的 finalize 释放，本对象不 delete
     TsfnBridge *stateBridge = nullptr;
     TsfnBridge *dataBridge = nullptr;
+
+    // N12：每会话重连退避策略（ArkTS 线程经 setReconnectPolicy 写、
+    // nextReconnectDelaySec 读；与既有方法同一 ArkTS 串行调用约定，无需加锁）
+    ssh::BackoffSchedule reconnectPolicy;
 
     std::atomic<bool> tornDown{false};
 
@@ -663,6 +677,19 @@ napi_value CreateSession(napi_env env, napi_callback_info info)
             auto *evt = new BridgeEvent{EventKind::kStateChange};
             evt->text1 = ssh::toString(from);
             evt->text2 = ssh::toString(to);
+            // N12：终态（disconnected/error/closed）附「是否值得自动重连」提示与错误码，
+            // 供 ArkTS SessionManager（C4）编排退避重连；重连决策纯函数见
+            // ssh::isAutoReconnectable（session.h）。本回调在循环线程触发，
+            // raw->session 在 teardown join 线程前始终存活
+            if (to == ssh::SshSessionState::kDisconnected || to == ssh::SshSessionState::kError ||
+                to == ssh::SshSessionState::kClosed) {
+                const ssh::SshSessionError err = raw->session->lastError();
+                evt->hasHint = true;
+                evt->success = ssh::isAutoReconnectable(to, err);
+                if (err != ssh::SshSessionError::kNone) {
+                    evt->text3 = ssh::toString(err);
+                }
+            }
             SendStateEvent(raw, evt);
         });
 
@@ -912,6 +939,95 @@ napi_value CloseSession(napi_env env, napi_callback_info info)
     return MakeBool(env, true);
 }
 
+// ---------------------------------------------------------------- N12 keepalive 与重连策略
+
+napi_value SetKeepalive(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t h = 0;
+    uint32_t intervalSec = 0, maxMisses = 0;
+    if (argc < 3 || !GetHandleArg(env, argv[0], h) || !GetUint32Arg(env, argv[1], intervalSec) ||
+        !GetUint32Arg(env, argv[2], maxMisses)) {
+        return MakeBool(env, false);
+    }
+    auto sh = LookupLive(h);
+    if (!sh || !sh->session) {
+        return MakeBool(env, false);
+    }
+    // 仅 idle 态受理（即须在 connect 前调用）；语义见 ssh/session.h setKeepaliveConfig
+    return MakeBool(env, sh->session->setKeepaliveConfig(intervalSec, maxMisses));
+}
+
+// 读取退避序列数组（number[]，秒，0 表示立即重试档，86400 上限作 sanity 截断）；
+// 空数组 = 恢复默认序列（BackoffSchedule 构造约定）
+bool GetDelaysArg(napi_env env, napi_value v, std::vector<uint32_t> &out)
+{
+    bool isArray = false;
+    if (napi_is_array(env, v, &isArray) != napi_ok || !isArray) {
+        return false;
+    }
+    uint32_t len = 0;
+    if (napi_get_array_length(env, v, &len) != napi_ok) {
+        return false;
+    }
+    out.clear();
+    out.reserve(len);
+    for (uint32_t i = 0; i < len; ++i) {
+        napi_value elem = nullptr;
+        double d = 0;
+        if (napi_get_element(env, v, i, &elem) != napi_ok ||
+            napi_get_value_double(env, elem, &d) != napi_ok || d < 0 || d > 86400) {
+            return false;
+        }
+        out.push_back(static_cast<uint32_t>(d));
+    }
+    return true;
+}
+
+napi_value SetReconnectPolicy(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t h = 0;
+    std::vector<uint32_t> delays;
+    uint32_t maxAttempts = ssh::BackoffSchedule::kDefaultMaxAttempts;
+    if (argc < 3 || !GetHandleArg(env, argv[0], h) || !GetDelaysArg(env, argv[1], delays) ||
+        !GetUint32Arg(env, argv[2], maxAttempts)) {
+        return MakeBool(env, false);
+    }
+    auto sh = LookupLive(h);
+    if (!sh) {
+        return MakeBool(env, false);
+    }
+    // 任意时刻可调（策略不参与 native 会话内部状态，仅作 ArkTS 重连编排的查询依据）
+    sh->reconnectPolicy = ssh::BackoffSchedule(std::move(delays), maxAttempts);
+    return MakeBool(env, true);
+}
+
+napi_value NextReconnectDelaySec(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t h = 0;
+    uint32_t attempt = 0;
+    // -1 = 已达上限放弃重连（或句柄/参数无效）；否则为第 attempt 次（从 1 计）
+    // 重连前的建议等待秒数，越界档由 BackoffSchedule 钳制
+    double result = -1;
+    if (argc >= 2 && GetHandleArg(env, argv[0], h) && GetUint32Arg(env, argv[1], attempt)) {
+        auto sh = LookupLive(h);
+        if (sh && !sh->reconnectPolicy.shouldGiveUp(attempt)) {
+            result = static_cast<double>(sh->reconnectPolicy.delayForAttempt(attempt));
+        }
+    }
+    napi_value r = nullptr;
+    napi_create_double(env, result, &r);
+    return r;
+}
+
 // env 销毁清理钩子：全部会话同步优雅停掉（VM 正在关闭，阻塞可接受），
 // 并等待进行中的异步 teardown 收尾——它们的 TSFN 属于本 env，必须先放完。
 // 注意 OHOS 的 napi_add_env_cleanup_hook 签名是 void(*)(void*)（不传 env，
@@ -943,6 +1059,11 @@ void RegisterSessionBridge(napi_env env, napi_value exports)
         {"resize", nullptr, Resize, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"closeChannel", nullptr, CloseChannel, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"closeSession", nullptr, CloseSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setKeepalive", nullptr, SetKeepalive, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setReconnectPolicy", nullptr, SetReconnectPolicy, nullptr, nullptr, nullptr,
+         napi_default, nullptr},
+        {"nextReconnectDelaySec", nullptr, NextReconnectDelaySec, nullptr, nullptr, nullptr,
+         napi_default, nullptr},
     };
     if (napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc) != napi_ok) {
         OH_LOG_ERROR(LOG_APP, "RegisterSessionBridge: napi_define_properties failed");

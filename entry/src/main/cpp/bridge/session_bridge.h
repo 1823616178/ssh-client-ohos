@@ -48,6 +48,16 @@
  * 确认编排留给上层（C4/known_hosts 方向）在拿到事件后自行实现，需要拒绝时
  * 上层 closeSession 后重连。
  *
+ * N12 keepalive 与重连（任务约定：重连编排在 ArkTS 侧，native 只做三件套）：
+ *   - setKeepalive(handle, intervalSec, maxMisses)：会话 keepalive 配置
+ *     （须在 connect 前调用；静默黑洞判定在 ssh/session.cpp，触发后走
+ *     stateChange → disconnected，errorCode=keepalive_timeout）；
+ *   - stateChange 进入终态（disconnected/error/closed）时附 reconnectHint
+ *     （是否值得自动重连，ssh::isAutoReconnectable）与 errorCode；
+ *   - setReconnectPolicy(handle, delaysSec, maxAttempts) 设置每会话退避策略，
+ *     nextReconnectDelaySec(handle, attempt) 查询第 attempt 次重连的建议延迟
+ *     （-1 = 已达上限放弃）；倒计时与尝试计数由 ArkTS 侧据事件自行驱动。
+ *
  * 本目录（bridge/）与 napi_init.cpp 是唯二允许 include napi/hilog 头的位置；
  * ssh/ io/ term/ crypto/ 保持纯净。napi 头经 OHOS 扩展头 napi/native_api.h
  * 引入（TSFN、env cleanup hook 等在该头声明）。

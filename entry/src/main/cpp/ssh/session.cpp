@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 
 #include <libssh2.h>
@@ -136,6 +137,21 @@ std::optional<HostKeyInfo> SshSession::hostKeyInfo() const
 {
     std::lock_guard<std::mutex> lock(hostKeyMutex_);
     return hostKeyInfo_;
+}
+
+bool SshSession::setKeepaliveConfig(uint32_t intervalSec, uint32_t maxMisses)
+{
+    // 仅 idle 态受理：keepalive 参数在进入 established 的 armKeepalive 时一次性
+    // 装配（libssh2_keepalive_config + 定时器），连接建立后再改没有意义——
+    // 上层（bridge setKeepalive）的契约就是 connect 之前调用
+    if (state() != SshSessionState::kIdle) {
+        return false;
+    }
+    options_.keepaliveIntervalSec = intervalSec;
+    options_.keepaliveMaxMisses = maxMisses;
+    // tracker 只携带阈值配置，重建即重置（idle 态尚无循环线程活动，无并发）
+    keepaliveMissTracker_ = KeepaliveMissTracker(maxMisses);
+    return true;
 }
 
 bool SshSession::isLegalTransition(SshSessionState from, SshSessionState to)
@@ -296,6 +312,11 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
                 peerLost(SshSessionError::kDisconnectedByPeer, "对端关闭连接");
             }
             return;
+        }
+        // N12：入站活动观测（keepalive 黑洞判定的信号 1，见 keepalive.h 头注）。
+        // 只在 established 周期内有意义，authenticating 顺带标记无害
+        if ((events & EPOLLIN) != 0) {
+            keepaliveInboundSeen_ = true;
         }
         // N8：认证类操作进行中时按 libssh2 声明的阻塞方向挂了 EPOLLIN/OUT
         // （见 updateFdInterest），事件到来即续跑驱动；
@@ -570,6 +591,9 @@ void SshSession::transitionTo(SshSessionState to)
     }
     state_.store(to, std::memory_order_release);
     SSH_LOG("状态 %s -> %s", toString(from), toString(to));
+    if (to == SshSessionState::kEstablished) {
+        armKeepalive(); // N12：装配 keepalive（interval 为 0 时内部空操作）
+    }
     if (callback_) {
         callback_(from, to);
     }
@@ -651,6 +675,10 @@ void SshSession::cancelTimers()
         thread_.loop().cancelTimer(closeFlushTimer_);
         closeFlushTimer_ = 0;
     }
+    if (keepaliveTimer_ != 0) {
+        thread_.loop().cancelTimer(keepaliveTimer_);
+        keepaliveTimer_ = 0;
+    }
 }
 
 // ------------------------------------------------------------------ N10 通道分发（循环线程）
@@ -703,6 +731,86 @@ void SshSession::notifyChannelsSessionLost()
     channels_.clear();
 }
 
+// ------------------------------------------------------------------ N12 keepalive（循环线程）
+
+void SshSession::armKeepalive()
+{
+    // 进入 established 的钩子（transitionTo 调用）；interval 为 0 = 关闭，直接返回
+    if (options_.keepaliveIntervalSec == 0 || session_ == nullptr) {
+        return;
+    }
+    // want_reply=1：发 SSH_MSG_GLOBAL_REQUEST 要求对端应答（OpenSSH 会回
+    // SSH_MSG_REQUEST_SUCCESS）。libssh2 不做无应答计数，计数判定在 onKeepaliveTick
+    // （口径见 keepalive.h 头注）。注意 libssh2 会把 interval=1 提升到 2（1.11.1
+    // keepalive.c 防忙等条款），本层周期定时不受影响——首拍后按 seconds_to_next 预约
+    ::libssh2_keepalive_config(session_, 1, options_.keepaliveIntervalSec);
+
+    keepaliveMissTracker_ = KeepaliveMissTracker(options_.keepaliveMaxMisses);
+    keepaliveSendCount_.store(0, std::memory_order_release);
+    keepaliveMissCount_.store(0, std::memory_order_release);
+    // 首周期宽限：能到达 established 本身（认证成功应答）就是对端存活的入站证据；
+    // 同时记下 FIONREAD 基线，握手/认证残留字节不会被误判为「新入站」
+    keepaliveInboundSeen_ = true;
+    int pending = 0;
+    if (::ioctl(fd_, FIONREAD, &pending) == 0) {
+        keepalivePendingBaseline_ = pending;
+    }
+
+    keepaliveTimer_ = thread_.loop().runAfter(
+        static_cast<uint64_t>(options_.keepaliveIntervalSec) * 1000,
+        [this] { onKeepaliveTick(); });
+}
+
+void SshSession::onKeepaliveTick()
+{
+    keepaliveTimer_ = 0; // 本拍定时器已到期消费；下方按需预约下一拍
+    if (state() != SshSessionState::kEstablished || session_ == nullptr || fd_ < 0) {
+        return; // 已离开 established（关闭/断线收尾中），keepalive 链自然终止
+    }
+
+    // 观测上一周期的入站活动：fd 事件标志 或 待读字节数增长（口径与近似性见
+    // keepalive.h 头注）；观测完即清零，进入下一周期
+    int pending = 0;
+    if (::ioctl(fd_, FIONREAD, &pending) != 0) {
+        pending = static_cast<int>(keepalivePendingBaseline_); // 查询失败按「无增长」处理，
+                                                               // socket 真坏时 fd 事件会先捕获
+    }
+    const bool hadInbound = keepaliveInboundObserved(keepaliveInboundSeen_, pending,
+                                                     keepalivePendingBaseline_);
+    keepaliveInboundSeen_ = false;
+    keepalivePendingBaseline_ = pending;
+
+    if (keepaliveMissTracker_.tick(hadInbound)) {
+        keepaliveMissCount_.store(keepaliveMissTracker_.misses(), std::memory_order_release);
+        peerLost(SshSessionError::kKeepaliveTimeout,
+                 "keepalive 静默黑洞：连续 " +
+                     std::to_string(options_.keepaliveMaxMisses) + " 个周期无入站数据");
+        return;
+    }
+    keepaliveMissCount_.store(keepaliveMissTracker_.misses(), std::memory_order_release);
+
+    // 发送本拍 keepalive。libssh2 语义（1.11.1 keepalive.c 已核对）：按
+    // keepalive_last_sent + interval 决定是否真正发包；EAGAIN 被其吞掉返回 0
+    // （发送缓冲满时假装已发——本周期无应答会计入 miss，语义自洽）；
+    // 非 0 返回 = socket 写已坏（LIBSSH2_ERROR_SOCKET_SEND），直接判黑洞
+    int secondsToNext = static_cast<int>(options_.keepaliveIntervalSec);
+    const int rc = ::libssh2_keepalive_send(session_, &secondsToNext);
+    if (rc != 0) {
+        peerLost(SshSessionError::kKeepaliveTimeout,
+                 "keepalive 发送失败（socket 写错误，libssh2 rc=" + std::to_string(rc) + "）");
+        return;
+    }
+    keepaliveSendCount_.fetch_add(1, std::memory_order_acq_rel);
+
+    // 按 libssh2 返回的 seconds_to_next 预约下一拍（官方推荐用法），而不是固定
+    // runEvery：time() 秒粒度截断下固定周期可能让 libssh2 偶发跳过一次发送，
+    // 造成「无请求在飞」的空窗被误记一次 miss；按 s2n 预约保证每拍都真正发包
+    uint64_t delayMs = static_cast<uint64_t>(secondsToNext > 0 ? secondsToNext
+                                                               : options_.keepaliveIntervalSec) *
+                       1000;
+    keepaliveTimer_ = thread_.loop().runAfter(delayMs, [this] { onKeepaliveTick(); });
+}
+
 // ------------------------------------------------------------------ 字符串化
 
 const char *toString(SshSessionState state)
@@ -738,9 +846,36 @@ const char *toString(SshSessionError error)
     case SshSessionError::kAuthTimeout:           return "auth_timeout";
     case SshSessionError::kDisconnectedByPeer: return "disconnected_by_peer";
     case SshSessionError::kSocketError:       return "socket_error";
+    case SshSessionError::kKeepaliveTimeout:  return "keepalive_timeout";
     case SshSessionError::kInternal:          return "internal";
     }
     return "unknown";
+}
+
+bool isAutoReconnectable(SshSessionState terminalState, SshSessionError error)
+{
+    switch (terminalState) {
+    case SshSessionState::kDisconnected:
+        // 对端关闭 / socket 错误 / keepalive 黑洞：都可能是瞬态网络问题
+        return true;
+    case SshSessionState::kError:
+        switch (error) {
+        case SshSessionError::kResolveFailed:
+        case SshSessionError::kConnectFailed:
+        case SshSessionError::kConnectTimeout:
+        case SshSessionError::kHandshakeFailed:
+        case SshSessionError::kHandshakeTimeout:
+        case SshSessionError::kSocketError:
+        case SshSessionError::kAuthTimeout: // 认证期对端不应答，语义上属链路异常
+            return true;
+        default:
+            // 凭据类失败（重连同样的凭据必然再败）、kInternal（本端资源问题）等
+            return false;
+        }
+    default:
+        // closed（主动关闭，含主机密钥被拒走 closing → closed）与非终态：不自动重连
+        return false;
+    }
 }
 
 } // namespace ssh

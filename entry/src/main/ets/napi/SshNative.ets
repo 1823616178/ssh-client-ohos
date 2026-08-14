@@ -28,6 +28,9 @@ interface LibSshCoreModule {
   resize(handle: number, channelId: number, cols: number, rows: number): boolean;
   closeChannel(handle: number, channelId: number): boolean;
   closeSession(handle: number): boolean;
+  setKeepalive(handle: number, intervalSec: number, maxMisses: number): boolean;
+  setReconnectPolicy(handle: number, delaysSec: number[], maxAttempts: number): boolean;
+  nextReconnectDelaySec(handle: number, attempt: number): number;
   getLibssh2Version(): string;
   getOpensslVersion(): string;
   getVtermVersion(): string;
@@ -55,6 +58,10 @@ export interface SshEvent {
   type: string;
   from?: string;
   to?: string;
+  /** N12：stateChange 进终态时附——是否值得自动重连（供 SessionManager 编排退避） */
+  reconnectHint?: boolean;
+  /** N12：stateChange 进终态时附——错误码（如 keepalive_timeout；正常关闭省略） */
+  errorCode?: string;
   keyType?: string;
   fingerprintSha256?: string;
   fingerprintMd5?: string;
@@ -146,6 +153,31 @@ export class SshNativeSession {
     }
     native.closeSession(this.handle);
     this.handle = 0;
+  }
+
+  /**
+   * N12：配置 keepalive（须在 connect 前调用）。
+   * intervalSec 秒为发送周期、0 = 关闭（默认 30）；maxMisses 为连续无入站
+   * 活动判黑洞的周期数（默认 3，0 = 只发不判）
+   */
+  setKeepalive(intervalSec: number, maxMisses: number): boolean {
+    return this.alive && native.setKeepalive(this.handle, intervalSec, maxMisses);
+  }
+
+  /**
+   * N12：设置自动重连退避策略。delaysSec 空数组 = 恢复默认 [1,2,5,10,20,30]，
+   * 越界档钳到最后档；maxAttempts 0 = 无限（默认 6）
+   */
+  setReconnectPolicy(delaysSec: number[], maxAttempts: number): boolean {
+    return this.alive && native.setReconnectPolicy(this.handle, delaysSec, maxAttempts);
+  }
+
+  /** N12：第 attempt 次重连（从 1 计）前的建议等待秒数；-1 = 已达上限放弃 */
+  nextReconnectDelaySec(attempt: number): number {
+    if (!this.alive) {
+      return -1;
+    }
+    return native.nextReconnectDelaySec(this.handle, attempt);
   }
 
   private get alive(): boolean {

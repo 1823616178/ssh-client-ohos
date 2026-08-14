@@ -30,7 +30,9 @@
  *     （析构做兜底资源回收，但不会在运行中的循环上并发摘 fd）。
  *
  * 断线检测：socket ERR / 对端 FIN / RST → disconnected（秒级，见 N6 测试）；
- * 「拔网线无 RST」的静默黑洞检测靠 keepalive，属 N12 范围，不在本任务。
+ * 「拔网线无 RST」的静默黑洞检测由 N12 keepalive 落地（established 态周期发
+ * 全局请求，连续 keepaliveMaxMisses 个周期无入站活动 → kKeepaliveTimeout 进
+ * disconnected；判定口径与近似性见 keepalive.h 头注与 onKeepaliveTick）。
  *
  * 纯逻辑代码：只依赖 C/C++ 标准库、POSIX 与 libssh2 公共头，
  * 禁止 include <napi/native_api.h> / <hilog/log.h>（桥接层是 N11）。
@@ -48,6 +50,7 @@
 
 #include "../io/EventLoop.h"
 #include "hostkey.h"
+#include "keepalive.h"
 
 // 前向声明 libssh2 会话结构与 keyboard-interactive 回调结构，
 // 避免把 <libssh2.h> 漏进公共头
@@ -93,8 +96,15 @@ enum class SshSessionError {
     kAuthTimeout,           // 单次认证尝试超时（authTimeoutMs，终态 error）
     kDisconnectedByPeer, // 对端关闭（FIN/RST）
     kSocketError,        // 底层 socket 错误
+    kKeepaliveTimeout,   // N12：keepalive 静默黑洞——连续 keepaliveMaxMisses 个周期
+                         // 无入站活动，或 keepalive 发送本身失败（终态 disconnected）
     kInternal,           // 内部错误（资源创建失败等）
 };
+
+// N12 keepalive 默认值（DESIGN §7.1：默认 30 s）；SshSessionOptions 默认值与
+// 成员初始式共用，避免两处写死漂移
+inline constexpr uint32_t kDefaultKeepaliveIntervalSec = 30;
+inline constexpr unsigned kDefaultKeepaliveMaxMisses = 3;
 
 struct SshSessionOptions {
     uint32_t connectTimeoutMs = 10000;    // TCP 连接超时
@@ -103,6 +113,12 @@ struct SshSessionOptions {
     uint32_t authTimeoutMs = 15000;       // N8：单次认证尝试超时（到时按终态 error 处理——
                                           // 对端 15 s 不应答通常意味着链路异常，重试无益）
     uint32_t authMaxAttempts = 3;         // N8：认证失败重试上限，达到后转 error 终态
+
+    // ---- N12 keepalive（established 态生效；DESIGN §7.1 默认 30 s）----
+    uint32_t keepaliveIntervalSec = kDefaultKeepaliveIntervalSec; // 发送周期秒数；0 = 关闭
+    uint32_t keepaliveMaxMisses = kDefaultKeepaliveMaxMisses; // 连续无入站活动周期数达到
+                                                              // 该值判静默黑洞 → kKeepaliveTimeout；
+                                                              // 0 = 只发不判
 
     // N7 主机密钥 TOFU 决策回调（构造后不可变，无并发问题）：
     // 握手成功后、进入 authenticating 前在事件循环线程同步调用，须快速返回
@@ -226,6 +242,16 @@ public:
     // 探测服务端支持的认证方式（libssh2_userauth_list 非阻塞驱动；与认证尝试互斥）
     bool queryAuthMethods(AuthMethodsCallback callback);
 
+    // ---- N12 keepalive 配置与观测 ----
+    // 设置 keepalive 参数（任意线程；仅 idle 态受理——即必须在 connect 之前调用，
+    // 返回 false 表示未受理）。进入 established 时生效（libssh2_keepalive_config +
+    // 周期定时器），语义见 options 字段注释与 keepalive.h 头注。
+    bool setKeepaliveConfig(uint32_t intervalSec, uint32_t maxMisses);
+    // 观测钩子（任意线程，供集成测试与诊断）：进入 established 后 keepalive 的
+    // 实际发送次数 / 当前连续无入站活动周期数
+    uint32_t keepaliveSendCount() const { return keepaliveSendCount_.load(std::memory_order_acquire); }
+    uint32_t keepaliveMissCount() const { return keepaliveMissCount_.load(std::memory_order_acquire); }
+
     // 迁移合法性表（静态纯函数，供单测直接校验状态机边界）
     static bool isLegalTransition(SshSessionState from, SshSessionState to);
 
@@ -251,6 +277,10 @@ private:
     void unregisterChannel(SshChannel *channel); // 通道收尾时注销（幂等）
     void driveChannels();      // established 态 fd 事件分发：泵送全部注册通道
     void notifyChannelsSessionLost(); // releaseResources 前置：全部通道 kError 清理
+
+    // ---- N12 keepalive（全部仅事件循环线程执行）----
+    void armKeepalive();    // 进入 established 时装配：libssh2_keepalive_config + 首拍定时
+    void onKeepaliveTick(); // 每拍：观测入站活动 → 发送 → 按 seconds_to_next 预约下一拍
 
     // ---- N8 认证驱动（循环线程；实现在 auth.cpp，避免 session.cpp 臃肿）----
     // 进行中的认证尝试：方式、凭据副本（受理时复制并清零调用方 buffer）、超时定时器。
@@ -333,10 +363,28 @@ private:
     // established 态的 fd 事件经 driveChannels 泵送到每个通道；会话断开/关闭时
     // 经 notifyChannelsSessionLost 全部清理。通道完成收尾（finishClose）后自行注销。
     std::vector<SshChannel *> channels_;
+
+    // ---- N12 keepalive 状态（除两个 atomic 计数器外仅事件循环线程访问）----
+    io::EventLoop::TimerId keepaliveTimer_ = 0; // 下一拍定时（逐拍 runAfter 预约，见 onKeepaliveTick）
+    KeepaliveMissTracker keepaliveMissTracker_{kDefaultKeepaliveMaxMisses}; // 受理配置时重建
+    bool keepaliveInboundSeen_ = false;  // 本周期内 fd 事件出现过 EPOLLIN
+    long keepalivePendingBaseline_ = 0;  // 上一拍 socket 待读字节数（FIONREAD 基线）
+    // 观测钩子：循环线程写、任意线程读（集成测试断言 keepalive 在跑且不误判）
+    std::atomic<uint32_t> keepaliveSendCount_{0};
+    std::atomic<uint32_t> keepaliveMissCount_{0};
 };
 
 const char *toString(SshSessionState state);
 const char *toString(SshSessionError error);
+
+// N12：给定终态与错误码，判定「是否值得自动重连」（纯函数，供 bridge 给
+// stateChange 终态事件附 reconnectHint 字段；重连编排本身在 ArkTS 侧）：
+//   - disconnected：一律 true（对端关闭/socket 错误/keepalive 黑洞都可能是瞬态网络问题）；
+//   - error：按错误码分——链路类（解析失败/连接失败或超时/握手失败或超时/
+//     socket 错误/认证超时，多为瞬态网络问题）true；凭据类（密码/公钥/短语/
+//     interactive 被拒，重连同样的凭据必然再败）与 kInternal（本端资源问题）false；
+//   - closed（主动关闭、含主机密钥被拒）与其余非终态：false。
+bool isAutoReconnectable(SshSessionState terminalState, SshSessionError error);
 
 } // namespace ssh
 } // namespace sshclient

@@ -26,7 +26,11 @@ export const getArgon2Version: () => string;
 /**
  * 会话事件（onEvent 回调参数）。type 判别种类，其余字段随类型而定：
  * - stateChange：from / to（idle|connecting|handshaking|authenticating|
- *   established|closing|closed|disconnected|error）
+ *   established|closing|closed|disconnected|error）；
+ *   N12 起进入终态（disconnected/error/closed）时另附：
+ *   reconnectHint（是否值得自动重连：disconnected 与链路类 error 为 true，
+ *   凭据类失败与主动关闭为 false）与 errorCode（如 keepalive_timeout；
+ *   正常关闭无错误时省略）
  * - hostKey：keyType / fingerprintSha256 / fingerprintMd5 / randomart
  *   （M1 阶段 bridge「接受并上报」，TOFU 确认编排由上层负责）
  * - authResult：method（password|publickey）/ success / error / message /
@@ -46,6 +50,8 @@ export interface SshNativeEvent {
   type: string;
   from?: string;
   to?: string;
+  reconnectHint?: boolean;
+  errorCode?: string;
   keyType?: string;
   fingerprintSha256?: string;
   fingerprintMd5?: string;
@@ -113,3 +119,28 @@ export const closeChannel: (handle: number, channelId: number) => boolean;
  * 进行中的事件回调在入口关闭后即弃，不再投递
  */
 export const closeSession: (handle: number) => boolean;
+
+/**
+ * N12：配置 keepalive（须在 connect 前调用，false = 未受理）。
+ * intervalSec：发送周期秒数，0 = 关闭（默认 30）；
+ * maxMisses：连续无入站活动周期数达到该值判静默断线（默认 3，0 = 只发不判）。
+ * 判定触发后会话进 disconnected（stateChange 附 reconnectHint=true、
+ * errorCode=keepalive_timeout）
+ */
+export const setKeepalive: (handle: number, intervalSec: number, maxMisses: number) => boolean;
+
+/**
+ * N12：设置自动重连退避策略（任意时刻可调；重连编排在 ArkTS 侧
+ * SessionManager，native 不自行重连）。
+ * delaysSec：逐次重连前等待秒数序列，空数组 = 恢复默认 [1,2,5,10,20,30]；
+ * 次数超出序列长度钳到最后档。maxAttempts：最大重连次数（默认 6，0 = 无限）
+ */
+export const setReconnectPolicy: (handle: number, delaysSec: number[], maxAttempts: number) => boolean;
+
+/**
+ * N12：查询第 attempt 次重连（从 1 计）前的建议等待秒数；
+ * -1 = 已达上限（或句柄无效），放弃重连。
+ * 用法：stateChange 进 disconnected 且 reconnectHint=true 时，attempt 从 1 起
+ * 逐次查询并自行倒计时，到点后新建会话重连
+ */
+export const nextReconnectDelaySec: (handle: number, attempt: number) => number;
