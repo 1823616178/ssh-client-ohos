@@ -20,6 +20,8 @@ set(NATIVE_SOURCES
     ssh/agent.cpp
     ssh/channel.cpp
     # term/
+    term/grid.cpp
+    term/vterm_screen.cpp
     # crypto/
     crypto/aad.cpp
     # io/

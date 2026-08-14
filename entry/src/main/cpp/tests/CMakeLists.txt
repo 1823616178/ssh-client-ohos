@@ -66,6 +66,8 @@ set(TESTED_SOURCES
     ${CPP_ROOT}/ssh/auth.cpp
     ${CPP_ROOT}/ssh/agent.cpp
     ${CPP_ROOT}/ssh/channel.cpp
+    ${CPP_ROOT}/term/grid.cpp
+    ${CPP_ROOT}/term/vterm_screen.cpp
 )
 
 # ---- N6 ssh/ 会话层的 libssh2 依赖 ----
@@ -84,6 +86,9 @@ if(CMAKE_CROSSCOMPILING)
         ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libssh2.a
         ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libcrypto.a
         z)
+    # T1：term/ 的 libvterm 复用仓库 prebuilt（OHOS target，只编不跑）
+    set(VTERM_INCLUDE_DIR ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/include)
+    set(VTERM_LIBS ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libvterm.a)
 else()
     if(NOT EXISTS "${SSH_TESTS_HOST_LIBSSH2}/lib/libssh2.a"
             OR NOT EXISTS "${SSH_TESTS_HOST_LIBSSH2}/include/libssh2.h")
@@ -95,6 +100,19 @@ else()
     set(LIBSSH2_INCLUDE_DIR ${SSH_TESTS_HOST_LIBSSH2}/include)
     find_package(OpenSSL REQUIRED)
     set(LIBSSH2_LIBS ${SSH_TESTS_HOST_LIBSSH2}/lib/libssh2.a OpenSSL::Crypto z)
+
+    # T1：term/ 单测需要宿主机版 libvterm（setup-host-deps.sh 产物，与 prebuilt 同版本）
+    set(SSH_TESTS_HOST_LIBVTERM "$ENV{HOME}/ohos-probe/build/host-deps/libvterm"
+        CACHE PATH "宿主机版 libvterm 安装前缀（scripts/setup-host-deps.sh 产物）")
+    if(NOT EXISTS "${SSH_TESTS_HOST_LIBVTERM}/lib/libvterm.a"
+            OR NOT EXISTS "${SSH_TESTS_HOST_LIBVTERM}/include/vterm.h")
+        message(FATAL_ERROR
+            "找不到宿主机版 libvterm（${SSH_TESTS_HOST_LIBVTERM}）。\n"
+            "请先运行 scripts/setup-host-deps.sh（WSL 内），"
+            "或用 -DSSH_TESTS_HOST_LIBVTERM=<前缀> 指定。")
+    endif()
+    set(VTERM_INCLUDE_DIR ${SSH_TESTS_HOST_LIBVTERM}/include)
+    set(VTERM_LIBS ${SSH_TESTS_HOST_LIBVTERM}/lib/libvterm.a)
 endif()
 
 add_executable(ssh_core_tests
@@ -110,9 +128,11 @@ add_executable(ssh_core_tests
     reconnect_policy_test.cpp
     keepalive_test.cpp
     error_codes_test.cpp
+    term_grid_test.cpp
+    vterm_screen_test.cpp
     ${TESTED_SOURCES}
 )
-target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR})
+target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR} ${VTERM_INCLUDE_DIR})
 if(SSH_TESTS_INTEGRATION)
     target_compile_definitions(ssh_core_tests PRIVATE SSH_TESTS_INTEGRATION=1)
 endif()
@@ -120,8 +140,8 @@ endif()
 # std::thread / std::mutex 需要 pthread（OHOS musl 与宿主 Linux 均适用）
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-# 链接顺序：被测对象 → libssh2 → crypto/z → gtest（静态库依赖者在前）
-target_link_libraries(ssh_core_tests PRIVATE ${LIBSSH2_LIBS} ${GTEST_LIBS} Threads::Threads)
+# 链接顺序：被测对象 → vterm → libssh2 → crypto/z → gtest（静态库依赖者在前）
+target_link_libraries(ssh_core_tests PRIVATE ${VTERM_LIBS} ${LIBSSH2_LIBS} ${GTEST_LIBS} Threads::Threads)
 
 # 交叉编译（ohos target）时测试二进制无法在宿主机执行，不能在建后跑 --gtest_list_tests
 if(NOT CMAKE_CROSSCOMPILING)

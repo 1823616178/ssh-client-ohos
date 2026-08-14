@@ -7,6 +7,7 @@
 #
 # 产物布局：
 #   $HOST_DEPS_ROOT/libssh2/            宿主机版 libssh2 1.11.1（静态，链系统 OpenSSL）
+#   $HOST_DEPS_ROOT/libvterm/           宿主机版 libvterm 0.3.3（静态，T1 起 term/ 单测用）
 #   $HOST_DEPS_ROOT/sshd/rootfs/...     免 root 解包的 openssh-server（apt download + dpkg -x）
 #   $HOST_DEPS_ROOT/sshd/runtime/       运行时目录（host key、sshd_config、日志）
 #   $HOST_DEPS_ROOT/auth/               N8 认证测试环境（见下方「认证测试环境」段）
@@ -40,6 +41,7 @@ HOST_DEPS_ROOT="${HOST_DEPS_ROOT:-$HOME/ohos-probe/build/host-deps}"
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/ohos-probe/build/downloads}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 LIBSSH2_VER=1.11.1
+LIBVTERM_VER=0.3.3
 
 log()  { echo "[host-deps] $*"; }
 warn() { echo "[host-deps] 警告：$*" >&2; }
@@ -93,6 +95,56 @@ setup_libssh2() {
   cmake --build "$build" -j "$JOBS"
   cmake --install "$build"
   log "libssh2 安装完成：$prefix"
+}
+
+# ---------------------------------------------------------------- libvterm
+
+# T1 起 term/ 单测需要宿主机版 libvterm（与 prebuilt/ 同版本 0.3.3，Makefile 项目，
+# 直接编译全部 .c 再 ar 打包——与 scripts/build-deps.sh 的交叉编译同款做法）。
+setup_libvterm() {
+  local prefix="$HOST_DEPS_ROOT/libvterm"
+  if [ -f "$prefix/lib/libvterm.a" ] && [ -f "$prefix/include/vterm.h" ]; then
+    log "libvterm 已就绪：$prefix（跳过）"
+    return
+  fi
+
+  mkdir -p "$DOWNLOAD_DIR" "$HOST_DEPS_ROOT/src"
+  local tarball="$DOWNLOAD_DIR/libvterm-$LIBVTERM_VER.tar.gz"
+  if [ ! -s "$tarball" ]; then
+    log "下载 libvterm $LIBVTERM_VER"
+    curl -fsSL --connect-timeout 20 --max-time 600 -o "$tarball.tmp" \
+      "https://www.leonerd.org.uk/code/libvterm/libvterm-$LIBVTERM_VER.tar.gz" \
+      || curl -fsSL --connect-timeout 20 --max-time 600 -o "$tarball.tmp" \
+      "https://launchpad.net/libvterm/trunk/v$LIBVTERM_VER/+download/libvterm-$LIBVTERM_VER.tar.gz" \
+      || die "libvterm 源码下载失败；请手工放置 $tarball 后重跑"
+    mv "$tarball.tmp" "$tarball"
+  else
+    log "复用缓存 $tarball"
+  fi
+
+  local src="$HOST_DEPS_ROOT/src/libvterm-$LIBVTERM_VER"
+  rm -rf "$src"
+  tar xzf "$tarball" -C "$HOST_DEPS_ROOT/src"
+
+  local cc
+  if command -v clang >/dev/null; then cc=clang
+  elif command -v gcc >/dev/null; then cc=gcc
+  else die "找不到 clang 或 gcc（Ubuntu: apt install clang）"
+  fi
+
+  local obj_dir="$src/obj-host"
+  mkdir -p "$obj_dir"
+  local f
+  for f in "$src"/src/*.c; do
+    "$cc" -O2 -fPIC -std=c99 -I"$src/include" -I"$src/src" \
+      -c "$f" -o "$obj_dir/$(basename "${f%.c}").o"
+  done
+  ar rcs "$obj_dir/libvterm.a" "$obj_dir"/*.o
+
+  mkdir -p "$prefix/lib" "$prefix/include"
+  cp -a "$obj_dir/libvterm.a" "$prefix/lib/"
+  cp -a "$src/include/vterm.h" "$src/include/vterm_keycodes.h" "$prefix/include/"
+  log "libvterm 安装完成：$prefix（编译器 $cc）"
 }
 
 # ---------------------------------------------------------------- sshd（免 root）
@@ -349,6 +401,7 @@ if [ "${1:-}" = "--auth-sshd-root-step" ]; then
 fi
 
 setup_libssh2
+setup_libvterm
 setup_sshd
 setup_auth_sshd
 log "完成。宿主测试构建将自动使用 $HOST_DEPS_ROOT/libssh2；"
