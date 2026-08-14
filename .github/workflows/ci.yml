@@ -1,0 +1,51 @@
+# X3 CI 流水线骨架（GitHub Actions）
+#
+# ⚠️ 现实约束：HarmonyOS 构建依赖 DevEco Studio（SDK + hvigor + JBR + codelinter 插件）
+#    和 WSL2（native 单元测试在 WSL/Ubuntu 内编译运行），GitHub 公共 runner 均不具备，
+#    因此本 workflow 只能在 **自托管 Windows runner** 上执行（runs-on: [self-hosted, windows]）。
+#
+# 自托管 runner 预装要求：
+#   - Windows 10/11 + Git Bash（步骤默认 shell 即 bash）
+#   - DevEco Studio（默认路径 C:\Program Files\Huawei DevEco Studio；
+#     非默认路径可在 runner 机器上设 DEVECO_STUDIO / DEVECO_SDK_HOME / JAVA_HOME 环境变量）
+#   - WSL2 + Ubuntu 发行版（native 测试用；非 Ubuntu 可用 WSL_DISTRO 指定）
+#
+# 步骤与 scripts/ci-local.sh 完全一致：checkout → 一键门禁 → 上传日志与 HAP 产物。
+# 这是骨架而非开箱即用的云端 CI；接入真实仓库前请先在自托管机器上手工跑通
+# `bash scripts/ci-local.sh` 验证环境。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    name: 门禁（lint + ArkTS test + native test + assembleHap）
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行全部门禁（scripts/ci-local.sh）
+        shell: bash
+        run: bash scripts/ci-local.sh
+
+      - name: 上传 CI 日志与汇总报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: build/ci-logs/
+          if-no-files-found: warn
+
+      - name: 上传 HAP 产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hap
+          path: entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
