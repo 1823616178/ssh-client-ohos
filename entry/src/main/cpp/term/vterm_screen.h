@@ -1,21 +1,21 @@
 /**
- * VtermBridge —— libvterm 屏幕层封装（任务 T1，DESIGN §2.2）。
+ * VtermBridge —— libvterm 屏幕层封装（任务 T1/T2，DESIGN §2.2）。
  *
  * 职责：包装 libvterm（vterm_new + vterm_obtain_screen + 回调 + reset），
  * 把终端状态机落到连续内存的 CellGrid：
  *   feed(bytes)   → vterm_input_write，结束后 flush damage
- *   resize        → vterm_set_size，网格按交集保留内容
+ *   resize        → vterm_set_size，网格按交集保留内容；回滚行宽经 resizeCols 重排
  *   damage        → 逐格 vterm_screen_get_cell 重读并写入网格（含颜色解析）
- *   moverect      → 网格内拷贝（滚动场景，sb_pushline 见下方 TODO）
- *   movecursor    → 记录光标位置，新旧光标行标脏
+ *   moverect      → 返回 0：库改标 damage，按 damage 重读（不镜像拷贝，见 .cpp 注释）
+ *   sb_pushline   → 主屏顶出行写入 ScrollbackBuffer（T2，libvterm 仅主屏触发）
+ *   sb_popline    → resize 行数增大时从回滚区弹行回填屏幕顶部
+ *   sb_clear      → ED 3（CSI 3 J）清空回滚缓冲
+ *   movecursor    → 记录光标位置，新旧光标行标脏，并抬 revision（纯光标移动也要重绘）
  *   settermprop   → 标题/图标名/光标可见性/鼠标模式/alt-screen 等状态记录
  *   bell          → 计数 + 回调上抛（UI 触感）
  *
  * 本头文件包含 <vterm.h>（回调签名需要 VTermRect/VTermPos 等类型）；
  * 禁止 include <napi/native_api.h> / <hilog/log.h>。
- *
- * TODO(T2)：sb_pushline / sb_popline / sb_clear 回调槽位已注册但内部为空，
- * 回滚缓冲（环形缓冲 5000 行）由任务 T2 实现；本任务滚动顶出的行直接丢弃。
  */
 #pragma once
 
@@ -24,10 +24,12 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <vterm.h>
 
 #include "grid.h"
+#include "scrollback.h"
 
 namespace sshclient {
 namespace term {
@@ -48,7 +50,8 @@ public:
 
     VtermBridge(int cols, int rows,
                 uint32_t defaultFgArgb = kDefaultFgArgb,
-                uint32_t defaultBgArgb = kDefaultBgArgb);
+                uint32_t defaultBgArgb = kDefaultBgArgb,
+                size_t scrollbackCapacity = ScrollbackBuffer::kDefaultCapacity);
     ~VtermBridge();
 
     VtermBridge(const VtermBridge &) = delete;
@@ -62,6 +65,10 @@ public:
 
     CellGrid &grid() { return grid_; }
     const CellGrid &grid() const { return grid_; }
+
+    // 回滚缓冲只读访问（写入只发生在 libvterm sb_* 回调内）。
+    // UI 层按绝对行号窗口查询；视图滚动偏移是 UI 层状态，本层不跟踪（T3/T4 对接）。
+    const ScrollbackBuffer &scrollback() const { return scrollback_; }
 
     // 终端状态查询（供 UI 层）
     int cursorRow() const { return cursorRow_; }
@@ -99,6 +106,9 @@ private:
 
     // 把 damage 矩形内的 libvterm 单元格重读进网格
     void convertRect(int startRow, int startCol, int endRow, int endCol);
+    // VTermScreenCell → 本层 Cell（颜色解析 + 属性位映射）；convertRect 与
+    // sb_pushline 共用同一转换，保证屏幕与回滚的内容表示一致
+    Cell convertCell(const VTermScreenCell &vc) const;
     // VTermColor → ARGB（默认色 / 16 色注入调色板 / 256 扩展公式 / 真彩 / bold-as-bright）
     uint32_t resolveColor(const VTermColor &color, bool isForeground, bool cellBold) const;
     void accumulatePropString(bool isTitle, const VTermStringFragment &frag);
@@ -106,6 +116,9 @@ private:
     VTerm *vt_ = nullptr;
     VTermScreen *screen_ = nullptr;
     CellGrid grid_;
+    ScrollbackBuffer scrollback_; // 回滚缓冲（T2）；行宽跟随 grid_.cols()
+    // sb_pushline 高频路径的转换暂存（cols 格，onResize 同步），避免每次堆分配
+    std::vector<Cell> sbScratch_;
 
     // 终端状态
     int cursorRow_ = 0;

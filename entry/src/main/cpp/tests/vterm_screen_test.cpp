@@ -260,7 +260,8 @@ TEST(VtermScreenTest, FullScreenScrollDropsTopLine)
     EXPECT_EQ(dumpGridRow(b.grid(), 1), "R2");
     EXPECT_EQ(dumpGridRow(b.grid(), 2), "R3");
     EXPECT_EQ(dumpGridRow(b.grid(), 3), "");
-    // R0 被顶出屏幕：T2 回滚缓冲接手前直接丢弃（sb_pushline 槽位仅注册）
+    // R0 被顶出屏幕：T2 起进入回滚缓冲（sb_pushline → ScrollbackBuffer，
+    // 集成断言见 scrollback_test.cpp 的 ScrolledOffLineEntersScrollback）
 }
 
 // ---- alt-screen ----

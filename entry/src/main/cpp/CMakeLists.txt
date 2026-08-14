@@ -22,6 +22,7 @@ set(NATIVE_SOURCES
     # term/
     term/grid.cpp
     term/vterm_screen.cpp
+    term/scrollback.cpp
     # crypto/
     crypto/aad.cpp
     # io/

@@ -18,6 +18,8 @@
  * 它们负责「脏行位图置位 + revision +1」；cellAt 返回的可写指针只供
  * 读路径与确知自己在做什么的写入者（写后须自行 touchCell），
  * 否则脏行位图与 revision 会与实际内容脱节。
+ * 两条例外路径：bumpRevision（光标移动等非内容性视觉变化，只抬 revision）
+ * 与 raiseRevisionFloor（整体重建后保 revision 单调不减），均不写单元格。
  */
 #pragma once
 
@@ -86,7 +88,8 @@ public:
     // 用 cell 填充半开矩形 [row0,row1) × [col0,col1)（ED/EL 用；越界部分裁剪）
     void fillCells(int row0, int col0, int row1, int col1, const Cell &cell);
 
-    // 拷贝矩形区域（moverect 用），源/目标允许重叠（内部走临时快照）；越界部分裁剪
+    // 拷贝矩形区域（矩形搬移原语；VtermBridge 滚动不镜像拷贝、走 damage 重读，
+    // 见 vterm_screen.cpp onMoveRect），源/目标允许重叠（内部走临时快照）；越界部分裁剪
     void copyCells(int destRow, int destCol, int srcRow, int srcCol, int rowCount, int colCount);
 
     // 改尺寸：按行拷贝行列交集保留内容，新增区域填空白格；全部行标脏
@@ -100,6 +103,20 @@ public:
 
     // 单调递增修订号：每次单元格内容写入 +1（ArkTS 每帧比对，无变化跳过渲染）
     uint64_t revision() const { return revision_; }
+
+    // 非内容性视觉变化（光标移动）抬 revision：帧循环以 revision 判「是否重绘」，
+    // 纯光标移动不写单元格、不抬会丢光标帧（T1 审查跟进项，T2 修）。
+    // 只抬计数，不碰脏行位图——新旧光标行的标脏由调用方负责。
+    void bumpRevision() { ++revision_; }
+
+    // 把 revision 抬到至少 floor（floor 更大时生效，否则不动）。
+    // 用途：setDefaultColors 这类「整体重建网格」后 revision 从 0 重计数会对外回退，
+    // 调用方重建后抬回旧值，保证 revision 对外单调不减（帧循环不比小）。
+    void raiseRevisionFloor(uint64_t floor)
+    {
+        if (revision_ < floor)
+            revision_ = floor;
+    }
 
 private:
     size_t index(int row, int col) const;
