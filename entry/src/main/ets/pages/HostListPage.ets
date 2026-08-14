@@ -2,7 +2,7 @@
  * HostListPage —— 主机列表页（任务 U1，DESIGN §4.3.1 页面清单 / §4.2 Token / §4.3 sm 单栏）。
  *
  * 结构（自上而下，单栏；宽度一律百分比不写真机宽度，md/lg 多栏归 U5）：
- *   - 顶栏：标题「主机」+「+」新增入口（跳 HostEditPage 是 U2 的活，当前 Toast 占位）；
+ *   - 顶栏：标题「主机」+「+」新增入口（U2 接线：router 跳 HostEditPage 新建）；
  *   - 搜索框：实时过滤（名称/主机/用户名，大小写不敏感，逻辑在 HostListViewModel）；
  *   - 快速连接卡：host[:port] + 用户名 → 构造临时 HostProfile 调 SessionManager.connect，
  *     不落库（U1 只反馈状态，终端页跳转是 U4 接线点）；
@@ -10,16 +10,19 @@
  *     的代码侧要求），按 order 升序分组区 + 未分组区，组头点击折叠（持久化到 C3
  *     hostGroupCollapsed 键，重启复原）；
  *   - 主机行：状态点（按 hostId 从 C4 会话列表派生）+ 名称 + user@host:port + authType 徽标；
- *   - 滑动菜单（ListItem swipeAction）：编辑（U2 占位）、删除（AlertDialog 二次确认 →
- *     关闭该主机活跃会话 C4 → HostDao.deleteById C1 → CredentialStore.removeAllSecrets
- *     级联 C2）；
- *   - 空状态：无主机时引导「添加第一台主机」（U2 占位）；搜索无结果时给提示文案。
+ *   - 滑动菜单（ListItem swipeAction）：编辑（U2 接线：router 跳 HostEditPage 并传
+ *     hostId）、删除（AlertDialog 二次确认 → 关闭该主机活跃会话 C4 → HostDao.deleteById
+ *     C1 → CredentialStore.removeAllSecrets 级联 C2）；
+ *   - 空状态：无主机时引导「添加第一台主机」（同「+」入口）；搜索无结果时给提示文案。
  *
  * 刷新模型：C1 DAO 是同步封装、数据量小，页面在 aboutToAppear 与每次操作后
  * reload 全量 + 重建行（reloadRows）；会话状态经 C4 SessionManager 事件监听器
  * （stateChange）驱动状态点刷新，aboutToDisappear 摘除监听。
+ * 本组件内嵌于 Index（@Entry 在其上），从 HostEditPage 返回时经父页 onPageShow
+ * 递增 refreshTick 触发重载（U2 接线，@Prop @Watch）。
  */
 
+import { router } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { HostProfile, createDefaultHostProfile } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
@@ -77,6 +80,11 @@ class HostRowDataSource implements IDataSource {
 
 @Component
 export struct HostListPage {
+  /**
+   * 父页（Index）onPageShow 递增：从 HostEditPage 保存/返回后触发重载（U2 接线）。
+   * 首次 aboutToAppear 已 reload，此处仅响应后续变化（@Watch 只在值变化时触发）。
+   */
+  @Prop @Watch('onRefreshTick') refreshTick: number = 0;
   /** 视图模型：搜索串 / 折叠集合 / 派生行（生产依赖惰性解析 AppDatabase / SettingsRepository） */
   private readonly viewModel: HostListViewModel = new HostListViewModel();
   private readonly dataSource: HostRowDataSource = new HostRowDataSource();
@@ -125,9 +133,16 @@ export struct HostListPage {
 
   // ---------------------------------------------------------------- 交互
 
-  /** 「+」与空状态按钮共用：跳 HostEditPage 是 U2 的活（U2 接线点） */
+  /** 父页 onPageShow 驱动：从 HostEditPage 返回后全量重载（含状态点与行重建） */
+  private onRefreshTick(): void {
+    this.viewModel.reload();
+    this.refreshConnStatus();
+    this.reloadRows();
+  }
+
+  /** 「+」与空状态按钮共用：跳 HostEditPage 新建（U2 接线） */
   private onAddHost(): void {
-    this.toast('主机编辑页将在 U2 提供');
+    router.pushUrl({ url: 'pages/HostEditPage' });
   }
 
   /** 点按主机行 / 快速连接共用入口：受理后状态经状态点与 Toast 反馈（U4 接线点：连接后跳 TerminalPage） */
@@ -164,9 +179,12 @@ export struct HostListPage {
     this.connectHost(host);
   }
 
-  /** 滑动菜单「编辑」：跳 HostEditPage 是 U2 的活（U2 接线点） */
-  private onEditHost(): void {
-    this.toast('主机编辑页将在 U2 提供');
+  /** 滑动菜单「编辑」：跳 HostEditPage 并传 hostId（U2 接线） */
+  private onEditHost(hostId: string): void {
+    // arkts-no-untyped-obj-literals：非空 Record 字面量禁，空字面量 + 逐键赋值
+    const params: Record<string, Object> = {};
+    params['hostId'] = hostId;
+    router.pushUrl({ url: 'pages/HostEditPage', params: params });
   }
 
   /** 滑动菜单「删除」→ 二次确认对话框（UIContext.showAlertDialog，AlertDialog.show 已弃用） */
@@ -435,7 +453,7 @@ export struct HostListPage {
     }
   }
 
-  /** 滑动菜单（ListItem 右滑）：编辑（U2 占位）+ 删除（二次确认） */
+  /** 滑动菜单（ListItem 右滑）：编辑（U2 已接线）+ 删除（二次确认） */
   @Builder
   SwipeActions(row: HostListRow) {
     if (row.host !== null) {
@@ -448,7 +466,9 @@ export struct HostListPage {
           .height('100%')
           .margin({ right: Tokens.space.xs })
           .onClick(() => {
-            this.onEditHost();
+            if (row.host !== null) {
+              this.onEditHost(row.host.id);
+            }
           })
         Button('删除')
           .fontSize(Tokens.fontSize.body)

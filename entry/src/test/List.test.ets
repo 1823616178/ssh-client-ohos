@@ -18,6 +18,7 @@ import daoTest from './Dao.test';
 import credentialStoreTest from './CredentialStore.test';
 import sessionManagerTest from './SessionManager.test';
 import hostListViewModelTest from './HostListViewModel.test';
+import hostEditViewModelTest from './HostEditViewModel.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -41,4 +42,5 @@ export default function testsuite() {
   credentialStoreTest();
   sessionManagerTest();
   hostListViewModelTest();
+  hostEditViewModelTest();
 }

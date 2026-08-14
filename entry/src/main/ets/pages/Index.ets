@@ -27,6 +27,13 @@ struct Index {
   @State nativeResult: string = '';
   // 调试折叠区开关（默认折叠，U1 起首页主体为主机列表）
   @State debugExpanded: boolean = false;
+  // U2 接线：从 HostEditPage 返回时递增，驱动内嵌 HostListPage 重载（@Prop @Watch）
+  @State listRefreshTick: number = 0;
+
+  /** 页面重新显示（含从 HostEditPage 返回）：递增 tick 通知主机列表重载 */
+  onPageShow(): void {
+    this.listRefreshTick = this.listRefreshTick + 1;
+  }
 
   // ---- N11 连接冒烟（表单值不需要响应式，用普通成员即可）----
   private host: string = '';
@@ -123,8 +130,9 @@ struct Index {
   build() {
     Column() {
       // U1 首页主体：主机列表（包裹层 layoutWeight 提供有界高度，HostListPage 根节点填满）
+      // U2 接线：refreshTick 随 onPageShow 递增，从 HostEditPage 返回后列表重载
       Column() {
-        HostListPage()
+        HostListPage({ refreshTick: this.listRefreshTick })
       }
       .width('100%')
       .layoutWeight(1)
