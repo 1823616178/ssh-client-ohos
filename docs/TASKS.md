@@ -8,6 +8,17 @@
 
 ---
 
+## 进度快照（2026-08-13 更新）
+
+- **已完成（M0）**：X1 `b1fa2f0`、X5 `f8b604e`、X2 `a57d4e7`、X4 `dbfd13f`、N1/N2 `d8604bd`、N3 `e5e8c25`、N4 `181b00d`、X3 `79e4c49`
+- **已完成（M1）**：N5 `070c6f7`、N6 `9646ecc`、N7 `caff668`、N8 `3a8e85d`、N9 `72a4b32`、N10 `6610a22`、N11 `089c617`、N12 `9db98d0`、N13 `da2428e`；C3 提前完成 `b65dd79`
+- **M1 剩余**：Q1 大部分已由「WSL 免 root sshd + native 测试 + ci-local.sh 门禁」覆盖，Docker 多算法 sshd 与 x86_64 模拟器用例待补
+- **阻塞**：X0（签名，需人工）；N3b/T0 spike 与全部真机验收依赖 X0
+- **验证基线**：`scripts/run-native-tests.sh` 116/116（含真实 sshd 集成）、ASan 干净、`scripts/ci-local.sh` 四阶段全绿
+- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）
+
+---
+
 ## 0. 怎么读这份表
 
 - **轨道**：`X` 基座 / `N` 原生 / `T` 终端 / `C` 核心数据 / `U` 界面 / `S` 同步 / `Q` 质量 / `P` 发布
