@@ -3,7 +3,8 @@
  *
  * 密码、私钥密码短语、私钥内容存 @ohos.security.asset（@kit.AssetStoreKit），
  * 等价桌面端 safeStorage：明文只进出 ASSET 系统服务（加密存储于系统区），
- * 不落应用沙箱；不显式设置 IS_PERSISTENT（默认 false），卸载应用即被系统清除——
+ * 不落应用沙箱；不显式设置 IS_PERSISTENT（默认 false，卸载即被系统清除；
+ * 显式设置需 ohos.permission.STORE_PERSISTENT_DATA 权限，故不设）——
  * 验收标准「hdc 导出沙箱无明文 / 卸载后不可恢复」依赖该系统属性，实现侧保证
  * 不绕开 ASSET 自行落盘，两条均列为真机待验项。
  * 账号 token / Vault key 缓存属 M5 同步任务，不在本文件范围，别名方案已预留命名空间。
@@ -153,8 +154,8 @@ export class CredentialStore {
    *     DEVICE_POWERED_ON，不产生额外门槛。DEVICE_UNLOCKED 会在锁屏后拒绝读取，
    *     破坏后台保活，故不取。
    *   - SYNC_TYPE = NEVER：凭据不随换机克隆 / 云同步迁出本机。
-   *   - IS_PERSISTENT = false：卸载应用即被系统清除（验收标准依赖项，且免申请
-   *     ohos.permission.STORE_PERSISTENT_DATA）。
+   *   - IS_PERSISTENT 不显式设置（默认 false，卸载即被系统清除，验收标准依赖项；
+   *     显式设置需 ohos.permission.STORE_PERSISTENT_DATA 权限，故不设）。
    * 生物识别门禁（预留接口位，未实现）：如需「读取凭据前强制用户认证」，add 时追加
    *   asset.Tag.AUTH_TYPE = asset.AuthType.ANY（可选 AUTH_VALIDITY_PERIOD），
    *   读取改走 asset.preQuery → userAuth 用户认证 → asset.query → asset.postQuery 流程。
@@ -166,7 +167,6 @@ export class CredentialStore {
     attributes.set(asset.Tag.SECRET, encodeUtf8(value));
     attributes.set(asset.Tag.ACCESSIBILITY, asset.Accessibility.DEVICE_FIRST_UNLOCKED);
     attributes.set(asset.Tag.SYNC_TYPE, asset.SyncType.NEVER);
-    attributes.set(asset.Tag.IS_PERSISTENT, false);
     // THROW_ERROR：冲突时抛 DUPLICATED，由下方转 update（OVERWRITE 会静默覆盖，无法在日志区分新建与覆盖）
     attributes.set(asset.Tag.CONFLICT_RESOLUTION, asset.ConflictResolution.THROW_ERROR);
     try {
@@ -242,7 +242,10 @@ export class CredentialStore {
 
   /** 真故障统一出口：记日志（只含操作名与别名，绝不含明文）后包装为 SshError(INTERNAL_ERROR) */
   private static fatal(op: string, alias: string, err: Object): SshError {
-    Logger.error(`CredentialStore ${op} 失败（alias=${alias}）: ${JSON.stringify(err)}`, LOG_TAG);
+    // Error 的 JSON.stringify 只得 {}，显式提取 BusinessError.code 与 message 便于真机排查
+    const code: number = businessErrorCode(err);
+    const detail: string = err instanceof Error ? err.message : JSON.stringify(err);
+    Logger.error(`CredentialStore ${op} 失败（alias=${alias}, code=${code}）: ${detail}`, LOG_TAG);
     return new SshError(SshErrorCode.INTERNAL_ERROR, `凭据存储操作失败：${op}`);
   }
 }
