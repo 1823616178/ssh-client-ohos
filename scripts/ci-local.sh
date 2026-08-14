@@ -3,6 +3,7 @@
 #
 # 四个阶段（任一失败立即停，快速失败，并打印失败阶段）：
 #   1) ArkTS lint      DevEco codelinter CLI（-e error：存在 error 级缺陷即非 0 退出）
+#                      附加步骤（N13）：scripts/check-error-codes.sh 错误码两面对拍
 #   2) ArkTS 单元测试   hvigorw test + 日志 grep 判真伪失败
 #                      ⚠️ hvigorw test 不以退出码门禁测试失败（失败仍 BUILD SUCCESSFUL），
 #                      必须 grep 日志中的 "Error in" / "FAILED" 字样，命中即判失败
@@ -113,7 +114,10 @@ run_hvigor() {
 # ---------- 阶段 1：ArkTS lint ----------
 stage_lint() {
   node "$CODELINTER_JS" -c code-linter.json5 -e error -o "$LOG_DIR/codelinter-report.txt" . \
-    > "$LOG_DIR/stage1.log" 2>&1
+    > "$LOG_DIR/stage1.log" 2>&1 || return 1
+  # N13 附加步骤：统一错误码两面对拍（ArkTS SshError.ets ↔ native error_codes.h），
+  # 码表漂移即门禁失败；输出并入阶段 1 日志
+  bash scripts/check-error-codes.sh >> "$LOG_DIR/stage1.log" 2>&1
 }
 
 # ---------- 阶段 2：ArkTS 单元测试 ----------

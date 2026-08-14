@@ -60,8 +60,15 @@ export interface SshEvent {
   to?: string;
   /** N12：stateChange 进终态时附——是否值得自动重连（供 SessionManager 编排退避） */
   reconnectHint?: boolean;
-  /** N12：stateChange 进终态时附——错误码（如 keepalive_timeout；正常关闭省略） */
-  errorCode?: string;
+  /**
+   * N13：stateChange 进终态时附——统一数值错误码（与 common/SshError.ets 的
+   * SshErrorCode 一致；正常关闭省略）。上层经 SshError.fromNativeCode() 收口
+   */
+  errorCode?: number;
+  /** N13：错误码调试名（snake_case，如 keepalive_timeout），随 errorCode 同附 */
+  errorCodeName?: string;
+  /** N13：native 原始错误描述（诊断用，不对用户展示），随 errorCode 同附 */
+  errorMessage?: string;
   keyType?: string;
   fingerprintSha256?: string;
   fingerprintMd5?: string;

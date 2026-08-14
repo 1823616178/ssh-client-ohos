@@ -34,6 +34,7 @@
 #include "../io/SessionThread.h"
 #include "../ssh/auth.h" // secureZero（OPENSSL_cleanse 封装）
 #include "../ssh/channel.h"
+#include "../ssh/error_codes.h" // N13：toSshErrorCode（统一数值错误码）
 #include "../ssh/reconnect_policy.h" // N12：BackoffSchedule（每会话重连退避策略）
 #include "../ssh/session.h"
 #include "data_aggregator.h"
@@ -60,13 +61,13 @@ struct BridgeEvent {
     EventKind kind;
     uint32_t channelId = 0; // kChannelOpen / kChannelData / kChannelClose
     int stream = 0;         // kChannelData：0=stdout 1=stderr
-    long number = 0;        // attemptsLeft / exitStatus / droppedCount
+    long number = 0;        // attemptsLeft / exitStatus / droppedCount / kStateChange 终态的统一错误码（N13）
     bool success = false;   // kAuthResult / kChannelOpen / kStateChange 终态的 reconnectHint 值
     bool hasHint = false;   // kStateChange：终态（disconnected/error/closed）附重连提示（N12）
     std::string text1;      // from / keyType / method / openError / closeReason / code
     std::string text2;      // to / sha256 / authError / openMessage / exitSignal / message
-    std::string text3;      // md5 / authMessage / closeMessage / kStateChange 终态的 errorCode
-    std::string text4;      // randomart
+    std::string text3;      // md5 / authMessage / closeMessage / kStateChange 终态的 errorCodeName
+    std::string text4;      // randomart / kStateChange 终态的 errorMessage（N13）
     std::string bytes;      // kChannelData 聚合批次（原始字节，可能切断 UTF-8 序列）
 };
 
@@ -182,11 +183,15 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
         SetStrProp(env, obj, "type", "stateChange");
         SetStrProp(env, obj, "from", evt->text1);
         SetStrProp(env, obj, "to", evt->text2);
-        // N12：终态附自动重连提示（reconnectHint）与错误码（errorCode，kNone 时省略）
+        // N12：终态附自动重连提示（reconnectHint）；
+        // N13：errorCode 为统一数值码（kNone=0 时省略），另附 errorCodeName /
+        // errorMessage 字符串便于调试，展示层经 SshError.fromNativeCode 收口
         if (evt->hasHint) {
             SetBoolProp(env, obj, "reconnectHint", evt->success);
-            if (!evt->text3.empty()) {
-                SetStrProp(env, obj, "errorCode", evt->text3);
+            if (evt->number != 0) {
+                SetNumProp(env, obj, "errorCode", static_cast<double>(evt->number));
+                SetStrProp(env, obj, "errorCodeName", evt->text3);
+                SetStrProp(env, obj, "errorMessage", evt->text4);
             }
         }
         break;
@@ -679,7 +684,9 @@ napi_value CreateSession(napi_env env, napi_callback_info info)
             evt->text2 = ssh::toString(to);
             // N12：终态（disconnected/error/closed）附「是否值得自动重连」提示与错误码，
             // 供 ArkTS SessionManager（C4）编排退避重连；重连决策纯函数见
-            // ssh::isAutoReconnectable（session.h）。本回调在循环线程触发，
+            // ssh::isAutoReconnectable（session.h）。N13：errorCode 为统一数值码
+            // （ssh::toSshErrorCode，与 ArkTS SshErrorCode 数值一致），errorCodeName /
+            // errorMessage 为调试字符串。本回调在循环线程触发，
             // raw->session 在 teardown join 线程前始终存活
             if (to == ssh::SshSessionState::kDisconnected || to == ssh::SshSessionState::kError ||
                 to == ssh::SshSessionState::kClosed) {
@@ -687,7 +694,9 @@ napi_value CreateSession(napi_env env, napi_callback_info info)
                 evt->hasHint = true;
                 evt->success = ssh::isAutoReconnectable(to, err);
                 if (err != ssh::SshSessionError::kNone) {
+                    evt->number = ssh::toSshErrorCode(err);
                     evt->text3 = ssh::toString(err);
+                    evt->text4 = raw->session->lastErrorMessage();
                 }
             }
             SendStateEvent(raw, evt);

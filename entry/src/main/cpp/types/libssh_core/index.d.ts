@@ -27,10 +27,13 @@ export const getArgon2Version: () => string;
  * 会话事件（onEvent 回调参数）。type 判别种类，其余字段随类型而定：
  * - stateChange：from / to（idle|connecting|handshaking|authenticating|
  *   established|closing|closed|disconnected|error）；
- *   N12 起进入终态（disconnected/error/closed）时另附：
- *   reconnectHint（是否值得自动重连：disconnected 与链路类 error 为 true，
- *   凭据类失败与主动关闭为 false）与 errorCode（如 keepalive_timeout；
- *   正常关闭无错误时省略）
+ *   终态（disconnected/error/closed）时另附：
+ *   reconnectHint（N12：是否值得自动重连——disconnected 与链路类 error 为 true，
+ *   凭据类/协商类失败与主动关闭为 false）；
+ *   errorCode（N13：统一数值错误码，与 common/SshError.ets 的 SshErrorCode
+ *   一致，经 SshError.fromNativeCode() 收口后 toUserMessage() 取中文提示；
+ *   正常关闭无错误时省略）、errorCodeName（snake_case 调试名，如
+ *   keepalive_timeout）与 errorMessage（native 原始错误描述，诊断用）
  * - hostKey：keyType / fingerprintSha256 / fingerprintMd5 / randomart
  *   （M1 阶段 bridge「接受并上报」，TOFU 确认编排由上层负责）
  * - authResult：method（password|publickey）/ success / error / message /
@@ -51,7 +54,12 @@ export interface SshNativeEvent {
   from?: string;
   to?: string;
   reconnectHint?: boolean;
-  errorCode?: string;
+  /** N13：统一数值错误码（与 SshErrorCode 一致；正常关闭省略） */
+  errorCode?: number;
+  /** 错误码调试名（snake_case，如 keepalive_timeout） */
+  errorCodeName?: string;
+  /** native 原始错误描述（诊断用，不对用户展示） */
+  errorMessage?: string;
   keyType?: string;
   fingerprintSha256?: string;
   fingerprintMd5?: string;
@@ -125,7 +133,7 @@ export const closeSession: (handle: number) => boolean;
  * intervalSec：发送周期秒数，0 = 关闭（默认 30）；
  * maxMisses：连续无入站活动周期数达到该值判静默断线（默认 3，0 = 只发不判）。
  * 判定触发后会话进 disconnected（stateChange 附 reconnectHint=true、
- * errorCode=keepalive_timeout）
+ * errorCode=404（KEEPALIVE_TIMEOUT，N13 统一数值码））
  */
 export const setKeepalive: (handle: number, intervalSec: number, maxMisses: number) => boolean;
 

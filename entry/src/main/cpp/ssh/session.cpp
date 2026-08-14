@@ -63,6 +63,31 @@ int createTcpSocket(int family, int protocol)
     return fd;
 }
 
+// N13：connect 阶段 errno → 细分错误码（统一错误码 102/103/104 的 native 来源）。
+// ECONNREFUSED 等默认归 kConnectFailed（被拒）；ENETUNREACH/EHOSTUNREACH 归
+// kConnectUnreachable；SO_ERROR 报 ETIMEDOUT 时内核已判超时，归 kConnectTimeout
+// （与 connectTimer_ 的应用层超时同一语义）。
+SshSessionError connectErrorForErrno(int err)
+{
+    switch (err) {
+    case ENETUNREACH:
+    case EHOSTUNREACH:
+        return SshSessionError::kConnectUnreachable;
+    case ETIMEDOUT:
+        return SshSessionError::kConnectTimeout;
+    default:
+        return SshSessionError::kConnectFailed;
+    }
+}
+
+// N13：libssh2 握手失败 rc → 是否算法协商类（KEX/算法无共同集）。
+// 其余（banner/协议错误/socket 错误等）归 kHandshakeFailed。
+bool isAlgorithmNegotiationError(int rc)
+{
+    return rc == LIBSSH2_ERROR_KEX_FAILURE || rc == LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE ||
+           rc == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED || rc == LIBSSH2_ERROR_ALGO_UNSUPPORTED;
+}
+
 } // namespace
 
 SshSession::SshSession(io::SessionThread &thread, SshSessionOptions options, StateCallback callback)
@@ -231,7 +256,7 @@ void SshSession::doConnect()
     ::freeaddrinfo(results);
 
     if (fd_ < 0) {
-        failWith(SshSessionError::kConnectFailed,
+        failWith(connectErrorForErrno(lastErrno),
                  std::string("TCP 连接失败: ") + std::strerror(lastErrno));
         return;
     }
@@ -268,7 +293,7 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
         socklen_t len = sizeof(soErr);
         ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &soErr, &len);
         if (soErr != 0) {
-            failWith(SshSessionError::kConnectFailed,
+            failWith(connectErrorForErrno(soErr),
                      std::string("TCP 连接失败: ") + std::strerror(soErr));
             return;
         }
@@ -407,7 +432,9 @@ void SshSession::driveHandshake()
     char *errmsg = nullptr;
     int errmsgLen = 0;
     ::libssh2_session_last_error(session_, &errmsg, &errmsgLen, 0);
-    failWith(SshSessionError::kHandshakeFailed,
+    // N13：算法协商类失败细分（301），其余握手失败归 304
+    failWith(isAlgorithmNegotiationError(rc) ? SshSessionError::kAlgorithmNegotiationFailed
+                                             : SshSessionError::kHandshakeFailed,
              std::string("SSH 握手失败: ") +
                  (errmsg != nullptr ? std::string(errmsg, errmsgLen) : std::string("未知错误")));
 }
@@ -835,9 +862,11 @@ const char *toString(SshSessionError error)
     case SshSessionError::kNone:              return "none";
     case SshSessionError::kResolveFailed:     return "resolve_failed";
     case SshSessionError::kConnectFailed:     return "connect_failed";
+    case SshSessionError::kConnectUnreachable: return "connect_unreachable";
     case SshSessionError::kConnectTimeout:    return "connect_timeout";
     case SshSessionError::kHandshakeFailed:   return "handshake_failed";
     case SshSessionError::kHandshakeTimeout:  return "handshake_timeout";
+    case SshSessionError::kAlgorithmNegotiationFailed: return "algorithm_negotiation_failed";
     case SshSessionError::kHostKeyMismatch:   return "host_key_mismatch";
     case SshSessionError::kAuthFailedPassword:    return "auth_failed_password";
     case SshSessionError::kAuthFailedKey:         return "auth_failed_key";
@@ -862,6 +891,7 @@ bool isAutoReconnectable(SshSessionState terminalState, SshSessionError error)
         switch (error) {
         case SshSessionError::kResolveFailed:
         case SshSessionError::kConnectFailed:
+        case SshSessionError::kConnectUnreachable:
         case SshSessionError::kConnectTimeout:
         case SshSessionError::kHandshakeFailed:
         case SshSessionError::kHandshakeTimeout:
@@ -869,7 +899,8 @@ bool isAutoReconnectable(SshSessionState terminalState, SshSessionError error)
         case SshSessionError::kAuthTimeout: // 认证期对端不应答，语义上属链路异常
             return true;
         default:
-            // 凭据类失败（重连同样的凭据必然再败）、kInternal（本端资源问题）等
+            // 凭据类失败（重连同样的凭据必然再败）、协商类（算法不匹配，重连同样的
+            // 算法集必然再败）、kInternal（本端资源问题）等
             return false;
         }
     default:

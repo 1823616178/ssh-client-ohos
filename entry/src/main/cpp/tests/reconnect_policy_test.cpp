@@ -202,16 +202,18 @@ TEST(AutoReconnectableTest, ErrorStateClassifiedByCode)
     // 链路类（瞬态网络问题）：可重连
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kResolveFailed));
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kConnectFailed));
+    EXPECT_TRUE(isAutoReconnectable(kErr, E::kConnectUnreachable)); // N13：不可达多为瞬态网络
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kConnectTimeout));
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kHandshakeFailed));
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kHandshakeTimeout));
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kSocketError));
     EXPECT_TRUE(isAutoReconnectable(kErr, E::kAuthTimeout));
-    // 凭据类与本端资源问题：重连无益
+    // 凭据类、协商类与本端资源问题：重连无益
     EXPECT_FALSE(isAutoReconnectable(kErr, E::kAuthFailedPassword));
     EXPECT_FALSE(isAutoReconnectable(kErr, E::kAuthFailedKey));
     EXPECT_FALSE(isAutoReconnectable(kErr, E::kAuthFailedPassphrase));
     EXPECT_FALSE(isAutoReconnectable(kErr, E::kAuthFailedInteractive));
+    EXPECT_FALSE(isAutoReconnectable(kErr, E::kAlgorithmNegotiationFailed)); // N13
     EXPECT_FALSE(isAutoReconnectable(kErr, E::kInternal));
     EXPECT_FALSE(isAutoReconnectable(kErr, E::kHostKeyMismatch));
 }

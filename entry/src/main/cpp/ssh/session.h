@@ -19,8 +19,9 @@
  *     成功 → established；失败 → 停留 authenticating 允许重试（authMaxAttempts 上限），
  *     细分错误码经 AuthCallback 与 lastError() 双通道回报。驱动实现独立在 auth.cpp，
  *     纯逻辑辅助（错误映射/方式解析/抗优化清零）在 auth.h/cpp；
- *   - error 终态细分原因由 lastError() / lastErrorMessage() 提供
- *     （统一错误码体系是 N13，这里先用会话内枚举）。
+ *   - error 终态细分原因由 lastError() / lastErrorMessage() 提供；
+ *     N13 统一错误码体系：SshSessionError 经 ssh/error_codes.h 的
+ *     toSshErrorCode() 映射为与 ArkTS SshErrorCode 数值一致的统一码跨层传递。
  *
  * 线程契约（与 EventLoop 对齐）：
  *   - connect() / close() / state() / lastError() 任意线程可调；
@@ -80,10 +81,14 @@ enum class SshSessionState {
 enum class SshSessionError {
     kNone,
     kResolveFailed,      // getaddrinfo 失败
-    kConnectFailed,      // TCP connect 被拒/不可达
-    kConnectTimeout,     // TCP connect 超时
-    kHandshakeFailed,    // SSH 握手/算法协商失败
+    kConnectFailed,      // TCP connect 被拒（ECONNREFUSED 等）
+    kConnectUnreachable, // N13：网络/主机不可达（ENETUNREACH/EHOSTUNREACH；N6 时并入
+                         // kConnectFailed，为统一错误码 104 拆出）
+    kConnectTimeout,     // TCP connect 超时（含 SO_ERROR 报 ETIMEDOUT 的内核判定）
+    kHandshakeFailed,    // SSH 握手失败（banner/协议错误等非算法类）
     kHandshakeTimeout,   // SSH 握手超时
+    kAlgorithmNegotiationFailed, // N13：KEX/算法协商失败（无共同算法等；N6 时并入
+                                 // kHandshakeFailed，为统一错误码 301 拆出）
     kHostKeyMismatch,    // N7：主机密钥被上层拒绝（指纹不匹配/首连未获信任）；
                          // 终态为 closed（closing → closed 主动断开），此码经 lastError() 读取
     // ---- N8 认证错误：单次失败时经 AuthCallback 回报并同步到 lastError()（会话仍停
@@ -380,9 +385,10 @@ const char *toString(SshSessionError error);
 // N12：给定终态与错误码，判定「是否值得自动重连」（纯函数，供 bridge 给
 // stateChange 终态事件附 reconnectHint 字段；重连编排本身在 ArkTS 侧）：
 //   - disconnected：一律 true（对端关闭/socket 错误/keepalive 黑洞都可能是瞬态网络问题）；
-//   - error：按错误码分——链路类（解析失败/连接失败或超时/握手失败或超时/
+//   - error：按错误码分——链路类（解析失败/连接被拒或不可达或超时/握手失败或超时/
 //     socket 错误/认证超时，多为瞬态网络问题）true；凭据类（密码/公钥/短语/
-//     interactive 被拒，重连同样的凭据必然再败）与 kInternal（本端资源问题）false；
+//     interactive 被拒，重连同样的凭据必然再败）、协商类（算法不匹配，重连同样的
+//     算法集必然再败）与 kInternal（本端资源问题）false；
 //   - closed（主动关闭、含主机密钥被拒）与其余非终态：false。
 bool isAutoReconnectable(SshSessionState terminalState, SshSessionError error);
 

@@ -109,6 +109,7 @@ add_executable(ssh_core_tests
     bridge_logic_test.cpp
     reconnect_policy_test.cpp
     keepalive_test.cpp
+    error_codes_test.cpp
     ${TESTED_SOURCES}
 )
 target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR})

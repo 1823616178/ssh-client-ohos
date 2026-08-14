@@ -259,8 +259,10 @@ TEST(SshSessionStateMachineTest, ConnectToBlackholeAlwaysConvergesToError)
         const auto elapsed = std::chrono::steady_clock::now() - begin;
 
         const SshSessionError err = session.lastError();
+        // N13：部分环境内核直接报 EHOSTUNREACH/ENETUNREACH，细分为 connect_unreachable
         EXPECT_TRUE(err == SshSessionError::kConnectTimeout ||
                     err == SshSessionError::kConnectFailed ||
+                    err == SshSessionError::kConnectUnreachable ||
                     err == SshSessionError::kHandshakeTimeout ||
                     err == SshSessionError::kHandshakeFailed)
             << "意外错误码: " << sshclient::ssh::toString(err);
@@ -317,8 +319,10 @@ TEST(SshSessionStateMachineTest, HandshakeGarbageBannerFails)
         SshSession session(thread, opts, std::ref(rec));
         ASSERT_TRUE(session.connect("127.0.0.1", server.port(), "tester"));
         ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 10s));
+        // N13：垃圾字节断在 KEX 阶段时 libssh2 报 KEX_FAILURE，细分为算法协商失败
         EXPECT_TRUE(session.lastError() == SshSessionError::kHandshakeFailed ||
-                    session.lastError() == SshSessionError::kHandshakeTimeout)
+                    session.lastError() == SshSessionError::kHandshakeTimeout ||
+                    session.lastError() == SshSessionError::kAlgorithmNegotiationFailed)
             << "意外错误码: " << sshclient::ssh::toString(session.lastError());
         thread.stop();
     }

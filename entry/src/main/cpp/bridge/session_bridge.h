@@ -51,9 +51,11 @@
  * N12 keepalive 与重连（任务约定：重连编排在 ArkTS 侧，native 只做三件套）：
  *   - setKeepalive(handle, intervalSec, maxMisses)：会话 keepalive 配置
  *     （须在 connect 前调用；静默黑洞判定在 ssh/session.cpp，触发后走
- *     stateChange → disconnected，errorCode=keepalive_timeout）；
+ *     stateChange → disconnected，附统一错误码 404 keepalive_timeout）；
  *   - stateChange 进入终态（disconnected/error/closed）时附 reconnectHint
- *     （是否值得自动重连，ssh::isAutoReconnectable）与 errorCode；
+ *     （是否值得自动重连，ssh::isAutoReconnectable）与错误码——N13 起
+ *     errorCode 为统一数值码（ssh/error_codes.h，与 ArkTS SshErrorCode 一致），
+ *     另附 errorCodeName / errorMessage 字符串便于调试；
  *   - setReconnectPolicy(handle, delaysSec, maxAttempts) 设置每会话退避策略，
  *     nextReconnectDelaySec(handle, attempt) 查询第 attempt 次重连的建议延迟
  *     （-1 = 已达上限放弃）；倒计时与尝试计数由 ArkTS 侧据事件自行驱动。
