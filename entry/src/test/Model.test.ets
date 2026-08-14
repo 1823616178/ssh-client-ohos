@@ -19,6 +19,7 @@ import {
   createDefaultPortForwardRule,
   createDefaultSnippet
 } from '../main/ets/common/model/models';
+import { buildTerminalFontFamily } from '../main/ets/theme/FontService';
 
 export default function modelTest() {
   describe('ModelTest', () => {
@@ -27,7 +28,7 @@ export default function modelTest() {
       const p: AppearanceProfile = createDefaultAppearanceProfile('appearance-1');
       expect(p.id).assertEqual('appearance-1');
       expect(p.name).assertEqual('Harmony Dark');
-      expect(p.fontFamily).assertEqual('JetBrains Mono');
+      expect(p.fontFamily).assertEqual(buildTerminalFontFamily());
       expect(p.fontSize).assertEqual(14);
       expect(p.lineHeight).assertEqual(1.2);
       expect(p.letterSpacing).assertEqual(0);

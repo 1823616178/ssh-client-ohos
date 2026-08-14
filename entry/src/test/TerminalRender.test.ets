@@ -394,6 +394,14 @@ export default function terminalRenderTest() {
         .assertEqual('normal 500 12vp "monospace"');
     });
 
+    it('buildFontString_字族栈逐项加引号', 0, () => {
+      // T5：逗号分隔的字族栈须逐项加引号，整串加引号会被当成单个含逗号的字族名
+      expect(buildFontString(false, false, 400, 14, 'JetBrains Mono, Sarasa Term SC'))
+        .assertEqual('normal normal 14vp "JetBrains Mono", "Sarasa Term SC"');
+      expect(buildFontString(false, true, 400, 14, 'JetBrains Mono,Sarasa Term SC'))
+        .assertEqual('normal bold 14vp "JetBrains Mono", "Sarasa Term SC"');
+    });
+
     it('外观_默认值与C3一致', 0, () => {
       const a: TerminalAppearance = createDefaultTerminalAppearance();
       const profile = createDefaultAppearanceProfile('x');

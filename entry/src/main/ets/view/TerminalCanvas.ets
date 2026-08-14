@@ -46,10 +46,10 @@ import {
 import {
   RowDrawCommands,
   RowRenderEnv,
-  buildFontString,
   generateCursorCommands,
   generateRowsCommands
 } from './terminal/TerminalDrawCommands';
+import { measureTerminalCells, verifyCjkAlignment } from './terminal/FontMetrics';
 import { TerminalLayoutMetrics, computeTerminalLayout } from './terminal/TerminalLayout';
 import {
   hexColorToArgb,
@@ -60,7 +60,7 @@ import {
 /** 实例 id 自增序号（模块级；调度器注册用） */
 let nextCanvasId = 0;
 
-/** 字符度量失败（字体未注册，T5 之前的窗口期）时的近似格宽系数 */
+/** 字符度量失败（字体未注册）时的近似格宽系数 */
 const FALLBACK_CELL_WIDTH_FRACTION = 0.6;
 /** underline/strike 线宽 = 字号 × 该系数（下限 1vp） */
 const TEXT_DECO_THICKNESS_FRACTION = 0.06;
@@ -118,6 +118,8 @@ export struct TerminalCanvas {
   private lastGridCols = 0;
   private lastGridRows = 0;
   private needsFullRedraw = true;
+  /** 最近一次 1:2 对齐校验结果（T5；isCjkAligned() 供 UI/A3 读，默认 true 不告警） */
+  private cjkAligned = true;
 
   aboutToAppear(): void {
     this.applyAppearance();
@@ -140,6 +142,11 @@ export struct TerminalCanvas {
   forceFullRedraw(): void {
     this.needsFullRedraw = true;
     FrameScheduler.get().wakeup();
+  }
+
+  /** T5：宽字符 2 格对齐校验结果（false = 字族未 1:2 对齐，UI 可提示「字体未对齐」） */
+  isCjkAligned(): boolean {
+    return this.cjkAligned;
   }
 
   /**
@@ -358,7 +365,13 @@ export struct TerminalCanvas {
     FrameScheduler.get().wakeup();
   }
 
-  /** 字符度量：measureText('W') 只在字体参数变化时测一次并缓存（DESIGN §4.4） */
+  /**
+   * 字符度量：委托 FontMetrics（T5 单一事实源），measureText('W') 只在字体参数
+   * 变化时测一次并跨实例缓存（DESIGN §4.4）。letterSpacing/lineHeight 影响 cell
+   * 高宽换算，故本组件的 key 比 FontMetrics 缓存 key 多这两项。
+   * 改字号「一帧内重排」：applyAppearance 同步调到本函数重测 → relayout →
+   * needsFullRedraw + wakeup，下一 vsync 帧即按新版面上屏，无跨帧延迟。
+   */
   private measureCells(): void {
     const a = this.appearance;
     const key = `${a.fontFamily}|${a.fontSize}|${a.fontWeight}|${a.letterSpacing}|${a.lineHeight}`;
@@ -366,27 +379,45 @@ export struct TerminalCanvas {
       return;
     }
     this.measuredFontKey = key;
-    this.fontNormal = buildFontString(false, false, a.fontWeight, a.fontSize, a.fontFamily);
-    this.fontBold = buildFontString(false, true, a.fontWeight, a.fontSize, a.fontFamily);
-    this.fontItalic = buildFontString(true, false, a.fontWeight, a.fontSize, a.fontFamily);
-    this.fontBoldItalic = buildFontString(true, true, a.fontWeight, a.fontSize, a.fontFamily);
+    const m = measureTerminalCells(this.context, a.fontFamily, a.fontSize, a.fontWeight);
+    this.fontNormal = m.fontNormal;
+    this.fontBold = m.fontBold;
+    this.fontItalic = m.fontItalic;
+    this.fontBoldItalic = m.fontBoldItalic;
     this.context.font = this.fontNormal;
     this.context.textAlign = 'left';
     this.context.textBaseline = 'middle';
-    let width = 0;
-    try {
-      width = this.context.measureText('W').width;
-    } catch (e) {
-      Logger.warn(`TerminalCanvas measureText 失败：${JSON.stringify(e)}`, 'Terminal');
-    }
-    if (!(width > 0)) {
-      // 字体未注册（T5 之前的窗口期）或度量失败的保底格宽。
+    let glyphWidth = m.glyphWidthVp;
+    if (!m.measured) {
+      // 字体未注册（启动注册失败的兜底路径）或度量失败的保底格宽。
       // 注意此时不落定 measuredFontKey：下次调用（如 onCanvasReady）会重测
-      width = a.fontSize * FALLBACK_CELL_WIDTH_FRACTION;
+      glyphWidth = a.fontSize * FALLBACK_CELL_WIDTH_FRACTION;
       this.measuredFontKey = '';
     }
-    this.cellWidthVp = width + a.letterSpacing;
+    this.cellWidthVp = glyphWidth + a.letterSpacing;
     this.cellHeightVp = a.fontSize * a.lineHeight;
+    if (m.measured) {
+      this.checkCjkAlignment();
+    }
+  }
+
+  /**
+   * 宽字符 2 格对齐校验（每换新 fontKey 一次）：'中' 宽 ≈ 2×'W' 宽。
+   * 未对齐只告警不阻断——渲染照常（混排可能错位），结果由 isCjkAligned() 供 UI/A3 读。
+   */
+  private checkCjkAlignment(): void {
+    try {
+      const a = this.appearance;
+      const r = verifyCjkAlignment(this.context, a.fontFamily, a.fontSize, a.fontWeight);
+      this.cjkAligned = r.aligned;
+      if (!r.aligned) {
+        Logger.warn(`终端字族 1:2 对齐校验未通过：'中'=${r.cjkWidthVp.toFixed(2)}vp，` +
+          `2×'W'=${(2 * r.asciiWidthVp).toFixed(2)}vp（ratio=${r.ratio.toFixed(3)}，` +
+          '容差 ±5%）：中英混排可能错位，请确认字体注册结果', 'Terminal');
+      }
+    } catch (e) {
+      Logger.warn(`对齐校验异常：${JSON.stringify(e)}`, 'Terminal');
+    }
   }
 
   /** 画布尺寸 → cols/rows；变化时回调 onGridSizeChanged 并按职责驱动 terminal.resize() */

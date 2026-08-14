@@ -9,6 +9,7 @@
  * 除 KnownHostEntry 外每个实体附「创建默认值」工厂函数（KnownHostEntry 由首连 TOFU 时的
  * 真实主机密钥数据构造，没有有意义的默认值）；默认值取 §4.4 提到的常用值。
  */
+import { buildTerminalFontFamily } from '../../theme/FontService';
 
 /** 认证方式 */
 export type AuthType = 'password' | 'key' | 'agent';
@@ -158,12 +159,13 @@ export function createDefaultHostProfile(id: string): HostProfile {
   };
 }
 
-/** 创建默认外观配置：Harmony Dark 配色 + §4.4 常用值（JetBrains Mono / 14 / 1.2 / 块光标闪烁 / 不透明 / 内边距 8vp） */
+/** 创建默认外观配置：Harmony Dark 配色 + §4.4 常用值（T5 字族栈 / 14 / 1.2 / 块光标闪烁 / 不透明 / 内边距 8vp） */
 export function createDefaultAppearanceProfile(id: string): AppearanceProfile {
   return {
     id: id,
     name: 'Harmony Dark',
-    fontFamily: 'JetBrains Mono',
+    // T5：默认字族 = 内置随包字族栈（JetBrains Mono + Sarasa Term SC，1:2 对齐）
+    fontFamily: buildTerminalFontFamily(),
     fontSize: 14,
     lineHeight: 1.2,
     letterSpacing: 0,

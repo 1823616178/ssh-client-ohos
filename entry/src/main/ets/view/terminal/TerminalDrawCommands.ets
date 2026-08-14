@@ -281,12 +281,19 @@ export function generateCursorCommands(style: CursorStyle, view: DataView | null
 
 /**
  * Canvas font 字符串（CSS font shorthand；字号带 vp 单位，与 Canvas 默认单位模式一致）。
- * 字族固定加双引号——'JetBrains Mono' 这类含空格字族不加引号不是合法 shorthand
- * （T5 注册字体后由真机验证解析生效）。
+ * fontFamily 支持逗号分隔的字族栈（T5：'JetBrains Mono, Sarasa Term SC'）——逐项加
+ * 双引号：含空格字族不加引号不是合法 shorthand，而整串加一个引号会被当成单个
+ * 含逗号的字族名（匹配不到任何字体）。
+ * ⚠️ 字族列表的逐字回退（ASCII 用前者、CJK 落后者）是否生效需真机验证（TASKS T5）。
  */
 export function buildFontString(italic: boolean, bold: boolean, fontWeight: number,
   fontSizeVp: number, fontFamily: string): string {
   const styleToken = italic ? 'italic' : 'normal';
   const weightToken = bold ? 'bold' : (fontWeight === 400 ? 'normal' : `${fontWeight}`);
-  return `${styleToken} ${weightToken} ${fontSizeVp}vp "${fontFamily}"`;
+  const families = fontFamily.split(',')
+    .map((name: string) => name.trim())
+    .filter((name: string) => name.length > 0)
+    .map((name: string) => name.startsWith('"') ? name : `"${name}"`)
+    .join(', ');
+  return `${styleToken} ${weightToken} ${fontSizeVp}vp ${families}`;
 }

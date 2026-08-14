@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { Logger } from '../common/utils/Logger';
 import { SettingsRepository } from '../repository/SettingsRepository';
+import { registerTerminalFonts } from '../theme/FontService';
 
 const DOMAIN = 0x0000;
 
@@ -14,6 +15,8 @@ export default class EntryAbility extends UIAbility {
     // 初始化应用设置（C3）：获取 preferences store，并对缺失键写入默认值（不覆盖已有值）
     SettingsRepository.init(this.context);
     SettingsRepository.ensureDefaults();
+    // 注册终端内置字体（T5）：JetBrains Mono + Sarasa Term SC；失败只记日志不阻断启动
+    registerTerminalFonts();
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {

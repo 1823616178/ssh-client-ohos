@@ -6,6 +6,7 @@ import sshErrorTest from './SshError.test';
 import sshTerminalTest from './SshTerminal.test';
 import terminalRenderTest from './TerminalRender.test';
 import frameSchedulerTest from './FrameScheduler.test';
+import fontServiceTest from './FontService.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -16,4 +17,5 @@ export default function testsuite() {
   sshTerminalTest();
   terminalRenderTest();
   frameSchedulerTest();
+  fontServiceTest();
 }
