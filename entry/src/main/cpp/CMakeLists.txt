@@ -14,6 +14,7 @@ set(NATIVE_SOURCES
     # ssh/
     # term/
     # crypto/
+    crypto/aad.cpp
     # io/
 )
 

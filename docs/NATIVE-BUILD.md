@@ -199,3 +199,59 @@ A：不能（DESIGN §3.7 注）：configure/make 需要 POSIX 环境，Windows 
 A：三个库的下载都带主站 + 镜像回退（curl 直连）。若公司网络拦了外网，手工下载源码包放到
 `~/ohos-probe/build/downloads/`（文件名照脚本里的 `libssh2-1.11.1.tar.gz` /
 `libvterm-0.3.3.tar.gz` / `argon2-20190702.tar.gz`），重跑脚本即走缓存。
+
+---
+
+## 7. native 单元测试（N4 交付物）
+
+### 7.1 怎么跑
+
+```bash
+# WSL / Linux CI 内：宿主机 clang 构建并运行全部测试（首次自动下载 googletest 1.15.2）
+bash scripts/run-native-tests.sh
+
+# 交叉编译 x86_64-linux-ohos：只编不跑，用于验证同一份代码在 OHOS 工具链下可编译
+TARGET=ohos-x86_64 bash scripts/run-native-tests.sh
+```
+
+Windows 侧驱动：`wsl -d Ubuntu -- bash /mnt/c/.../scripts/run-native-tests.sh`。
+脚本退出码 0 = 全部通过，非 0 = 失败，CI 可直接调用；junit 风格 XML 报告输出到
+`entry/src/main/cpp/tests/build/host/test-results.xml`。构建目录
+`entry/src/main/cpp/tests/build/` 已被 `.gitignore` 的 `**/build` 规则覆盖。
+
+GoogleTest 获取策略（脚本头部注释有完整说明）：本地 `GOOGLETEST_SRC` 指定 →
+`DOWNLOAD_DIR` 缓存 tarball → GitHub release 下载 → gitee 镜像 git clone；
+`SYSTEM_GTEST=ON` 时改用 `find_package` 找宿主机已装的 GTest。
+
+### 7.2 目录与构建约定
+
+- 测试源码与独立 CMake 收在 `entry/src/main/cpp/tests/`（`CMakeLists.txt` + `*_test.cpp`），
+  **与 OHOS 产物的 `cpp/CMakeLists.txt` 完全分离**，互不使用对方的构建文件。
+- 被测纯逻辑源码显式列在两处：`tests/CMakeLists.txt` 的 `TESTED_SOURCES`（宿主机/交叉编译用）
+  与 `cpp/CMakeLists.txt` 的 `NATIVE_SOURCES`（编进 `libssh_core.so`）——**同一份文件，两处编译**，
+  新增纯逻辑源文件时两边都要加。
+- 单测源码 `#include "crypto/aad.hpp"` 这种以 `cpp/` 为根的相对路径，由 tests CMake 注入 include 目录。
+
+### 7.3 架构约定：纯逻辑与 NAPI 解耦（硬性规则）
+
+宿主机能跑测试的前提是**被测代码可以在没有 OHOS 环境的情况下编译**，因此：
+
+- `crypto/` `term/` `io/` `ssh/` 下的纯逻辑代码只准依赖 C/C++ 标准库与 prebuilt 第三方库头文件，
+  **禁止** include `<napi/native_api.h>` / `<hilog/log.h>`；
+- NAPI 胶水只允许出现在 `bridge/` 与 `napi_init.cpp`；
+- 单测只编译纯逻辑源码，不链 `ace_napi.z` 等 OHOS 系统库。
+
+第一个落地样例是 `crypto/aad.{hpp,cpp}`（DESIGN §6.2 的 AAD 编码）+ `tests/aad_test.cpp`。
+
+### 7.4 宿主机与目标机的差异（结论可迁移的前提）
+
+- **路线选择**：DESIGN §9 允许「x86_64-linux-ohos 或宿主机 clang」二选一。x86_64-linux-ohos
+  二进制依赖 OHOS musl 运行时，WSL/普通 Linux CI 无法直接执行，故选**宿主机 clang +
+  宿主机版依赖**；`TARGET=ohos-x86_64` 的交叉编译仅作为「OHOS 工具链下可编译」的看护。
+- **S2 黄金向量测试的可迁移性**：宿主机跑密码学测试时链接宿主机版 OpenSSL/libargon2
+  （`apt install libssl-dev libargon2-dev` 或源码编，S2 时接入 tests CMake）。
+  可迁移的前提是——libargon2 是参考实现（且 OHOS 侧固定 `OPTTARGET=generic` 走 `ref.c`，
+  见 §4.4），跨平台逐字节一致；OpenSSL 的 AES-256-GCM/HKDF-SHA256 是标准算法，实现间
+  互操作有互通测试背书。因此宿主机上通过的黄金向量结论可迁移到 OHOS 产物；
+  **若将来任一依赖换成非参考实现或启用平台专用优化路径，此前提作废，必须改在目标 ABI 上重验**。
+- libvterm/libssh2 的宿主版当前用不到，暂不链接；后续需要时按同一规则接入。
