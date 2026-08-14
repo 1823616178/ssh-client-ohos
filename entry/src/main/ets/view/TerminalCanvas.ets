@@ -30,6 +30,19 @@
  * native 侧标记（DESIGN §4.4 兜底顺序：脏行 → OffscreenCanvas 分块 → 自绘节点）。
  *
  * 本组件尚不被任何页面使用（U4 才整合 TerminalPage），保持在 view/ 待用。
+ *
+ * 输入通路（任务 T6 接线，详见 KeyMap/StickyModifiers/ImeInputHandler/FocusManager 头注）：
+ *  - 隐藏 TextInput（ImeInputSink）承接软键盘 IME：onChange 增量 → 字节 →
+ *    terminal.write()；中文候选期（previewText 非空）不发送；
+ *  - 物理键盘：onKeyPreIme（IME 前拦截方向/功能/Ctrl 组合，可打印键放行给 IME）
+ *    + onKeyEvent（容器自身获焦时的全量通路）→ mapKeyEvent → write()；
+ *  - 焦点路由：focusId 非空时按 FocusManager 判定，非聚焦窗格不投任何输入；
+ *    点击窗格 = 聚焦 + 弹软键盘（焦点边框高亮归 U4b）；
+ *  - 粘滞修饰：stickyModifiers 实例公开给 T7 功能键条（tap/lock），
+ *    组件在每次按键/IME 提交出口消费；
+ *  - T10 扩展点：2in1 物理键盘完整支持（不弹软键盘策略、keyText 非 US 布局、
+ *    可自定义快捷键表、Meta 细分、小键盘映射）——handleKeyInput 是唯一出口，
+ *    T10 在这里扩，不要另开旁路。
  */
 import { NativeTerminalFrame } from '../napi/SshNative';
 import {
@@ -56,6 +69,14 @@ import {
   paletteToArgb,
   withOpacity
 } from './terminal/TerminalPalette';
+import { FocusManager } from './terminal/FocusManager';
+import { isModifierKeyCode, isPrintableKeyCode, mapKeyEvent } from './terminal/KeyMap';
+import { StickyModifiers } from './terminal/StickyModifiers';
+import {
+  CommittedDelta,
+  ImeInputSink,
+  committedDeltaToInputBytes
+} from './terminal/ImeInputHandler';
 
 /** 实例 id 自增序号（模块级；调度器注册用） */
 let nextCanvasId = 0;
@@ -86,10 +107,27 @@ export struct TerminalCanvas {
    * 默认 false，T0/Q2 帧率不达标再启用（前置条件与风险见文件头注「性能策略」）
    */
   scrollBlitEnabled: boolean = false;
+  /**
+   * 窗格焦点 id（T6，U4b Leaf 传入）：非空时输入按 FocusManager 路由，
+   * 仅聚焦窗格收发；空串 = 单窗格模式（输入直通，不做路由判定）
+   */
+  @Prop focusId: string = '';
+  /**
+   * 终端应用光标模式（DECCKM）：native 尚未暴露该模式位（T1 未加），
+   * 先参数化透传给 mapKeyEvent；native 暴露后由 U4 接线（KeyMap 头注）
+   */
+  @Prop applicationCursorKeys: boolean = false;
+  /**
+   * 粘滞修饰键状态机（T6）：T7 功能键条读写（tapCtrl/tapAlt/lockCtrl/lockAlt），
+   * 组件在每次物理按键与 IME 提交出口取快照并 consume
+   */
+  readonly stickyModifiers: StickyModifiers = new StickyModifiers();
 
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private context: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private readonly schedulerId: string = `terminal-canvas-${++nextCanvasId}`;
+  /** 隐藏 IME 承接框的全局唯一 id（focusControl.requestFocus 用） */
+  private readonly imeSinkId: string = `terminal-ime-${++nextCanvasId}`;
 
   private canvasReady = false;
   private areaWidthVp = 0;
@@ -175,6 +213,95 @@ export struct TerminalCanvas {
     this.context.fillRect(0, 0, w, h);
     this.context.drawImage(bitmap, 0, 0);
     return true;
+  }
+
+  // ---------------------------------------------------------------- 输入通路（T6）
+
+  /** 输入投递判定：单窗格模式（focusId 空）直通；否则仅聚焦窗格（DESIGN §4.3.1） */
+  private isInputTarget(): boolean {
+    return this.focusId.length === 0 || FocusManager.get().isFocused(this.focusId);
+  }
+
+  /** 点击窗格：聚焦本窗格（U4b 边框高亮经 FocusManager 监听器）+ 弹软键盘承接 IME */
+  private onPaneClick(): void {
+    if (this.focusId.length > 0) {
+      FocusManager.get().focus(this.focusId);
+    }
+    if (this.isInputTarget()) {
+      focusControl.requestFocus(this.imeSinkId);
+    }
+  }
+
+  /** 写终端输入：Uint8Array → 零偏移全量 ArrayBuffer（writeTerminal 接受 ArrayBuffer | string） */
+  private sendInputBytes(bytes: Uint8Array): void {
+    const terminal = this.terminal;
+    if (terminal === null || bytes.length === 0) {
+      return;
+    }
+    terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+
+  /**
+   * 物理键盘统一出口（onKeyEvent 与 onKeyPreIme 共用；T10 扩展点，勿开旁路）。
+   *
+   * @param preIme true = TextInput 的 IME 前拦截（onKeyPreIme）：无 Ctrl/Alt 的
+   *   可打印键必须放行（返回 false），让 IME 走 onChange 增量路径——否则中文
+   *   候选会被拦断、可打印字符与 IME 双发；false = 容器自身获焦的全量通路。
+   * @returns true = 已消费（不再进 IME/不再冒泡）
+   */
+  private handleKeyInput(event: KeyEvent, preIme: boolean): boolean {
+    if (event.type !== KeyType.Down) {
+      return false; // 只处理按下；弹起不重复发送
+    }
+    if (isModifierKeyCode(event.keyCode)) {
+      return false; // 修饰键自身放行（组合状态由系统跟踪，不产生字节）
+    }
+    const ctrl = this.queryModifierState(event, 'ctrl');
+    const alt = this.queryModifierState(event, 'alt');
+    if (preIme && !ctrl && !alt && isPrintableKeyCode(event.keyCode)) {
+      return false;
+    }
+    if (!this.isInputTarget()) {
+      return false; // 非聚焦窗格：物理输入不投递（路由验收标准）
+    }
+    const snap = this.stickyModifiers.snapshot();
+    const mapped = mapKeyEvent(event.keyCode, this.queryModifierState(event, 'shift'),
+      alt || snap.alt, ctrl || snap.ctrl, false, this.applicationCursorKeys);
+    if (mapped === null) {
+      return false; // 未映射键放行系统默认处理
+    }
+    this.sendInputBytes(mapped);
+    this.stickyModifiers.consume(); // 一次性粘滞用完复位（locked 保持）
+    return true;
+  }
+
+  /**
+   * 硬件修饰状态查询。KeyEvent.getModifierKeyState 在 SDK 声明中为可选方法
+   * （支持 'ctrl'|'alt'|'shift'；Meta 暂不支持，mapKeyEvent 内 Meta 按 Alt 处理），
+   * 缺失时退化为无修饰（真机待验项，见 ImeInputHandler 头注）。
+   */
+  private queryModifierState(event: KeyEvent, name: string): boolean {
+    return event.getModifierKeyState !== undefined ? event.getModifierKeyState([name]) : false;
+  }
+
+  /**
+   * IME 提交出口：增量 + 粘滞快照 → 字节 → write()；每次提交都消费一次性粘滞
+   * （「下一个按键带修饰」以按键/提交计，见 StickyModifiers 头注）。
+   */
+  private onImeDelta = (delta: CommittedDelta): void => {
+    if (!this.isInputTarget()) {
+      return;
+    }
+    const snap = this.stickyModifiers.snapshot();
+    const bytes = committedDeltaToInputBytes(delta, snap);
+    this.stickyModifiers.consume();
+    if (bytes !== null) {
+      this.sendInputBytes(bytes);
+    }
+  }
+
+  private onImeInterceptKey = (event: KeyEvent): boolean => {
+    return this.handleKeyInput(event, true);
   }
 
   // ---------------------------------------------------------------- 帧流程
@@ -466,14 +593,32 @@ export struct TerminalCanvas {
   }
 
   build() {
-    Canvas(this.context)
-      .width('100%')
-      .height('100%')
-      .onReady(() => {
-        this.onCanvasReady();
+    Stack() {
+      Canvas(this.context)
+        .width('100%')
+        .height('100%')
+        .onReady(() => {
+          this.onCanvasReady();
+        })
+        .onAreaChange((oldArea: Area, newArea: Area) => {
+          this.onCanvasAreaChange(oldArea, newArea);
+        })
+      // 隐藏 IME 承接框（T6）：1vp 近全透明、不拦截触摸，物理键 IME 前拦截
+      ImeInputSink({
+        sinkId: this.imeSinkId,
+        onDelta: this.onImeDelta,
+        onInterceptKey: this.onImeInterceptKey
       })
-      .onAreaChange((oldArea: Area, newArea: Area) => {
-        this.onCanvasAreaChange(oldArea, newArea);
-      })
+    }
+    .width('100%')
+    .height('100%')
+    .onClick(() => {
+      this.onPaneClick();
+    })
+    .onKeyEvent((event: KeyEvent): boolean => {
+      // 容器自身获焦时的物理键盘通路（API 15 起返回值可拦截冒泡）；
+      // 子组件（ImeInputSink）获焦时按键先经其 onKeyPreIme，此处不再重复
+      return this.handleKeyInput(event, false);
+    })
   }
 }

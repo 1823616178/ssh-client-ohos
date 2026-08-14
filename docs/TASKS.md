@@ -12,7 +12,7 @@
 
 - **已完成（M0）**：X1 `b1fa2f0`、X5 `f8b604e`、X2 `a57d4e7`、X4 `dbfd13f`、N1/N2 `d8604bd`、N3 `e5e8c25`、N4 `181b00d`、X3 `79e4c49`
 - **已完成（M1）**：N5 `070c6f7`、N6 `9646ecc`、N7 `caff668`、N8 `3a8e85d`、N9 `72a4b32`、N10 `6610a22`、N11 `089c617`、N12 `9db98d0`、N13 `da2428e`；C3 提前完成 `b65dd79`
-- **已完成（M2）**：T1 `62b87c2`、T2 `0f6529b`、T3 `c49a8f9`（+回滚窗口修复 `a5d759b`）、T4 `22253f5`（帧率/CPU 验收待真机）
+- **已完成（M2）**：T1 `62b87c2`、T2 `0f6529b`、T3 `c49a8f9`（+回滚窗口修复 `a5d759b`）、T4 `22253f5`（帧率/CPU 验收待真机）、T6（本提交；候选期 previewText 判定与应用光标模式接线待真机，hypium 执行绿证待 Previewer 恢复）
 - **M1 剩余**：Q1 大部分已由「WSL 免 root sshd + native 测试 + ci-local.sh 门禁」覆盖，Docker 多算法 sshd 与 x86_64 模拟器用例待补
 - **阻塞**：X0（签名，需人工）；N3b/T0 spike 与全部真机验收依赖 X0（含 T4 的 ≥50fps / CPU≈0 / 4 实例验收）
 - **验证基线**：`scripts/run-native-tests.sh` 116/116（含真实 sshd 集成）、ASan 干净、`scripts/ci-local.sh` 四阶段全绿

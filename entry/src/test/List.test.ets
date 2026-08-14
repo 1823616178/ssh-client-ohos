@@ -7,6 +7,9 @@ import sshTerminalTest from './SshTerminal.test';
 import terminalRenderTest from './TerminalRender.test';
 import frameSchedulerTest from './FrameScheduler.test';
 import fontServiceTest from './FontService.test';
+import keyMapTest, { focusManagerTest } from './KeyMap.test';
+import stickyModifiersTest from './StickyModifiers.test';
+import imeInputTest from './ImeInput.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -18,4 +21,8 @@ export default function testsuite() {
   terminalRenderTest();
   frameSchedulerTest();
   fontServiceTest();
+  keyMapTest();
+  focusManagerTest();
+  stickyModifiersTest();
+  imeInputTest();
 }
