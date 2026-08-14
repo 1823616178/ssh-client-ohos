@@ -59,20 +59,55 @@ set(TESTED_SOURCES
     ${CPP_ROOT}/crypto/aad.cpp
     ${CPP_ROOT}/io/EventLoop.cpp
     ${CPP_ROOT}/io/SessionThread.cpp
+    ${CPP_ROOT}/ssh/session.cpp
 )
+
+# ---- N6 ssh/ 会话层的 libssh2 依赖 ----
+# 宿主机：scripts/setup-host-deps.sh 产出的静态 libssh2 + 系统 OpenSSL + z
+#        （仓库 prebuilt/ 是 OHOS target，宿主测试不能链）；
+# 交叉（ohos-x86_64）：复用仓库 prebuilt/${OHOS_ARCH} 的头与静态库，只编不跑。
+option(SSH_TESTS_INTEGRATION "编译真实 sshd 集成测试用例（运行时找不到 sshd 则 GTEST_SKIP）" ON)
+set(SSH_TESTS_HOST_LIBSSH2 "$ENV{HOME}/ohos-probe/build/host-deps/libssh2"
+    CACHE PATH "宿主机版 libssh2 安装前缀（scripts/setup-host-deps.sh 产物）")
+
+if(CMAKE_CROSSCOMPILING)
+    # 交叉目标无法在宿主机执行，集成用例编译但不启用（运行时更不会执行）
+    set(SSH_TESTS_INTEGRATION OFF)
+    set(LIBSSH2_INCLUDE_DIR ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/include)
+    set(LIBSSH2_LIBS
+        ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libssh2.a
+        ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libcrypto.a
+        z)
+else()
+    if(NOT EXISTS "${SSH_TESTS_HOST_LIBSSH2}/lib/libssh2.a"
+            OR NOT EXISTS "${SSH_TESTS_HOST_LIBSSH2}/include/libssh2.h")
+        message(FATAL_ERROR
+            "找不到宿主机版 libssh2（${SSH_TESTS_HOST_LIBSSH2}）。\n"
+            "请先运行 scripts/setup-host-deps.sh（WSL 内），"
+            "或用 -DSSH_TESTS_HOST_LIBSSH2=<前缀> 指定。")
+    endif()
+    set(LIBSSH2_INCLUDE_DIR ${SSH_TESTS_HOST_LIBSSH2}/include)
+    find_package(OpenSSL REQUIRED)
+    set(LIBSSH2_LIBS ${SSH_TESTS_HOST_LIBSSH2}/lib/libssh2.a OpenSSL::Crypto z)
+endif()
 
 add_executable(ssh_core_tests
     aad_test.cpp
     event_loop_test.cpp
     session_thread_test.cpp
+    ssh_session_test.cpp
     ${TESTED_SOURCES}
 )
-target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT})
+target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR})
+if(SSH_TESTS_INTEGRATION)
+    target_compile_definitions(ssh_core_tests PRIVATE SSH_TESTS_INTEGRATION=1)
+endif()
 
 # std::thread / std::mutex 需要 pthread（OHOS musl 与宿主 Linux 均适用）
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-target_link_libraries(ssh_core_tests PRIVATE ${GTEST_LIBS} Threads::Threads)
+# 链接顺序：被测对象 → libssh2 → crypto/z → gtest（静态库依赖者在前）
+target_link_libraries(ssh_core_tests PRIVATE ${LIBSSH2_LIBS} ${GTEST_LIBS} Threads::Threads)
 
 # 交叉编译（ohos target）时测试二进制无法在宿主机执行，不能在建后跑 --gtest_list_tests
 if(NOT CMAKE_CROSSCOMPILING)

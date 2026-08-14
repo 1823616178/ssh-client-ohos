@@ -12,6 +12,7 @@ set(NATIVE_SOURCES
     napi_init.cpp
     # bridge/
     # ssh/
+    ssh/session.cpp
     # term/
     # crypto/
     crypto/aad.cpp

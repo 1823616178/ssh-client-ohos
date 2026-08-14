@@ -254,4 +254,28 @@ GoogleTest 获取策略（脚本头部注释有完整说明）：本地 `GOOGLET
   见 §4.4），跨平台逐字节一致；OpenSSL 的 AES-256-GCM/HKDF-SHA256 是标准算法，实现间
   互操作有互通测试背书。因此宿主机上通过的黄金向量结论可迁移到 OHOS 产物；
   **若将来任一依赖换成非参考实现或启用平台专用优化路径，此前提作废，必须改在目标 ABI 上重验**。
-- libvterm/libssh2 的宿主版当前用不到，暂不链接；后续需要时按同一规则接入。
+- **libssh2 的宿主版**自 N6 起由 `scripts/setup-host-deps.sh` 自动产出（见 §7.5）；
+  libvterm 的宿主版当前用不到，暂不链接，后续需要时按同一规则接入。
+
+### 7.5 N6：宿主版 libssh2 与测试用 sshd（`scripts/setup-host-deps.sh`）
+
+N6 的 `ssh/session.cpp` 单测需要**宿主机版** libssh2（仓库 `prebuilt/` 是 OHOS target，
+宿主测试不能链），集成用例还需要一个真实 sshd。两者由
+`scripts/setup-host-deps.sh`（WSL/Linux CI 内运行，幂等）一次备齐，产物全部落在
+`~/ohos-probe/build/host-deps/`，**不进仓库**。`run-native-tests.sh` 在宿主机模式下
+发现 libssh2 缺失时会自动调用该脚本，一般不需要手工跑。
+
+- **宿主版 libssh2 1.11.1**：复用 `DOWNLOAD_DIR` 缓存的源码包（与 N2 同一份 tarball），
+  用宿主 clang + 系统 OpenSSL（`apt install libssl-dev`）编成静态库，装到
+  `host-deps/libssh2/`。测试链接「静态 libssh2 + 系统 OpenSSL.so + z」。
+- **测试用 sshd（免 root）**：`sudo` 不可用的环境（如本机 WSL）下，
+  用 `apt-get download openssh-server libwrap0` + `dpkg -x` 解包到用户目录，
+  运行时以 `LD_LIBRARY_PATH` 指向解包内的私有库目录（Ubuntu 的 sshd 链了 libwrap）。
+  host key（ed25519/rsa）与 `sshd_config` 生成在 `host-deps/sshd/runtime/`。
+- **集成用例的运行方式**：每个用例用 `sshd -d`（单连接调试模式：不 fork、处理一条
+  连接后退出）在 127.0.0.1 空闲高端口起独立实例，用例间互不影响；
+  「断线检测」用例直接 SIGKILL 该辅助进程模拟拔线/RST。
+- **降级语义**：找不到 sshd（或 `SSH_TESTS_INTEGRATION=OFF`，或交叉编译）时集成用例
+  `GTEST_SKIP` 而非失败；其余状态机用例不依赖 sshd，始终全量执行。
+- 可调环境变量：`SSH_TESTS_SSHD`（sshd 二进制路径）、`SSH_TESTS_SSHD_RUNTIME`
+  （运行时目录）、`SSH_TESTS_HOST_LIBSSH2`（CMake cache 变量，libssh2 前缀）。

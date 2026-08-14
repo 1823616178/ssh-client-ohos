@@ -111,6 +111,14 @@ ensure_gtest
 case "$TARGET" in
   host)
     BUILD_DIR="$BUILD_ROOT/host"
+    # N6：ssh/ 会话层单测需要宿主机版 libssh2（prebuilt/ 是 OHOS target，不能链）；
+    # 集成测试另需测试用 sshd。setup-host-deps.sh 幂等补齐两者，产物不进仓库。
+    HOST_DEPS_ROOT="${HOST_DEPS_ROOT:-$HOME/ohos-probe/build/host-deps}"
+    if [ ! -f "$HOST_DEPS_ROOT/libssh2/lib/libssh2.a" ]; then
+      log "宿主版 libssh2 缺失，运行 scripts/setup-host-deps.sh 补齐"
+      bash "$PROJECT_ROOT/scripts/setup-host-deps.sh"
+    fi
+    HOST_LIBSSH2_CMAKE_ARGS=(-DSSH_TESTS_HOST_LIBSSH2="$HOST_DEPS_ROOT/libssh2")
     SAN_CMAKE_ARGS=()
     if [ -n "$SANITIZE" ]; then
       [ "$SANITIZE" = "address" ] || die "未知 SANITIZE='$SANITIZE'（可选：address）"
@@ -119,7 +127,7 @@ case "$TARGET" in
     fi
     log "配置（宿主机，CC=$CC CXX=$CXX，gtest $GTEST_VER${SANITIZE:+，sanitizer=$SANITIZE}）→ $BUILD_DIR"
     cmake -S "$CPP_DIR/tests" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
-      "${GTEST_CMAKE_ARGS[@]}" "${SAN_CMAKE_ARGS[@]}"
+      "${GTEST_CMAKE_ARGS[@]}" "${HOST_LIBSSH2_CMAKE_ARGS[@]}" "${SAN_CMAKE_ARGS[@]}"
     log "构建（-j$JOBS）"
     cmake --build "$BUILD_DIR" -j "$JOBS"
     log "运行全部测试（junit XML → $BUILD_DIR/test-results.xml）"
