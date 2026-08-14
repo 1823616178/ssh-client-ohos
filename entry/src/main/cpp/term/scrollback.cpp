@@ -48,6 +48,21 @@ const Cell *ScrollbackBuffer::getLine(uint64_t absoluteIndex) const
 size_t ScrollbackBuffer::copyWindow(uint64_t startIndex, size_t count, Cell *out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    return copyWindowLocked(startIndex, count, out);
+}
+
+int ScrollbackBuffer::copyWindowWithCols(uint64_t startIndex, size_t count,
+                                         std::vector<Cell> &out) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 列宽与拷出在同一把锁内：out 尺寸与拷贝步长天然一致，无 TOCTOU 窗口
+    out.assign(count * static_cast<size_t>(cols_), Cell{});
+    copyWindowLocked(startIndex, count, out.data());
+    return cols_;
+}
+
+size_t ScrollbackBuffer::copyWindowLocked(uint64_t startIndex, size_t count, Cell *out) const
+{
     const uint64_t oldest = oldestIndexLocked();
     size_t copied = 0;
     for (size_t i = 0; i < count; ++i) {

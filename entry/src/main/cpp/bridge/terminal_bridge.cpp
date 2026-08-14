@@ -552,10 +552,10 @@ napi_value GetScrollbackWindow(napi_env env, napi_callback_info info)
         return MakeNull(env);
     }
     const auto &sb = core->vterm->scrollback();
-    const int cols = sb.cols();
-    std::vector<term::Cell> out(static_cast<size_t>(count) * static_cast<size_t>(cols));
-    // ScrollbackBuffer 全方法持锁（T3 起），与循环线程 pushLine/resizeCols 互斥
-    sb.copyWindow(static_cast<uint64_t>(start), count, out.data());
+    // 列宽读取与整段拷出在同一把锁内完成（T3 审查修复）：若拆成 cols() + copyWindow
+    // 两步，两锁之间 resizeCols 改列宽会让拷贝按新列宽写旧尺寸缓冲（堆越界写）
+    std::vector<term::Cell> out;
+    sb.copyWindowWithCols(static_cast<uint64_t>(start), count, out);
     napi_value ab = MakeCopiedArrayBuffer(env, out.data(), out.size() * sizeof(term::Cell));
     return ab != nullptr ? ab : MakeNull(env);
 }

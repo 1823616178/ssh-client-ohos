@@ -15,7 +15,9 @@
  */
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "term/scrollback.h"
@@ -177,6 +179,87 @@ TEST(ScrollbackBufferTest, CopyWindowBulkExactAndClamped)
     EXPECT_EQ(out[0].codepoint, 0u);
     EXPECT_EQ(out[4].codepoint, 11u);
     EXPECT_EQ(out[8].codepoint, 12u);
+}
+
+TEST(ScrollbackBufferTest, CopyWindowWithColsMatchesCopyWindowSemantics)
+{
+    ScrollbackBuffer sb(4, 5);
+    for (uint32_t i = 0; i < 6; ++i) // 推 6 行进容量 5：窗口 [1,6)
+        sb.pushLine(makeLine(4, 10 + i).data(), 4);
+
+    // 与 copyWindow 同语义：返回实际列宽，out 精确调整为 count × 列宽，
+    // 有效行原样、窗口外填零值 Cell
+    std::vector<Cell> out;
+    EXPECT_EQ(sb.copyWindowWithCols(4, 5, out), 4);
+    ASSERT_EQ(out.size(), 5u * 4u);
+    EXPECT_EQ(out[0].codepoint, 14u);
+    EXPECT_EQ(out[4].codepoint, 15u);
+    EXPECT_EQ(out[8].codepoint, 0u); // absoluteIndex 6 已无效 → 零值
+    EXPECT_EQ(out[16].codepoint, 0u);
+
+    // out 复用时尺寸被重新调整（不残留旧尺寸）
+    EXPECT_EQ(sb.copyWindowWithCols(1, 2, out), 4);
+    ASSERT_EQ(out.size(), 2u * 4u);
+    EXPECT_EQ(out[0].codepoint, 11u);
+    EXPECT_EQ(out[4].codepoint, 12u);
+}
+
+TEST(ScrollbackBufferTest, CopyWindowWithColsFollowsResizeCols)
+{
+    ScrollbackBuffer sb(4, 3);
+    std::vector<Cell> line(4, Cell{});
+    for (size_t i = 0; i < 4; ++i)
+        line[i].codepoint = static_cast<uint32_t>(u'A' + i); // A B C D
+    sb.pushLine(line.data(), line.size());
+
+    Cell blank{};
+    sb.resizeCols(6, blank); // 扩宽后：返回新列宽，内容补零值格
+    std::vector<Cell> out;
+    EXPECT_EQ(sb.copyWindowWithCols(0, 1, out), 6);
+    ASSERT_EQ(out.size(), 6u);
+    EXPECT_EQ(out[0].codepoint, u'A');
+    EXPECT_EQ(out[3].codepoint, u'D');
+    EXPECT_EQ(out[4].codepoint, 0u);
+    EXPECT_EQ(out[5].codepoint, 0u);
+
+    sb.resizeCols(2, blank); // 收窄后：返回新列宽，内容截断
+    EXPECT_EQ(sb.copyWindowWithCols(0, 1, out), 2);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].codepoint, u'A');
+    EXPECT_EQ(out[1].codepoint, u'B');
+}
+
+// T3 审查修复钉死：copyWindowWithCols 在循环线程 resizeCols 并发下，
+// 每次返回的 out 尺寸必须恒等于 count × 返回列宽（旧两步式在此场景下
+// 会按新列宽写旧尺寸缓冲，ASan 直接报堆越界写）
+TEST(ScrollbackBufferTest, CopyWindowWithColsConsistentUnderConcurrentResize)
+{
+    ScrollbackBuffer sb(4, 32);
+    for (uint32_t i = 0; i < 16; ++i)
+        sb.pushLine(makeLine(4, i).data(), 4);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ok{true};
+    const Cell blank{};
+    std::thread resizer([&] {
+        int cols = 8;
+        while (!stop.load(std::memory_order_relaxed)) {
+            sb.resizeCols(cols, blank);
+            cols = (cols == 8) ? 4 : 8;
+        }
+    });
+
+    constexpr size_t kCount = 8;
+    for (int iter = 0; iter < 20000 && ok.load(std::memory_order_relaxed); ++iter) {
+        std::vector<Cell> out;
+        const int cols = sb.copyWindowWithCols(0, kCount, out);
+        // 不变量：列宽合法且缓冲尺寸与返回列宽严格一致（同一把锁内产出）
+        if ((cols != 4 && cols != 8) || out.size() != kCount * static_cast<size_t>(cols))
+            ok.store(false, std::memory_order_relaxed);
+    }
+    stop.store(true, std::memory_order_relaxed);
+    resizer.join();
+    EXPECT_TRUE(ok.load());
 }
 
 TEST(ScrollbackBufferTest, PopLineLIFOAndCounterSync)

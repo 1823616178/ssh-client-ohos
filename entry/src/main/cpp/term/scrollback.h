@@ -80,6 +80,12 @@ public:
     // out 至少 count × cols() 个 Cell。
     size_t copyWindow(uint64_t startIndex, size_t count, Cell *out) const;
 
+    // 组合接口（T3 审查修复）：列宽读取与整段拷贝在同一把锁内完成，返回实际列宽，
+    // out 被精确调整为 count × 返回列宽（语义同 copyWindow：恒写满、窗口外填零）。
+    // 跨线程调用方必须用它而非「cols() + copyWindow」两步——两步之间 resizeCols
+    // 改列宽会让 copyWindow 按新列宽写旧尺寸的缓冲，构成堆越界写（TOCTOU）。
+    int copyWindowWithCols(uint64_t startIndex, size_t count, std::vector<Cell> &out) const;
+
     // 弹出最新行（libvterm sb_popline：resize 行数增大时回填屏幕顶部）：
     // 拷贝到 out（至少 cols() 格）后从缓冲移除；空缓冲返回 false 且不写 out。
     bool popLine(Cell *out);
@@ -101,6 +107,8 @@ private:
     }
     // 调用方已持锁前提下的有效窗口左端（方法内部复用，避免递归加锁）
     uint64_t oldestIndexLocked() const { return totalPushed_ - size_; }
+    // 调用方已持锁前提下的窗口拷贝主体（copyWindow / copyWindowWithCols 复用）
+    size_t copyWindowLocked(uint64_t startIndex, size_t count, Cell *out) const;
 
     mutable std::mutex mutex_; // 全方法级保护（T3 跨线程拷贝，见头注「线程安全」）
     int cols_;
