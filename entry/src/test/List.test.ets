@@ -19,6 +19,7 @@ import credentialStoreTest from './CredentialStore.test';
 import sessionManagerTest from './SessionManager.test';
 import hostListViewModelTest from './HostListViewModel.test';
 import hostEditViewModelTest from './HostEditViewModel.test';
+import terminalViewModelTest from './TerminalViewModel.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -43,4 +44,5 @@ export default function testsuite() {
   sessionManagerTest();
   hostListViewModelTest();
   hostEditViewModelTest();
+  terminalViewModelTest();
 }

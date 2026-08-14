@@ -29,7 +29,7 @@
  * 可靠检测要 native 滚动提示（T1 未暴露），T0/Q2 帧率不达标时再启用并补
  * native 侧标记（DESIGN §4.4 兜底顺序：脏行 → OffscreenCanvas 分块 → 自绘节点）。
  *
- * 本组件尚不被任何页面使用（U4 才整合 TerminalPage），保持在 view/ 待用。
+ * 本组件由 U4 TerminalPage 整合使用（单窗格：固定 paneId 绑一个会话）。
  *
  * 输入通路（任务 T6 接线，详见 KeyMap/StickyModifiers/ImeInputHandler/FocusManager 头注）：
  *  - 隐藏 TextInput（ImeInputSink）承接软键盘 IME：onChange 增量 → 字节 →
@@ -79,7 +79,12 @@ import {
   generateCursorCommands,
   generateRowsCommands
 } from './terminal/TerminalDrawCommands';
-import { measureTerminalCells, verifyCjkAlignment } from './terminal/FontMetrics';
+import {
+  TextMeasureContext,
+  TextMeasureResult,
+  measureTerminalCells,
+  verifyCjkAlignment
+} from './terminal/FontMetrics';
 import { TerminalLayoutMetrics, computeTerminalLayout } from './terminal/TerminalLayout';
 import {
   hexColorToArgb,
@@ -128,6 +133,32 @@ const MENU_HEIGHT_VP = 36;
 const MENU_WIDTH_VP = 152;
 /** 气泡菜单与选区起点行的垂直间距（vp） */
 const MENU_GAP_VP = 4;
+
+/**
+ * CanvasRenderingContext2D → TextMeasureContext 的名义类型适配（U4 修复）：
+ * ArkTS 禁类实例→接口的结构化赋值（arkts-no-structural-typing；本组件未被任何页面
+ * 引用时该校验不触发，U4 整合 TerminalPage 后才暴露为编译错误），包一层显式
+ * implements 的适配类规避；仅做透传，度量行为不变。
+ */
+class CanvasTextMeasureContext implements TextMeasureContext {
+  private readonly context: CanvasRenderingContext2D;
+
+  constructor(context: CanvasRenderingContext2D) {
+    this.context = context;
+  }
+
+  get font(): string {
+    return this.context.font;
+  }
+
+  set font(value: string) {
+    this.context.font = value;
+  }
+
+  measureText(text: string): TextMeasureResult {
+    return { width: this.context.measureText(text).width };
+  }
+}
 
 @Component
 export struct TerminalCanvas {
@@ -874,7 +905,8 @@ export struct TerminalCanvas {
       return;
     }
     this.measuredFontKey = key;
-    const m = measureTerminalCells(this.context, a.fontFamily, a.fontSize, a.fontWeight);
+    const m = measureTerminalCells(new CanvasTextMeasureContext(this.context), a.fontFamily,
+      a.fontSize, a.fontWeight);
     this.fontNormal = m.fontNormal;
     this.fontBold = m.fontBold;
     this.fontItalic = m.fontItalic;
@@ -903,7 +935,8 @@ export struct TerminalCanvas {
   private checkCjkAlignment(): void {
     try {
       const a = this.appearance;
-      const r = verifyCjkAlignment(this.context, a.fontFamily, a.fontSize, a.fontWeight);
+      const r = verifyCjkAlignment(new CanvasTextMeasureContext(this.context), a.fontFamily,
+        a.fontSize, a.fontWeight);
       this.cjkAligned = r.aligned;
       if (!r.aligned) {
         Logger.warn(`终端字族 1:2 对齐校验未通过：'中'=${r.cjkWidthVp.toFixed(2)}vp，` +

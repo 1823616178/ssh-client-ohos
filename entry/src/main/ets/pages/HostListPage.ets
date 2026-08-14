@@ -4,8 +4,9 @@
  * 结构（自上而下，单栏；宽度一律百分比不写真机宽度，md/lg 多栏归 U5）：
  *   - 顶栏：标题「主机」+「+」新增入口（U2 接线：router 跳 HostEditPage 新建）；
  *   - 搜索框：实时过滤（名称/主机/用户名，大小写不敏感，逻辑在 HostListViewModel）；
- *   - 快速连接卡：host[:port] + 用户名 → 构造临时 HostProfile 调 SessionManager.connect，
- *     不落库（U1 只反馈状态，终端页跳转是 U4 接线点）；
+ *   - 快速连接卡：host[:port] + 用户名 → 构造临时 HostProfile 调 SessionManager.connect
+ *     受理后持 sessionId 跳 TerminalPage（不落库；临时主机不在库中，终端页无法按
+ *     hostId 取回，故先受理再跳转，U4 接线）；
  *   - 分组列表：List + LazyForEach + IDataSource 懒加载（对应验收「100 台主机滚动 ≥55fps」
  *     的代码侧要求），按 order 升序分组区 + 未分组区，组头点击折叠（持久化到 C3
  *     hostGroupCollapsed 键，重启复原）；
@@ -92,7 +93,7 @@ export struct HostListPage {
   private quickAddress: string = '';
   private quickUser: string = '';
 
-  /** 会话状态变化 → 重派生状态点并重建行（U1 只反馈状态，终端页跳转归 U4） */
+  /** 会话状态变化 → 重派生状态点并重建行（点击跳转 TerminalPage 见 openTerminal，U4 接线） */
   private readonly sessionListener: SessionEventListener =
     (session: SessionInfo, event: SshEvent): void => {
       if (event.type === 'stateChange') {
@@ -145,23 +146,35 @@ export struct HostListPage {
     router.pushUrl({ url: 'pages/HostEditPage' });
   }
 
-  /** 点按主机行 / 快速连接共用入口：受理后状态经状态点与 Toast 反馈（U4 接线点：连接后跳 TerminalPage） */
-  private connectHost(host: HostProfile): void {
-    const displayName: string = host.name.length > 0 ? host.name : host.host;
-    SessionManager.get().connect(host).then((info: SessionInfo) => {
-      Logger.info(`已发起连接：${info.sessionId}（主机=${displayName}）`, LOG_TAG);
-      this.toast(`正在连接 ${displayName}…`);
-      // 受理即出现新会话（connecting 状态无 stateChange 事件），立即刷新一次状态点
-      this.refreshConnStatus();
-      this.reloadRows();
-    }).catch((err: Object) => {
-      const message: string = err instanceof Error ? err.message : '连接发起失败';
-      Logger.error(`连接发起失败（${displayName}）: ${JSON.stringify(err)}`, LOG_TAG);
-      this.toast(message);
-    });
+  /**
+   * 点按主机行：跳 TerminalPage（U4 接线，连接编排移交给终端页）。
+   * 该主机已有 established 会话时传 sessionId 复用，否则只传 hostId 由终端页发起
+   * 新连接（终端页路由参数二选一、同传 sessionId 优先，见 TerminalViewModel 头注）。
+   */
+  private openTerminal(host: HostProfile): void {
+    // arkts-no-untyped-obj-literals：非空 Record 字面量禁，空字面量 + 逐键赋值
+    const params: Record<string, Object> = {};
+    const established: string | null = this.establishedSessionOf(host.id);
+    if (established !== null) {
+      params['sessionId'] = established;
+    } else {
+      params['hostId'] = host.id;
+    }
+    router.pushUrl({ url: 'pages/TerminalPage', params: params });
   }
 
-  /** 快速连接：host[:port] + 用户名 → 临时 HostProfile（不落库） */
+  /** 该主机当前 established 会话的 sessionId（复用入口；无则 null，由终端页新连） */
+  private establishedSessionOf(hostId: string): string | null {
+    const sessions: SessionInfo[] = SessionManager.get().listSessions();
+    for (let i = 0; i < sessions.length; i++) {
+      if (sessions[i].hostId === hostId && sessions[i].state === 'established') {
+        return sessions[i].sessionId;
+      }
+    }
+    return null;
+  }
+
+  /** 快速连接：host[:port] + 用户名 → 临时 HostProfile（不落库）→ 先受理连接再持 sessionId 跳 TerminalPage */
   private quickConnect(): void {
     const target: QuickConnectTarget | null = parseQuickConnectAddress(this.quickAddress);
     const username: string = this.quickUser.trim();
@@ -174,9 +187,21 @@ export struct HostListPage {
     host.host = target.host;
     host.port = target.port;
     host.username = username;
+    const displayName: string = host.name;
+    // 临时主机不落库，TerminalPage 无法按 hostId 取回，故先受理连接、持 sessionId
+    // 跳转（终端页复用该会话）。
     // 已知限制：C4 受理前置要求凭据库已有密码（authType=password），快速连接无凭据
     // 时会以「凭据缺失」失败并 Toast；交互式密码输入归 U2/U4。
-    this.connectHost(host);
+    SessionManager.get().connect(host).then((info: SessionInfo) => {
+      Logger.info(`快速连接已受理：${info.sessionId}（${displayName}）`, LOG_TAG);
+      const params: Record<string, Object> = {};
+      params['sessionId'] = info.sessionId;
+      router.pushUrl({ url: 'pages/TerminalPage', params: params });
+    }).catch((err: Object) => {
+      const message: string = err instanceof Error ? err.message : '连接发起失败';
+      Logger.error(`快速连接发起失败（${displayName}）: ${JSON.stringify(err)}`, LOG_TAG);
+      this.toast(message);
+    });
   }
 
   /** 滑动菜单「编辑」：跳 HostEditPage 并传 hostId（U2 接线） */
@@ -447,7 +472,7 @@ export struct HostListPage {
       .margin({ bottom: Tokens.space.xs })
       .onClick(() => {
         if (row.host !== null) {
-          this.connectHost(row.host);
+          this.openTerminal(row.host);
         }
       })
     }

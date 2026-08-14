@@ -35,6 +35,8 @@
  *   SessionManager.get().bindPane(info.sessionId, paneId);  // 窗格绑定（一窗格一会话）
  *   SessionManager.get().unbindPane(paneId, true);          // 关窗格并释放会话
  *   SessionManager.get().closeAll();                        // 应用退出（幂等）
+ *   // U4 附加口（additive）：nativeSessionOf(sessionId) 装配 SshTerminal；
+ *   // reconnectNow(sessionId) 手动立即重连；cancelAutoReconnect(sessionId) 取消倒计时
  */
 
 import { util } from '@kit.ArkTS';
@@ -316,6 +318,60 @@ export class SessionManager {
       return null;
     }
     return record.nativeSession.nativeHandle;
+  }
+
+  /**
+   * 当前 native 会话实例（只读窄口，U4 装配 SshTerminal 用；退避期/已关闭返回 null）。
+   * 单测注入的 fake 不是 SshNativeSession（attach 仅生产路径可达），此时返回 null。
+   */
+  nativeSessionOf(sessionId: string): SshNativeSession | null {
+    const record: SessionRecord | undefined = this.sessions.get(sessionId);
+    if (record === undefined || record.nativeSession === null) {
+      return null;
+    }
+    return record.nativeSession instanceof SshNativeSession ? record.nativeSession : null;
+  }
+
+  // ---------------------------------------------------------------- 手动重连控制（U4，additive）
+
+  /**
+   * 手动立即重连（U4 错误蒙层「立即重连」，§7.1）：取消在途退避定时器、关闭残留
+   * 旧句柄（error 终态保留的那只），随后按原主机配置立即重新拨号（sessionId 不变、
+   * native 句柄换新，与自动重连同通路）。仅 disconnected / error 态受理，其余返回 false。
+   */
+  reconnectNow(sessionId: string): boolean {
+    const record: SessionRecord | undefined = this.sessions.get(sessionId);
+    if (record === undefined) {
+      return false;
+    }
+    const state: SshSessionStateName = record.info.state;
+    if (state !== 'disconnected' && state !== 'error') {
+      return false;
+    }
+    this.cancelReconnect(record);
+    if (record.nativeSession !== null) {
+      record.nativeSession.close();
+      record.nativeSession = null;
+    }
+    record.info.reconnectCountdownSec = 0;
+    Logger.info(`会话 ${sessionId} 手动重连受理`, LOG_TAG);
+    this.startReconnect(record);
+    return true;
+  }
+
+  /**
+   * 取消自动重连倒计时（U4 重连蒙层「取消」）：撤掉在途定时器并清零倒计时，
+   * 会话保持 disconnected 待用户抉择（立即重连 / 关闭）；无在途定时器返回 false。
+   */
+  cancelAutoReconnect(sessionId: string): boolean {
+    const record: SessionRecord | undefined = this.sessions.get(sessionId);
+    if (record === undefined || record.reconnectTimerId === -1) {
+      return false;
+    }
+    this.cancelReconnect(record);
+    record.info.reconnectCountdownSec = 0;
+    Logger.info(`会话 ${sessionId} 自动重连已由用户取消`, LOG_TAG);
+    return true;
   }
 
   // ---------------------------------------------------------------- 会话 ↔ 窗格绑定（§4.3.1）
