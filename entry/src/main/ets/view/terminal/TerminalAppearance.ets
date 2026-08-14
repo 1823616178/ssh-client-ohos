@@ -3,7 +3,8 @@
  *
  * TerminalCanvas 的输入对象；字段是 AppearanceProfile（C3，models.ets）中
  * 渲染相关项的子集 + fontWeight/boldAsBright。A 系列任务（外观系统）落地时
- * 由 terminalAppearanceFromProfile 接入完整 profile，选区色等 T8 再扩展。
+ * 由 terminalAppearanceFromProfile 接入完整 profile（T8 已补 selectionColor
+ * 选区背景色）。
  */
 import { AppearanceProfile, CursorStyle, createDefaultAppearanceProfile } from '../../common/model/models';
 
@@ -30,6 +31,8 @@ export interface TerminalAppearance {
   foreground: string;
   background: string;
   cursorColor: string;
+  /** 选区背景色（T8 选择模式叠加层；#RRGGBB） */
+  selectionColor: string;
 }
 
 /** AppearanceProfile → 渲染所需子集 */
@@ -49,7 +52,8 @@ export function terminalAppearanceFromProfile(profile: AppearanceProfile): Termi
     palette: profile.palette.slice(),
     foreground: profile.foreground,
     background: profile.background,
-    cursorColor: profile.cursorColor
+    cursorColor: profile.cursorColor,
+    selectionColor: profile.selectionColor
   };
 }
 

@@ -11,6 +11,14 @@
     {
       "name": "EntryAbility_label",
       "value": "SSH 客户端"
+    },
+    {
+      "name": "reason_vibrate",
+      "value": "用于按键与复制成功的触感反馈"
+    },
+    {
+      "name": "reason_read_pasteboard",
+      "value": "用于读取剪贴板内容以粘贴到终端"
     }
   ]
 }

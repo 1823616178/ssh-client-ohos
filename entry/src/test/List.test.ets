@@ -10,6 +10,9 @@ import fontServiceTest from './FontService.test';
 import keyMapTest, { focusManagerTest } from './KeyMap.test';
 import stickyModifiersTest from './StickyModifiers.test';
 import imeInputTest from './ImeInput.test';
+import selectionModelTest from './SelectionModel.test';
+import keyBarTest from './KeyBar.test';
+import terminalGesturesTest from './TerminalGestures.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -25,4 +28,7 @@ export default function testsuite() {
   focusManagerTest();
   stickyModifiersTest();
   imeInputTest();
+  selectionModelTest();
+  keyBarTest();
+  terminalGesturesTest();
 }

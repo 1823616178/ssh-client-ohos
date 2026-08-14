@@ -15,6 +15,28 @@
       {
         // SSH（原始 TCP）与同步 API（HTTP）都依赖此权限（DESIGN §7.6）
         "name": "ohos.permission.INTERNET"
+      },
+      {
+        // 触感反馈（DESIGN §4.4：粘滞键切换/复制成功等轻震，T7/T8）
+        "name": "ohos.permission.VIBRATE",
+        "reason": "$string:reason_vibrate",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        // 读取系统剪贴板（DESIGN §4.4「粘贴」，T8：粘贴前读取并做多行确认）
+        "name": "ohos.permission.READ_PASTEBOARD",
+        "reason": "$string:reason_read_pasteboard",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
       }
     ],
     "abilities": [
