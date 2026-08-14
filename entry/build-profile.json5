@@ -5,6 +5,13 @@
       "copyCodeResource": {
         "enable": false
       }
+    },
+    // N3：原生层接入，CMake 工程位于 src/main/cpp（DESIGN §3.5）
+    "externalNativeOptions": {
+      "path": "./src/main/cpp/CMakeLists.txt",
+      "arguments": "-DOHOS_STL=c++_shared",
+      "cppFlags": "-std=c++17 -fvisibility=hidden -ffunction-sections -fdata-sections",
+      "abiFilters": ["arm64-v8a", "x86_64"]
     }
   },
   "buildOptionSet": [

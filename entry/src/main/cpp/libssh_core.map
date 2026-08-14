@@ -1,0 +1,6 @@
+{
+  global:
+    RegisterSshCoreModule;
+  local:
+    *;
+};

@@ -1,0 +1,6 @@
+{
+  "name": "libssh_core",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "libssh_core.so（NAPI 桥接层）的 ArkTS 类型声明"
+}
