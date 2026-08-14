@@ -13,6 +13,8 @@ import imeInputTest from './ImeInput.test';
 import selectionModelTest from './SelectionModel.test';
 import keyBarTest from './KeyBar.test';
 import terminalGesturesTest from './TerminalGestures.test';
+import databaseSchemaTest from './DatabaseSchema.test';
+import daoTest from './Dao.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -31,4 +33,6 @@ export default function testsuite() {
   selectionModelTest();
   keyBarTest();
   terminalGesturesTest();
+  databaseSchemaTest();
+  daoTest();
 }
