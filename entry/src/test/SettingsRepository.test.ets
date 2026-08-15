@@ -25,7 +25,8 @@ const EXPECTED_DEFS: ExpectedDef[] = [
   { key: 'keyBarLayout', type: 'string', defaultValue: '' },
   { key: 'lastSessionId', type: 'string', defaultValue: '' },
   { key: 'syncPollIntervalMinutes', type: 'number', defaultValue: 15 },
-  { key: 'hostGroupCollapsed', type: 'string', defaultValue: '{}' }
+  { key: 'hostGroupCollapsed', type: 'string', defaultValue: '{}' },
+  { key: 'keyboardShortcuts', type: 'string', defaultValue: '' }
 ];
 
 function findDef(key: string): SettingDef | null {

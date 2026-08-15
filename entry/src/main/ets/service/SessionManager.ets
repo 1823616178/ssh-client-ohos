@@ -311,6 +311,15 @@ export class SessionManager {
     return record === undefined ? null : record.info;
   }
 
+  /**
+   * 会话的主机配置快照（U4b 分屏/新标签复用；含快速连接临时主机，DAO 里可能没有）。
+   * 返回内部引用，调用方不得改字段。
+   */
+  hostOf(sessionId: string): HostProfile | null {
+    const record: SessionRecord | undefined = this.sessions.get(sessionId);
+    return record === undefined ? null : record.host;
+  }
+
   /** 当前 native 句柄（退避期/已关闭返回 null）；供 U4 装配终端，业务层勿直接使用 */
   getNativeHandle(sessionId: string): number | null {
     const record: SessionRecord | undefined = this.sessions.get(sessionId);

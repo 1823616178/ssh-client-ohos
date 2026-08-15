@@ -1,34 +1,19 @@
 /**
- * TerminalPage —— 终端主界面（任务 U4，DESIGN §4.3.1 / §4.4 / §7.1 / §7.2）。
+ * TerminalPage —— 终端主界面（任务 U4 / U4b，DESIGN §4.3.1 / §4.4 / §7.1 / §7.2）。
  *
- * 验收标准「从主机列表点击到出现 shell 提示符全程无白屏、无跳变」的代码侧落地：
- *   - 页面背景 = 终端底色（appearance.background），进入第一帧即铺底，无白屏；
- *   - 终端画布常驻布局，连接中/失败/重连/已结束全部以蒙层叠加在画布之上，
- *     不做整页跳转式状态切换（蒙层形态由 TerminalViewModel.deriveOverlay 派生）；
- *   - 断线期画面保留（旧 SshTerminal 帧在 native 关闭后仍可安全读，T3 生命周期
- *     保护）+ 半透明置灰层（§7.2）；重连 established 后 VM 换绑画布 @Prop 全量重绘。
+ * 验收（U4）：「从主机列表点击到出现 shell 提示符全程无白屏、无跳变」——
+ *   页面背景 = 终端底色；画布常驻，连接中/失败/重连/已结束以蒙层叠加。
  *
- * 版面（§4.4）：
- *   - 沉浸式顶栏（作为布局一部分 + 页面背景 = 终端底色的简单沉浸方案）：返回
- *     （关闭会话并回列表）、终端标题/主机名、状态点与状态文案、抽屉开关「☰」；
- *   - 中部 TerminalCanvas（T4，尺寸协商/resize 由组件内部 autoResize 完成）；
- *   - 底部 KeyBar（T7）：与画布共享同一 StickyModifiers 实例；字节出口经
- *     vm.sendInput 直写当前终端（单窗格 focusId 为空时 TerminalCanvas.sendExternalInput
- *     的焦点路由本就直通，且 ArkUI 无子组件实例引用机制，页面拿不到 canvas 实例——
- *     多窗格焦点路由接线归 U4b）；
- *   - 侧滑抽屉（SideBarContainer Overlay，顶栏「☰」开合）：会话切换列表
- *     （主机名 + 状态点 +「当前」标记，点击换绑本页会话）+ SFTP/端口转发/命令片段
- *     三项占位（U8/U9/U10，置灰不可点）。
+ * 验收（U4b）：多标签 + 分屏二叉树 + 拖分隔条 + 焦点路由 + 断点降级树保活。
+ *   - 标签栏（md/lg）：激活 / 关闭 / 新建；sm 隐藏（会话改走抽屉，树仍保活）；
+ *   - 窗格区：按 VM.visiblePanes 绝对矩形铺 TerminalCanvas（focusId = paneId，
+ *     输入经 FocusManager 只进聚焦叶；autoResize 各自 request_pty_size）；
+ *   - 分隔条：PanGesture 把位移 / span 折算成 ratio，VM.setDividerRatio；
+ *   - sm：只渲染聚焦叶铺满，分隔条不画；lg→sm→lg 往返树与会话完好。
  *
- * 路由参数（二选一，同传 sessionId 优先，解析见 TerminalViewModel.parseTerminalRouteParams）：
- *   - hostId：按主机配置发起新连接（HostListPage 主机行的默认形态）；
- *   - sessionId：复用既有会话（该主机已有 established 会话、或快速连接先受理后跳转）。
- *
- * 外观：主机 appearanceId 绑定外观归 A 系列（M4），本页先用默认外观（Harmony Dark），
- * 捏合缩放的字号落库（onFontSizeCommit）同样归 A 系列。
- *
- * 退出语义：返回 = 关闭会话（VM dispose → unbindPane(paneId, true)）+ router.back；
- * aboutToDisappear 幂等兜底。单窗格「返回列表即断连」，会话保留/后台保活归 §7.5。
+ * 版面：沉浸式顶栏 +（md/lg 标签栏）+ 窗格区 + KeyBar；侧滑抽屉会话切换。
+ * 退出：返回 = VM.dispose（所有叶 unbindPane true）+ router.back；
+ * 关末叶 / 末标签 → vm.shouldExit → 同样退出。
  */
 
 import { router } from '@kit.ArkUI';
@@ -40,13 +25,20 @@ import { Tokens } from '../theme/Tokens';
 import { KeyBar } from '../view/KeyBar';
 import { TerminalCanvas } from '../view/TerminalCanvas';
 import { FrameScheduler } from '../view/FrameScheduler';
+import { FocusManager } from '../view/terminal/FocusManager';
 import { StickyModifiers } from '../view/terminal/StickyModifiers';
 import {
   TerminalAppearance,
   createDefaultTerminalAppearance
 } from '../view/terminal/TerminalAppearance';
 import { sessionStateToStatus } from '../viewmodel/HostListViewModel';
+import { DividerRect } from '../viewmodel/PaneTree';
+import { ShortcutAction } from '../view/terminal/ShortcutMap';
 import {
+  OverlayModel,
+  PaneRenderItem,
+  TabRenderItem,
+  TerminalFocusHostLike,
   TerminalRouteParams,
   TerminalSessionLike,
   TerminalViewModel,
@@ -61,48 +53,72 @@ const SIDEBAR_WIDTH_VP: number = 280;
 const LOADING_SIZE_VP: number = 48;
 /** 断线置灰层不透明度（画面保留但明显变暗，§7.2） */
 const DIM_OVERLAY_OPACITY: number = 0.55;
+/** 标签标题最大宽度（vp）：Token 表无「标签宽度」项 */
+const TAB_TITLE_MAX_WIDTH_VP: number = 160;
+
+/** 生产焦点宿主：转发给全局 FocusManager（画布点击 / 键条路由共用） */
+class PageFocusHost implements TerminalFocusHostLike {
+  register(id: string): boolean {
+    return FocusManager.get().register(id);
+  }
+
+  unregister(id: string): boolean {
+    return FocusManager.get().unregister(id);
+  }
+
+  focus(id: string): boolean {
+    return FocusManager.get().focus(id);
+  }
+
+  addListener(cb: (id: string) => void): () => void {
+    return FocusManager.get().addListener(cb);
+  }
+}
 
 @Entry
 @Component
 struct TerminalPage {
   /** 侧滑抽屉展开态（SideBarContainer onChange 双向同步） */
   @State private showSideBar: boolean = false;
+  /** 拖分隔条起点 ratio（onActionUpdate 相对此值累加，避免读到已更新的 item.ratio） */
+  private dragStartRatio: number = 0.5;
+  private dragSplitId: string = '';
   /** 触感总开关（C3 hapticEnabled；aboutToAppear 读取，读取失败保持默认 true） */
   private hapticEnabled: boolean = true;
   /** 功能键条布局 JSON（C3 keyBarLayout；空串/非法 = 内置默认布局） */
   private keyBarLayoutJson: string = '';
-  /** 终端外观：主机 appearanceId 绑定归 A 系列（M4），U4 先用默认外观（Harmony Dark） */
+  /** 快捷键表 JSON（C3 keyboardShortcuts；空串 = 内置默认） */
+  private shortcutBindingsJson: string = '';
+  /** 终端外观：主机 appearanceId 绑定归 A 系列（M4），先用默认外观（Harmony Dark） */
   private readonly appearance: TerminalAppearance = createDefaultTerminalAppearance();
-  /** 与 TerminalCanvas 共享的粘滞修饰状态机（T7：点 Ctrl/Alt 后软键盘输入也带修饰） */
+  /** 与所有 TerminalCanvas + KeyBar 共享的粘滞修饰（聚焦谁都吃同一份 Ctrl/Alt） */
   private readonly stickyModifiers: StickyModifiers = new StickyModifiers();
-  /** 视图模型：进入编排 / 终端装配与换绑 / 蒙层派生 / 事件分发（生产依赖缺省惰性解析） */
+  /** 视图模型：多标签/分屏编排 / 终端装配 / 蒙层派生 / 事件分发 */
   private readonly vm: TerminalViewModel = new TerminalViewModel({
     vibrate: (): void => {
       vibrateLight(this.hapticEnabled);
     },
     onContentDirty: (): void => {
-      // 语义等价 TerminalCanvas.notifyContentDirty()（其内部即 wakeup，
-      // TerminalCanvas.ets:253）；页面拿不到 canvas 实例，直接唤醒全局帧调度器
       FrameScheduler.get().wakeup();
-    }
+    },
+    focusHost: new PageFocusHost()
   });
 
   aboutToAppear(): void {
     try {
       this.hapticEnabled = SettingsRepository.isHapticEnabled();
       this.keyBarLayoutJson = SettingsRepository.getKeyBarLayout();
+      this.shortcutBindingsJson = SettingsRepository.getKeyboardShortcuts();
     } catch (err) {
       Logger.warn(`设置读取失败，使用默认值：${JSON.stringify(err)}`, LOG_TAG);
     }
     const params: TerminalRouteParams = parseTerminalRouteParams(this.readRouteParams());
     this.vm.start(params).catch((err: Object) => {
-      // start 内部已兜底为 startError 蒙层，此处仅为双保险
       Logger.error(`终端页启动异常: ${JSON.stringify(err)}`, LOG_TAG);
     });
   }
 
   aboutToDisappear(): void {
-    // 返回列表即断连（单窗格语义）；onBack 已 dispose 时为幂等二次调用
     this.vm.dispose();
   }
 
@@ -117,15 +133,30 @@ struct TerminalPage {
     }
   }
 
-  /** 画布绑定的终端：VM 的生产终端工厂产出的即 SshTerminal（fake 只存在于单测） */
-  private canvasTerminal(): SshTerminal | null {
-    return this.vm.terminal as SshTerminal | null;
+  private canvasTerminalOf(item: PaneRenderItem): SshTerminal | null {
+    return item.terminal as SshTerminal | null;
   }
 
-  /** 返回（关闭会话 + 回列表）：unbindPane(paneId, true) 在 VM dispose 内完成 */
+  /** 返回（关闭全部窗格会话 + 回列表） */
   private onBack(): void {
     this.vm.dispose();
     router.back();
+  }
+
+  private exitIfEmpty(): void {
+    if (this.vm.shouldExit) {
+      this.onBack();
+    }
+  }
+
+  private onPaneClose(paneId: string): void {
+    this.vm.closePane(paneId);
+    this.exitIfEmpty();
+  }
+
+  private onTabClose(tabId: string): void {
+    this.vm.closeTab(tabId);
+    this.exitIfEmpty();
   }
 
   // ---------------------------------------------------------------- 顶栏派生
@@ -167,6 +198,10 @@ struct TerminalPage {
     }
   }
 
+  private showTabBar(): boolean {
+    return this.vm.breakpoint !== 'sm' && this.vm.tabs.length > 0;
+  }
+
   // ---------------------------------------------------------------- 视图
 
   build() {
@@ -176,30 +211,30 @@ struct TerminalPage {
       Column() {
         this.TopBar()
 
-        // 终端区：画布常驻，状态以蒙层叠加（无整页跳转，无白屏无跳变）
+        if (this.showTabBar()) {
+          this.TabBar()
+        }
+
         Stack() {
-          TerminalCanvas({
-            terminal: this.canvasTerminal(),
-            appearance: this.appearance,
-            stickyModifiers: this.stickyModifiers,
-            hapticEnabled: this.hapticEnabled
-          })
+          ForEach(this.vm.visiblePanes, (item: PaneRenderItem) => {
+            this.PaneSlot(item)
+          }, (item: PaneRenderItem) => item.paneId)
 
-          // 断线/结束期画面保留置灰（§7.2）：半透明灰层同时阻断终端手势
-          if (this.vm.overlay.dimmed) {
-            Column()
-              .width('100%')
-              .height('100%')
-              .backgroundColor(Tokens.Color.appBg)
-              .opacity(DIM_OVERLAY_OPACITY)
-          }
+          ForEach(this.vm.dividers, (item: DividerRect) => {
+            this.DividerHandle(item)
+          }, (item: DividerRect) => item.splitId)
 
-          if (this.vm.overlay.kind !== 'none') {
-            this.StatusOverlay()
+          if (this.vm.visiblePanes.length === 0 && this.vm.overlay.kind !== 'none') {
+            this.StatusOverlay(this.vm.overlay, '', '')
           }
         }
         .width('100%')
         .layoutWeight(1)
+        .onAreaChange((_oldArea: Area, newArea: Area) => {
+          const w: number = newArea.width as number;
+          const h: number = newArea.height as number;
+          this.vm.setPaneAreaSize(w, h);
+        })
 
         KeyBar({
           layoutJson: this.keyBarLayoutJson,
@@ -213,6 +248,9 @@ struct TerminalPage {
       .width('100%')
       .height('100%')
       .backgroundColor(this.appearance.background)
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        this.vm.setViewportWidth(newArea.width as number);
+      })
     }
     .showSideBar(this.showSideBar)
     .sideBarWidth(SIDEBAR_WIDTH_VP)
@@ -262,7 +300,6 @@ struct TerminalPage {
       .layoutWeight(1)
       .margin({ left: Tokens.space.xs })
 
-      // 状态点：space_xs(8vp) 方块 + xs2(4vp) 圆角 = 正圆（与主机列表同风格）
       Column()
         .width(Tokens.space.xs)
         .height(Tokens.space.xs)
@@ -290,29 +327,188 @@ struct TerminalPage {
     })
   }
 
-  /** 状态蒙层（画布之上）：连接中指示 / 重连倒计时 / 错误与操作按钮 / 会话已结束 */
+  /** md/lg 标签栏：标签 + 关闭 + 新建 + 横/纵分屏 + 关聚焦窗格 */
   @Builder
-  StatusOverlay() {
+  TabBar() {
+    Row() {
+      Scroll() {
+        Row() {
+          ForEach(this.vm.tabs, (tab: TabRenderItem) => {
+            this.TabChip(tab)
+          }, (tab: TabRenderItem) => tab.tabId)
+        }
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .layoutWeight(1)
+
+      Text('+')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.text)
+        .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
+        .onClick(() => {
+          this.vm.newTab().catch((err: Object) => {
+            Logger.error(`新建标签失败: ${JSON.stringify(err)}`, LOG_TAG);
+          });
+        })
+      Text('│')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.text)
+        .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
+        .onClick(() => {
+          this.vm.splitFocused('row').catch((err: Object) => {
+            Logger.error(`左右分屏失败: ${JSON.stringify(err)}`, LOG_TAG);
+          });
+        })
+      Text('─')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.text)
+        .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
+        .onClick(() => {
+          this.vm.splitFocused('column').catch((err: Object) => {
+            Logger.error(`上下分屏失败: ${JSON.stringify(err)}`, LOG_TAG);
+          });
+        })
+      Text('×')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.textDim)
+        .padding({ left: Tokens.space.xs, right: Tokens.space.sm })
+        .onClick(() => {
+          this.vm.closeFocusedPane();
+          this.exitIfEmpty();
+        })
+    }
+    .width('100%')
+    .padding({
+      left: Tokens.space.xs,
+      right: Tokens.space.xs,
+      bottom: Tokens.space.xs2
+    })
+  }
+
+  @Builder
+  TabChip(tab: TabRenderItem) {
+    Row() {
+      Text(tab.title)
+        .fontSize(Tokens.fontSize.caption)
+        .fontColor(tab.active ? Tokens.Color.accent : Tokens.Color.text)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .constraintSize({ maxWidth: TAB_TITLE_MAX_WIDTH_VP })
+        .onClick(() => {
+          this.vm.activateTab(tab.tabId);
+        })
+      Text('×')
+        .fontSize(Tokens.fontSize.caption)
+        .fontColor(Tokens.Color.textFaint)
+        .padding({ left: Tokens.space.xs2 })
+        .onClick(() => {
+          this.onTabClose(tab.tabId);
+        })
+    }
+    .padding({
+      left: Tokens.space.sm,
+      right: Tokens.space.sm,
+      top: Tokens.space.xs2,
+      bottom: Tokens.space.xs2
+    })
+    .backgroundColor(tab.active ? Tokens.Color.surfaceHover : Tokens.Color.surface)
+    .borderRadius(Tokens.radius.xs)
+    .margin({ right: Tokens.space.xs2 })
+  }
+
+  /** 单个可见叶：画布 + 焦点边框 + 该叶蒙层 */
+  @Builder
+  PaneSlot(item: PaneRenderItem) {
+    Stack() {
+      TerminalCanvas({
+        terminal: this.canvasTerminalOf(item),
+        appearance: this.appearance,
+        stickyModifiers: this.stickyModifiers,
+        hapticEnabled: this.hapticEnabled,
+        focusId: item.paneId,
+        visible: true,
+        shortcutBindingsJson: this.shortcutBindingsJson,
+        onAppShortcut: (action: ShortcutAction): boolean => {
+          const handled: boolean = this.vm.handleShortcut(action);
+          this.exitIfEmpty();
+          return handled;
+        }
+      })
+
+      if (item.overlay.dimmed) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(Tokens.Color.appBg)
+          .opacity(DIM_OVERLAY_OPACITY)
+      }
+
+      if (item.overlay.kind !== 'none') {
+        this.StatusOverlay(item.overlay, item.sessionId, item.paneId)
+      }
+    }
+    .width(item.w)
+    .height(item.h)
+    .position({ x: item.x, y: item.y })
+    .border({
+      width: Tokens.space.xs2,
+      color: item.focused ? Tokens.Color.accent : Tokens.Color.border
+    })
+    .onClick(() => {
+      this.vm.focusPane(item.paneId);
+    })
+  }
+
+  /** 分隔条：按方向限制拖动轴，位移 / span 折算 ratio */
+  @Builder
+  DividerHandle(item: DividerRect) {
+    Column()
+      .width(item.w)
+      .height(item.h)
+      .position({ x: item.x, y: item.y })
+      .backgroundColor(Tokens.Color.border)
+      .gesture(
+        PanGesture({
+          direction: item.direction === 'row' ? PanDirection.Horizontal : PanDirection.Vertical
+        })
+          .onActionStart(() => {
+            this.dragSplitId = item.splitId;
+            this.dragStartRatio = item.ratio;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            if (item.span <= 0 || this.dragSplitId !== item.splitId) {
+              return;
+            }
+            const delta: number = item.direction === 'row' ? event.offsetX : event.offsetY;
+            this.vm.setDividerRatio(item.splitId, this.dragStartRatio + delta / item.span);
+          })
+      )
+  }
+
+  /** 状态蒙层：连接中 / 重连倒计时 / 错误与操作按钮 / 会话已结束 */
+  @Builder
+  StatusOverlay(model: OverlayModel, sessionId: string, paneId: string) {
     Column() {
-      if (this.vm.overlay.kind === 'connecting' || this.vm.overlay.kind === 'reconnecting') {
+      if (model.kind === 'connecting' || model.kind === 'reconnecting') {
         LoadingProgress()
           .width(LOADING_SIZE_VP)
           .height(LOADING_SIZE_VP)
           .color(Tokens.Color.accent)
       }
-      Text(this.vm.overlay.title)
+      Text(model.title)
         .fontSize(Tokens.fontSize.title)
         .fontColor(Tokens.Color.text)
         .margin({ top: Tokens.space.md })
-      if (this.vm.overlay.detail.length > 0) {
-        Text(this.vm.overlay.detail)
+      if (model.detail.length > 0) {
+        Text(model.detail)
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.textDim)
           .textAlign(TextAlign.Center)
           .margin({ top: Tokens.space.xs })
       }
       Row() {
-        if (this.vm.overlay.showCancelReconnect) {
+        if (model.showCancelReconnect) {
           Button('取消重连')
             .fontSize(Tokens.fontSize.body)
             .fontColor(Tokens.Color.text)
@@ -320,10 +516,14 @@ struct TerminalPage {
             .borderRadius(Tokens.radius.sm)
             .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
             .onClick(() => {
-              this.vm.cancelAutoReconnect();
+              if (sessionId.length > 0) {
+                this.vm.cancelAutoReconnectAt(sessionId);
+              } else {
+                this.vm.cancelAutoReconnect();
+              }
             })
         }
-        if (this.vm.overlay.showReconnectNow) {
+        if (model.showReconnectNow) {
           Button('立即重连')
             .fontSize(Tokens.fontSize.body)
             .fontColor(Color.White)
@@ -331,10 +531,14 @@ struct TerminalPage {
             .borderRadius(Tokens.radius.sm)
             .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
             .onClick(() => {
-              this.vm.reconnectNow();
+              if (sessionId.length > 0) {
+                this.vm.reconnectNowAt(sessionId);
+              } else {
+                this.vm.reconnectNow();
+              }
             })
         }
-        if (this.vm.overlay.showClose) {
+        if (model.showClose) {
           Button('关闭')
             .fontSize(Tokens.fontSize.body)
             .fontColor(Tokens.Color.text)
@@ -342,7 +546,11 @@ struct TerminalPage {
             .borderRadius(Tokens.radius.sm)
             .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
             .onClick(() => {
-              this.onBack();
+              if (paneId.length > 0) {
+                this.onPaneClose(paneId);
+              } else {
+                this.onBack();
+              }
             })
         }
       }
@@ -398,7 +606,7 @@ struct TerminalPage {
     .padding(Tokens.space.md)
   }
 
-  /** 抽屉会话行：状态点 + 主机名 +「当前」标记；点击换绑本页会话并收起抽屉 */
+  /** 抽屉会话行：状态点 + 主机名 +「当前」标记；点击聚焦已有叶或替换聚焦叶 */
   @Builder
   SessionRow(item: TerminalSessionLike) {
     Row() {

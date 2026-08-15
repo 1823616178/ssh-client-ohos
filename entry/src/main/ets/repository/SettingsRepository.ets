@@ -48,6 +48,7 @@ const KEY_KEY_BAR_LAYOUT: string = 'keyBarLayout';
 const KEY_LAST_SESSION_ID: string = 'lastSessionId';
 const KEY_SYNC_POLL_INTERVAL_MINUTES: string = 'syncPollIntervalMinutes';
 const KEY_HOST_GROUP_COLLAPSED: string = 'hostGroupCollapsed';
+const KEY_KEYBOARD_SHORTCUTS: string = 'keyboardShortcuts';
 
 /**
  * 键定义表：所有设置键的唯一声明处。
@@ -63,7 +64,8 @@ export const SETTING_DEFS: SettingDef[] = [
   { key: KEY_KEY_BAR_LAYOUT, type: 'string', defaultValue: '', comment: '功能键条布局（JSON 串，空串 = 内置默认布局）' },
   { key: KEY_LAST_SESSION_ID, type: 'string', defaultValue: '', comment: '上次会话 id（§5.1），空串 = 无' },
   { key: KEY_SYNC_POLL_INTERVAL_MINUTES, type: 'number', defaultValue: 15, comment: '同步轮询间隔（分钟，§6.4 默认 15）' },
-  { key: KEY_HOST_GROUP_COLLAPSED, type: 'string', defaultValue: '{}', comment: '主机分组折叠状态（JSON 串 groupId→boolean，U1；空对象 = 全部展开）' }
+  { key: KEY_HOST_GROUP_COLLAPSED, type: 'string', defaultValue: '{}', comment: '主机分组折叠状态（JSON 串 groupId→boolean，U1；空对象 = 全部展开）' },
+  { key: KEY_KEYBOARD_SHORTCUTS, type: 'string', defaultValue: '', comment: '终端快捷键表（JSON 数组，空串 = 内置默认：Ctrl+Shift+T 新标签等）' }
 ];
 
 export class SettingsRepository {
@@ -187,6 +189,15 @@ export class SettingsRepository {
 
   static setHostGroupCollapsed(collapsedJson: string): void {
     SettingsRepository.writeValue(KEY_HOST_GROUP_COLLAPSED, collapsedJson);
+  }
+
+  /** 终端快捷键表（JSON 数组）；空串表示使用内置默认表 */
+  static getKeyboardShortcuts(): string {
+    return SettingsRepository.readString(KEY_KEYBOARD_SHORTCUTS);
+  }
+
+  static setKeyboardShortcuts(shortcutsJson: string): void {
+    SettingsRepository.writeValue(KEY_KEYBOARD_SHORTCUTS, shortcutsJson);
   }
 
   // ---- 内部读写辅助 ----

@@ -15,7 +15,11 @@
  * 会话切换换绑序列（unbind→bind→attach 次序、切回复用缓存终端）/ 重连换柄后
  * terminal 换绑（旧 detach 新 attach 各一次）/ dispose 幂等（unbind closeSession=true
  * 恰好一次、终端全 detach）/ terminalTitle/bell 派生与非当前会话忽略 / dirty 通路 /
- * 手动重连与取消转发 / sendInput 字节出口。
+ * 手动重连与取消转发 / sendInput 字节出口 /
+ * U4b：首标签 terminal-main / 分屏再拨号与关叶兄弟上提 / 新标签 /
+ * 抽屉切到已寄宿会话只聚焦不换绑 / dirty 可见非聚焦叶仍唤醒 /
+ * 拖分隔条改矩形 / lg→sm→lg 树与会话保活 / 关末叶 shouldExit /
+ * dispose 解绑全部叶。
  */
 
 import { describe, it, expect } from '@ohos/hypium';
@@ -122,6 +126,7 @@ class FakeSessionHost implements TerminalSessionHostLike {
   cancelLog: string[] = [];
   connectError: Error | null = null;
   private idSeq: number = 0;
+  private readonly hostsBySession: Map<string, HostProfile> = new Map();
 
   /** 测试脚本入口：登记一个既有会话（可指定状态与 native 句柄） */
   addSession(sessionId: string, hostId: string, hostName: string, state: string,
@@ -149,7 +154,13 @@ class FakeSessionHost implements TerminalSessionHostLike {
     this.idSeq++;
     const info: FakeSessionInfo = this.addSession(`s-new-${this.idSeq}`, host.id,
       host.name.length > 0 ? host.name : host.host, 'connecting', 100 + this.idSeq);
+    this.hostsBySession.set(info.sessionId, host);
     return Promise.resolve(info);
+  }
+
+  hostOf(sessionId: string): HostProfile | null {
+    const host: HostProfile | undefined = this.hostsBySession.get(sessionId);
+    return host === undefined ? null : host;
   }
 
   close(sessionId: string): void {
@@ -678,6 +689,237 @@ export default function terminalViewModelTest() {
       env.vm.dispose();
       env.vm.sendInput(new Uint8Array([0x03]));
       expect(terminal.writeCount).assertEqual(1);
+    });
+
+    it('进入后首标签首叶是terminal-main且投影到聚焦字段', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 911);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      expect(env.vm.tabs.length).assertEqual(1);
+      expect(env.vm.tabs[0].active).assertTrue();
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.visiblePanes.length).assertEqual(1);
+      expect(env.vm.visiblePanes[0].paneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.visiblePanes[0].sessionId).assertEqual('s-1');
+      expect(env.vm.leafCount()).assertEqual(1);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+    });
+
+    it('分屏_再拨号绑新叶_关新叶兄弟上提会话释放', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1001);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      await env.vm.splitFocused('row');
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.vm.leafCount()).assertEqual(2);
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.dividers.length).assertEqual(1);
+      const newSessionId: string = env.vm.currentSessionId;
+      expect(newSessionId !== 's-1').assertTrue();
+      expect(env.host.ops.indexOf(`bind:${newSessionId}:${env.vm.focusedPaneId}`) >= 0).assertTrue();
+      env.host.emit(newSessionId, stateChange('established'));
+      expect(env.host.factory.terminals.length).assertEqual(2);
+      const newPaneId: string = env.vm.focusedPaneId;
+      env.vm.closePane(newPaneId);
+      expect(env.vm.leafCount()).assertEqual(1);
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+      expect(env.vm.dividers.length).assertEqual(0);
+      expect(env.host.ops.indexOf(`unbind:${newPaneId}:true`) >= 0).assertTrue();
+    });
+
+    it('新标签_独立会话_切回原标签恢复聚焦叶', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1101);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      await env.vm.newTab();
+      expect(env.vm.tabs.length).assertEqual(2);
+      expect(env.vm.leafCount()).assertEqual(2);
+      const tab2: string = env.vm.activeTabId;
+      const session2: string = env.vm.currentSessionId;
+      expect(session2 !== 's-1').assertTrue();
+      env.vm.activateTab(env.vm.tabs[0].tabId);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      env.vm.activateTab(tab2);
+      expect(env.vm.currentSessionId).assertEqual(session2);
+    });
+
+    it('抽屉切到已寄宿会话_只聚焦不换绑', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1201);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      await env.vm.splitFocused('row');
+      const session2: string = env.vm.currentSessionId;
+      const pane2: string = env.vm.focusedPaneId;
+      const opsBefore: number = env.host.ops.length;
+      env.vm.switchSession('s-1');
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+      expect(env.host.ops.length).assertEqual(opsBefore); // 无新 unbind/bind
+      env.vm.switchSession(session2);
+      expect(env.vm.focusedPaneId).assertEqual(pane2);
+      expect(env.host.ops.length).assertEqual(opsBefore);
+    });
+
+    it('dirty通路_可见非聚焦叶也唤醒_不可见标签不唤醒', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1301);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      await env.vm.splitFocused('row');
+      const session2: string = env.vm.currentSessionId;
+      env.dirtyCount = 0;
+      env.host.emitDirty('s-1'); // 同标签另一可见叶
+      expect(env.dirtyCount).assertEqual(1);
+      await env.vm.newTab();
+      const session3: string = env.vm.currentSessionId;
+      env.dirtyCount = 0;
+      env.host.emitDirty('s-1'); // 已切走的标签，不可见
+      expect(env.dirtyCount).assertEqual(0);
+      env.host.emitDirty(session3);
+      expect(env.dirtyCount).assertEqual(1);
+      env.host.emitDirty(session2);
+      expect(env.dirtyCount).assertEqual(1);
+    });
+
+    it('拖分隔条_改ratio后两侧宽度跟随_钳制生效', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1401);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(200, 80);
+      await env.vm.splitFocused('row');
+      const splitId: string = env.vm.dividers[0].splitId;
+      env.vm.setDividerRatio(splitId, 0.25);
+      expect(env.vm.dividers[0].ratio).assertEqual(0.25);
+      // 可用 192，A = floor(48)=48
+      expect(env.vm.visiblePanes[0].w).assertEqual(48);
+      env.vm.setDividerRatio(splitId, 0);
+      expect(env.vm.dividers[0].ratio).assertEqual(0.1);
+    });
+
+    it('断点降级_lg到sm只见聚焦叶_切回lg树与会话完好', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1501);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      await env.vm.splitFocused('row');
+      const pane2: string = env.vm.focusedPaneId;
+      const session2: string = env.vm.currentSessionId;
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.dividers.length).assertEqual(1);
+      env.vm.setViewportWidth(400); // sm
+      expect(env.vm.breakpoint).assertEqual('sm');
+      expect(env.vm.visiblePanes.length).assertEqual(1);
+      expect(env.vm.visiblePanes[0].paneId).assertEqual(pane2);
+      expect(env.vm.dividers.length).assertEqual(0);
+      expect(env.vm.leafCount()).assertEqual(2);
+      env.vm.setViewportWidth(900);
+      expect(env.vm.breakpoint).assertEqual('lg');
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.dividers.length).assertEqual(1);
+      expect(env.vm.leafCount()).assertEqual(2);
+      expect(env.host.getSession('s-1') !== null).assertTrue();
+      expect(env.host.getSession(session2) !== null).assertTrue();
+    });
+
+    it('关末叶_shouldExit_dispose解绑全部叶各一次', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1601);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      await env.vm.splitFocused('row');
+      const pane2: string = env.vm.focusedPaneId;
+      env.vm.closePane(pane2);
+      expect(env.vm.shouldExit).assertFalse();
+      env.vm.closeFocusedPane();
+      expect(env.vm.shouldExit).assertTrue();
+      expect(env.vm.leafCount()).assertEqual(0);
+
+      const env2: TestEnv = new TestEnv();
+      env2.dao.put(sampleHost('h1'));
+      env2.host.addSession('s-1', 'h1', '主机h1', 'established', 1602);
+      await env2.vm.start({ hostId: '', sessionId: 's-1' });
+      env2.vm.setViewportWidth(900);
+      await env2.vm.splitFocused('row');
+      const paneB: string = env2.vm.focusedPaneId;
+      env2.vm.dispose();
+      const unbindTrue: string[] = env2.host.ops.filter((op: string) =>
+        op.indexOf('unbind:') === 0 && op.indexOf(':true') > 0);
+      expect(unbindTrue.length).assertEqual(2);
+      expect(unbindTrue.indexOf(`unbind:${TERMINAL_MAIN_PANE_ID}:true`) >= 0).assertTrue();
+      expect(unbindTrue.indexOf(`unbind:${paneB}:true`) >= 0).assertTrue();
+    });
+
+    it('快捷键_切标签循环_关窗格_方向切焦点', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1801);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      await env.vm.newTab();
+      const tab2: string = env.vm.activeTabId;
+      expect(env.vm.handleShortcut('prevTab')).assertTrue();
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.handleShortcut('nextTab')).assertTrue();
+      expect(env.vm.activeTabId).assertEqual(tab2);
+      env.vm.activateTab(env.vm.tabs[0].tabId);
+      await env.vm.splitFocused('row');
+      const rightPane: string = env.vm.focusedPaneId;
+      expect(env.vm.handleShortcut('focusLeft')).assertTrue();
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.handleShortcut('focusRight')).assertTrue();
+      expect(env.vm.focusedPaneId).assertEqual(rightPane);
+      expect(env.vm.handleShortcut('closePane')).assertTrue();
+      expect(env.vm.leafCount()).assertEqual(1);
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.handleShortcut('copy')).assertFalse();
+      expect(env.vm.handleShortcut('paste')).assertFalse();
+    });
+
+    it('四窗格_各自会话互不串扰_标题只更新聚焦叶', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1701);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(1000);
+      env.vm.setPaneAreaSize(1000, 600);
+      await env.vm.splitFocused('row');
+      env.vm.focusPane(TERMINAL_MAIN_PANE_ID);
+      await env.vm.splitFocused('column');
+      env.vm.focusPane(env.vm.visiblePanes[env.vm.visiblePanes.length - 1].paneId);
+      await env.vm.splitFocused('row');
+      expect(env.vm.leafCount()).assertEqual(4);
+      expect(env.vm.visiblePanes.length).assertEqual(4);
+      const ids: string[] = [];
+      for (const pane of env.vm.visiblePanes) {
+        if (pane.sessionId.length > 0 && ids.indexOf(pane.sessionId) < 0) {
+          ids.push(pane.sessionId);
+        }
+      }
+      expect(ids.length).assertEqual(4);
+      env.vm.focusPane(TERMINAL_MAIN_PANE_ID);
+      env.host.emit('s-1', { type: 'terminalTitle', title: 'vim' });
+      expect(env.vm.terminalTitle).assertEqual('vim');
+      // 非聚焦叶标题不改顶栏
+      const other: string = ids[1] === 's-1' ? ids[2] : ids[1];
+      env.host.emit(other, { type: 'terminalTitle', title: 'htop' });
+      expect(env.vm.terminalTitle).assertEqual('vim');
     });
   });
 }

@@ -42,7 +42,7 @@
  *    组件在每次按键/IME 提交出口消费；
  *  - T10 扩展点：2in1 物理键盘完整支持（不弹软键盘策略、keyText 非 US 布局、
  *    可自定义快捷键表、Meta 细分、小键盘映射）——handleKeyInput 是唯一出口，
- *    T10 在这里扩，不要另开旁路。
+ *    应用快捷键表（§4.3.2）也走这里：先 matchShortcut，命中则消费、不送给远端。
  *
  * 移动端交互（T7/T8/T9，DESIGN §4.4「移动端专属交互」表）：
  *  - T7：sendExternalInput() 是功能键条/片段等外部字节源的统一出口
@@ -106,7 +106,13 @@ import {
   adjustWideCharBoundary,
   dataViewGridReader
 } from './terminal/SelectionModel';
-import { copyTextToPasteboard } from './terminal/Pasteboard';
+import { copyTextToPasteboard, pasteFromPasteboard } from './terminal/Pasteboard';
+import {
+  ShortcutAction,
+  ShortcutBinding,
+  matchShortcut,
+  parseShortcutLayout
+} from './terminal/ShortcutMap';
 import {
   AltScrollMode,
   ScrollLineAccumulator,
@@ -209,6 +215,15 @@ export struct TerminalCanvas {
    * 通知外部落库（写库是设置仓库/A3 的职责，组件不直接持久化）
    */
   onFontSizeCommit: (fontSize: number) => void = () => {};
+  /**
+   * 快捷键表 JSON（C3 keyboardShortcuts；空串 = 内置默认）。
+   * 命中后复制/粘贴在本组件处理，其余经 onAppShortcut 交给页面/VM。
+   */
+  @Prop @Watch('onShortcutJsonChanged') shortcutBindingsJson: string = '';
+  /** 标签/分屏/切焦点等应用动作（复制粘贴不走这里） */
+  onAppShortcut: (action: ShortcutAction) => boolean = (_action: ShortcutAction) => false;
+
+  private shortcutBindings: ShortcutBinding[] = parseShortcutLayout('');
 
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private context: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
@@ -269,9 +284,14 @@ export struct TerminalCanvas {
   private pinchBaseFontSize = 14;
 
   aboutToAppear(): void {
+    this.shortcutBindings = parseShortcutLayout(this.shortcutBindingsJson);
     this.applyAppearance();
     FrameScheduler.get().register(this.schedulerId, this.renderFrame);
     FrameScheduler.get().setVisible(this.schedulerId, this.visible);
+  }
+
+  private onShortcutJsonChanged(): void {
+    this.shortcutBindings = parseShortcutLayout(this.shortcutBindingsJson);
   }
 
   aboutToDisappear(): void {
@@ -390,14 +410,21 @@ export struct TerminalCanvas {
     }
     const ctrl = this.queryModifierState(event, 'ctrl');
     const alt = this.queryModifierState(event, 'alt');
+    const shift = this.queryModifierState(event, 'shift');
+    const meta = this.queryModifierState(event, 'meta');
     if (preIme && !ctrl && !alt && isPrintableKeyCode(event.keyCode)) {
       return false;
     }
     if (!this.isInputTarget()) {
       return false; // 非聚焦窗格：物理输入不投递（路由验收标准）
     }
+    const action: ShortcutAction | null =
+      matchShortcut(this.shortcutBindings, event.keyCode, ctrl, alt, shift, meta);
+    if (action !== null) {
+      return this.dispatchShortcut(action);
+    }
     const snap = this.stickyModifiers.snapshot();
-    const mapped = mapKeyEvent(event.keyCode, this.queryModifierState(event, 'shift'),
+    const mapped = mapKeyEvent(event.keyCode, shift,
       alt || snap.alt, ctrl || snap.ctrl, false, this.applicationCursorKeys);
     if (mapped === null) {
       return false; // 未映射键放行系统默认处理
@@ -405,6 +432,21 @@ export struct TerminalCanvas {
     this.sendInputBytes(mapped);
     this.stickyModifiers.consume(); // 一次性粘滞用完复位（locked 保持）
     return true;
+  }
+
+  /** 快捷键分发：复制/粘贴留在画布，其余交给页面 */
+  private dispatchShortcut(action: ShortcutAction): boolean {
+    if (action === 'copy') {
+      this.copySelection();
+      return true;
+    }
+    if (action === 'paste') {
+      pasteFromPasteboard(this.terminal).catch((err: Object) => {
+        Logger.warn(`快捷键粘贴失败：${JSON.stringify(err)}`, 'Terminal');
+      });
+      return true;
+    }
+    return this.onAppShortcut(action);
   }
 
   /**

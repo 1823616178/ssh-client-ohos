@@ -20,6 +20,8 @@ import sessionManagerTest from './SessionManager.test';
 import hostListViewModelTest from './HostListViewModel.test';
 import hostEditViewModelTest from './HostEditViewModel.test';
 import terminalViewModelTest from './TerminalViewModel.test';
+import paneTreeTest from './PaneTree.test';
+import shortcutMapTest from './ShortcutMap.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -45,4 +47,6 @@ export default function testsuite() {
   hostListViewModelTest();
   hostEditViewModelTest();
   terminalViewModelTest();
+  paneTreeTest();
+  shortcutMapTest();
 }
