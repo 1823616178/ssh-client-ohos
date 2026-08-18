@@ -17,17 +17,17 @@ using sshclient::crypto::VaultKeyRecoveryAad;
 TEST(AadTest, SyncDocumentAadMatchesDesign)
 {
     EXPECT_EQ(SyncDocumentAad("vault-abc", "1", "7"),
-              "ssh-client-ohos/sync-document/v1|9:vault-abc|1:1|1:7");
+              "ssh-port-mapper/sync-document/v1|9:vault-abc|1:1|1:7");
 }
 
 TEST(AadTest, VaultKeyPasswordAadMatchesDesign)
 {
-    EXPECT_EQ(VaultKeyPasswordAad("7"), "ssh-client-ohos/vault-key/password/v1|1:7");
+    EXPECT_EQ(VaultKeyPasswordAad("7"), "ssh-port-mapper/vault-key/password/v1|1:7");
 }
 
 TEST(AadTest, VaultKeyRecoveryAadMatchesDesign)
 {
-    EXPECT_EQ(VaultKeyRecoveryAad("12"), "ssh-client-ohos/vault-key/recovery/v1|2:12");
+    EXPECT_EQ(VaultKeyRecoveryAad("12"), "ssh-port-mapper/vault-key/recovery/v1|2:12");
 }
 
 // 长度前缀是 UTF-8 字节数，不是字符数："主机" 二字共 6 字节

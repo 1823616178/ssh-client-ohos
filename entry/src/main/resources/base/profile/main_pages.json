@@ -2,6 +2,9 @@
   "src": [
     "pages/Index",
     "pages/HostEditPage",
-    "pages/TerminalPage"
+    "pages/TerminalPage",
+    "pages/AccountSyncPage",
+    "pages/ConfigManagerPage",
+    "pages/SettingsPage"
   ]
 }

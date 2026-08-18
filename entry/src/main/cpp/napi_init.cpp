@@ -20,6 +20,7 @@
 #include "bridge/session_bridge.h"
 // T3：终端桥接（零拷贝快照 + 终端事件），实现见 bridge/terminal_bridge.cpp
 #include "bridge/terminal_bridge.h"
+#include "bridge/vault_bridge.h"
 
 namespace {
 
@@ -86,8 +87,10 @@ napi_value Init(napi_env env, napi_value exports)
     sshclient::bridge::RegisterSessionBridge(env, exports);
     // T3：注册终端桥接方法（attachTerminal/beginFrame/endFrame/getRevision/
     // selfTestGrid/copyGridRows/getScrollbackWindow/writeTerminal/resizeTerminal/
+    // setTerminalDefaultColors/
     // detachTerminal）；终端事件经 N11 的 stateTsfn 上抛，清理随会话钩子走
     sshclient::bridge::RegisterTerminalBridge(env, exports);
+    sshclient::bridge::RegisterVaultBridge(env, exports);
     return exports;
 }
 

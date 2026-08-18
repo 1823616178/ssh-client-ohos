@@ -63,5 +63,43 @@ private:
     unsigned misses_ = 0;
 };
 
+/**
+ * P1 主动探测窗口 —— 网络切换（WiFi ⇄ 蜂窝）后不干等 keepalive 周期的短判定窗口。
+ *
+ * 背景：默认 keepalive 是 30 s × 3 = 90 s 才判黑洞，而切网后旧 socket 多半已成
+ * 黑洞（新接口地址不同，旧连接不会收到任何 RST）。P1 要求 5 s 内触发重连，
+ * 故 ArkTS 侧监听到默认网变化时调 SshSession::probeNow()：立刻发一拍 keepalive，
+ * 并开一个 timeoutSec 的短窗口——窗口内无任何入站活动即判黑洞，走既有断线重连链。
+ *
+ * 判定信号与周期判定同源（keepaliveInboundObserved：EPOLLIN 或 FIONREAD 增长），
+ * 所以本类只承担「开窗 → 记基线 → 到期裁决」这一段纯逻辑。
+ */
+class KeepaliveProbe {
+public:
+    bool active() const { return active_; }
+    long baseline() const { return baseline_; }
+
+    // 开窗：记下窗口起点的待读字节基线（rebaseline == false 时沿用旧基线——
+    // 见 session.cpp doProbeNow：刚发过 keepalive 时 libssh2 会跳过本次发送，
+    // 此时重置基线会把「已在路上的应答」当成不存在，故保留旧基线更保守）
+    void arm(long pendingBaseline)
+    {
+        active_ = true;
+        baseline_ = pendingBaseline;
+    }
+
+    void disarm() { active_ = false; }
+
+    // 到期裁决：窗口内观测到任何入站活动 = 对端存活（true）；否则判黑洞（false）
+    bool verdictAlive(bool epollInSeen, long pendingNow) const
+    {
+        return keepaliveInboundObserved(epollInSeen, pendingNow, baseline_);
+    }
+
+private:
+    bool active_ = false;
+    long baseline_ = 0;
+};
+
 } // namespace ssh
 } // namespace sshclient

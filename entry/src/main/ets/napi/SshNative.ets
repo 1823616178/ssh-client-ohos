@@ -30,6 +30,7 @@ export interface LibSshCoreModule {
   closeChannel(handle: number, channelId: number): boolean;
   closeSession(handle: number): boolean;
   setKeepalive(handle: number, intervalSec: number, maxMisses: number): boolean;
+  probeNow(handle: number, timeoutSec: number): boolean;
   setReconnectPolicy(handle: number, delaysSec: number[], maxAttempts: number): boolean;
   nextReconnectDelaySec(handle: number, attempt: number): number;
   getLibssh2Version(): string;
@@ -47,6 +48,39 @@ export interface LibSshCoreModule {
   getScrollbackWindow(terminalHandle: number, startIndex: number, count: number): ArrayBuffer | null;
   writeTerminal(terminalHandle: number, data: ArrayBuffer | string): boolean;
   resizeTerminal(terminalHandle: number, cols: number, rows: number): boolean;
+  setTerminalDefaultColors(terminalHandle: number, fgArgb: number, bgArgb: number): boolean;
+  vaultCreate(password: string, keyVersion: number): NativeVaultCreateResult | null;
+  vaultUnlockPassword(password: string, keyVersion: number, kdfSalt: string,
+    passwordWrappedKey: string, passwordWrapNonce: string): number;
+  vaultUnlockRecovery(recoveryKey: string, keyVersion: number, recoveryWrappedKey: string,
+    recoveryWrapNonce: string): number;
+  vaultEncrypt(handle: number, vaultId: string, schemaVersion: number, keyVersion: number,
+    plaintext: string): NativeVaultSeal | null;
+  vaultDecrypt(handle: number, vaultId: string, schemaVersion: number, keyVersion: number,
+    nonce: string, ciphertext: string): string | null;
+  vaultRewrap(handle: number, newPassword: string, keyVersion: number): NativeVaultCreateResult | null;
+  vaultRotate(handle: number, password: string): NativeVaultCreateResult | null;
+  vaultClose(handle: number): boolean;
+}
+
+export interface NativeVaultCreateResult {
+  handle: number;
+  keyVersion: number;
+  passwordWrappedKey: string;
+  passwordWrapNonce: string;
+  recoveryWrappedKey: string;
+  recoveryWrapNonce: string;
+  kdfSalt: string;
+  recoveryKey: string;
+}
+
+export interface NativeVaultSeal {
+  schemaVersion: number;
+  keyVersion: number;
+  algorithm: string;
+  nonce: string;
+  ciphertext: string;
+  ciphertextHash: string;
 }
 
 /** T3：native beginFrame 组包的原始帧对象（字段随 napi 组包，可选字段可能缺省） */
@@ -121,8 +155,8 @@ export interface SshEvent {
   exitSignal?: string;
   code?: string;
   count?: number;
-  /** T3：终端事件携带的终端句柄（terminalOpen/terminalClose/terminalBell/
-   *  terminalTitle/terminalMouseMode），均随所属会话的 onEvent 上抛 */
+  /** T3：终端事件携带的终端句柄（terminalOpen/terminalData/terminalClose/
+   *  terminalBell/terminalTitle/terminalMouseMode），均随所属会话的 onEvent 上抛 */
   terminal?: number;
   /** T3：terminalTitle 事件的标题文本 */
   title?: string;
@@ -211,6 +245,16 @@ export class SshNativeSession {
    */
   setKeepalive(intervalSec: number, maxMisses: number): boolean {
     return this.alive && native.setKeepalive(this.handle, intervalSec, maxMisses);
+  }
+
+  /**
+   * P1：主动探测（仅 established 受理，false = 未受理）。网络切换后调用：
+   * 立刻发一拍 keepalive 并开 timeoutSec 秒判定窗口，窗口内无入站活动即判黑洞
+   * → 会话进 disconnected（reconnectHint=true），由 SessionManager 走既有重连链。
+   * timeoutSec 传 0 = native 默认 5 s
+   */
+  probeNow(timeoutSec: number): boolean {
+    return this.alive && native.probeNow(this.handle, timeoutSec);
   }
 
   /**

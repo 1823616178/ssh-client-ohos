@@ -10,8 +10,8 @@
  *
  * 关键规则（均有单测）：
  *   - 搜索：名称 / 主机地址 / 用户名三字段大小写不敏感包含匹配，空串复原全量；
- *   - 分组：按 HostGroup.order 升序，未分组区置最后；组内主机按 name 字典序
- *     （HostProfile 无 createdAt 字段，故取 name；字段将来补齐后可换序）；
+ *   - 分组：按 HostGroup.order 升序，未分组区置最后；组内主机按最后使用时间
+ *     降序（近者优先），未用过的靠后，时间相同再按 name 字典序；
  *   - 折叠持久化：JSON 串 Record<groupId, true>（未分组区用空串作键），
  *     脏数据（非法 JSON / 非对象 / 非布尔值）一律收敛空集或剔除；
  *   - 状态点：按 hostId 从会话列表派生，多会话同主机取最严重状态，
@@ -23,6 +23,7 @@ import { HostGroup, HostProfile } from '../common/model/models';
 import { AppDatabase } from '../repository/AppDatabase';
 import { SettingsRepository } from '../repository/SettingsRepository';
 import { Logger } from '../common/utils/Logger';
+import { notifyConfigSaved } from '../service/sync/SyncHooks';
 
 const LOG_TAG: string = 'HostList';
 
@@ -156,6 +157,66 @@ export function sortHostsByName(hosts: HostProfile[]): HostProfile[] {
   return hosts.slice().sort((a: HostProfile, b: HostProfile) => compareByName(a.name, b.name));
 }
 
+/** 组内主机排序：最后使用近者在前；从未使用（缺省 0）靠后；并列再按 name */
+export function sortHostsByLastUsed(hosts: HostProfile[], lastUsed: Map<string, number>): HostProfile[] {
+  return hosts.slice().sort((a: HostProfile, b: HostProfile) => {
+    const aUsed: number = lastUsed.get(a.id) ?? 0;
+    const bUsed: number = lastUsed.get(b.id) ?? 0;
+    if (aUsed !== bUsed) {
+      return bUsed - aUsed;
+    }
+    return compareByName(a.name, b.name);
+  });
+}
+
+/** JSON 串 → hostId→epochMs；脏数据收敛为空表 */
+export function decodeHostLastUsed(json: string): Map<string, number> {
+  const result: Map<string, number> = new Map();
+  const trimmed: string = json.trim();
+  if (trimmed.length === 0) {
+    return result;
+  }
+  let parsed: Object | null = null;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    Logger.warn(`主机最后使用时间 JSON 非法，收敛为空表：${JSON.stringify(err)}`, LOG_TAG);
+    return result;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return result;
+  }
+  const record: Record<string, Object> = parsed as Record<string, Object>;
+  const keys: string[] = Object.keys(record);
+  for (let i = 0; i < keys.length; i++) {
+    const key: string = keys[i];
+    const value: Object = record[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      result.set(key, value);
+    }
+  }
+  return result;
+}
+
+/** hostId→epochMs → JSON 串 */
+export function encodeHostLastUsed(lastUsed: Map<string, number>): string {
+  const obj: Record<string, number> = {};
+  lastUsed.forEach((value: number, key: string) => {
+    obj[key] = value;
+  });
+  return JSON.stringify(obj);
+}
+
+/** 记下某主机此刻被使用；空 id 忽略。本机偏好，不上云。 */
+export function recordHostLastUsed(hostId: string): void {
+  if (hostId.length === 0) {
+    return;
+  }
+  const current: Map<string, number> = decodeHostLastUsed(SettingsRepository.getHostLastUsed());
+  current.set(hostId, Date.now());
+  SettingsRepository.setHostLastUsed(encodeHostLastUsed(current));
+}
+
 // ---------------------------------------------------------------- 折叠集合与持久化编解码
 
 /** 折叠切换：返回新集合（不可变更新，@Trace 字段整体替换保证刷新） */
@@ -247,7 +308,9 @@ export interface HostListRow {
  * 主机按未分组处理（脏数据防御）。未分组区组头仅在有未分组主机时产出。
  */
 export function buildHostRows(hosts: HostProfile[], groups: HostGroup[],
-  collapsedGroupIds: Set<string>, connStatusMap: Map<string, HostConnStatus>): HostListRow[] {
+  collapsedGroupIds: Set<string>, connStatusMap: Map<string, HostConnStatus>,
+  lastUsedMap?: Map<string, number>): HostListRow[] {
+  const usedMap: Map<string, number> = lastUsedMap === undefined ? new Map() : lastUsedMap;
   const rows: HostListRow[] = [];
   const sortedGroups: HostGroup[] = sortGroupsByOrder(groups);
   const knownGroupIds: Set<string> = new Set();
@@ -265,7 +328,7 @@ export function buildHostRows(hosts: HostProfile[], groups: HostGroup[],
     if (members.length === 0) {
       continue;
     }
-    pushGroupSection(rows, group.id, group.name, members, collapsedGroupIds, connStatusMap);
+    pushGroupSection(rows, group.id, group.name, members, collapsedGroupIds, connStatusMap, usedMap);
   }
   const ungrouped: HostProfile[] = [];
   for (let i = 0; i < hosts.length; i++) {
@@ -275,15 +338,16 @@ export function buildHostRows(hosts: HostProfile[], groups: HostGroup[],
     }
   }
   if (ungrouped.length > 0) {
-    pushGroupSection(rows, GROUP_ID_UNGROUPED, '未分组', ungrouped, collapsedGroupIds, connStatusMap);
+    pushGroupSection(rows, GROUP_ID_UNGROUPED, '未分组', ungrouped, collapsedGroupIds,
+      connStatusMap, usedMap);
   }
   return rows;
 }
 
-/** 产出一个分组区（组头行 + 未折叠时的主机行，组内按 name 字典序） */
+/** 产出一个分组区（组头行 + 未折叠时的主机行，组内按最后使用时间降序） */
 function pushGroupSection(rows: HostListRow[], groupId: string, groupName: string,
   members: HostProfile[], collapsedGroupIds: Set<string>,
-  connStatusMap: Map<string, HostConnStatus>): void {
+  connStatusMap: Map<string, HostConnStatus>, lastUsedMap: Map<string, number>): void {
   const collapsed: boolean = collapsedGroupIds.has(groupId);
   rows.push({
     rowId: `group:${groupId}`,
@@ -298,7 +362,7 @@ function pushGroupSection(rows: HostListRow[], groupId: string, groupName: strin
   if (collapsed) {
     return;
   }
-  const sorted: HostProfile[] = sortHostsByName(members);
+  const sorted: HostProfile[] = sortHostsByLastUsed(members, lastUsedMap);
   for (let i = 0; i < sorted.length; i++) {
     const host: HostProfile = sorted[i];
     const status: HostConnStatus | undefined = connStatusMap.get(host.id);
@@ -466,7 +530,8 @@ export class HostListViewModel {
 
   /** 构建扁平行列表（搜索 + 分组 + 折叠 + 状态点的最终派生，LazyForEach 数据源内容） */
   buildRows(): HostListRow[] {
-    return buildHostRows(this.filteredHosts(), this.groups, this.collapsedGroupIds, this.connStatusMap);
+    return buildHostRows(this.filteredHosts(), this.groups, this.collapsedGroupIds, this.connStatusMap,
+      decodeHostLastUsed(SettingsRepository.getHostLastUsed()));
   }
 
   /** 从会话列表（C4 SessionManager.listSessions()）派生状态点；整体替换 Map 保证 @Trace 刷新 */
@@ -485,7 +550,11 @@ export class HostListViewModel {
       Logger.error(`删除主机失败（hostId=${hostId}）: ${JSON.stringify(err)}`, LOG_TAG);
       return false;
     }
-    return this.reload();
+    const ok: boolean = this.reload();
+    if (ok) {
+      notifyConfigSaved();
+    }
+    return ok;
   }
 
   private hostDao(): HostDaoLike {

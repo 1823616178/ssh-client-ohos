@@ -4,6 +4,8 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
+    // 模块级 AbilityStage：只为拿 onMemoryLevel（系统回收前优雅断开会话，P1/§7.5）
+    "srcEntry": "./ets/entryabilitystage/EntryAbilityStage.ets",
     "deviceTypes": [
       "phone",
       "tablet"
@@ -15,6 +17,14 @@
       {
         // SSH（原始 TCP）与同步 API（HTTP）都依赖此权限（DESIGN §7.6）
         "name": "ohos.permission.INTERNET"
+      },
+      {
+        // 同步网络恢复触发（S6）与切网收敛（P1，@ohos.net.connection）
+        "name": "ohos.permission.GET_NETWORK_INFO"
+      },
+      {
+        // 后台保活长时任务（P1，§7.5：切后台后维持 SSH 会话；用户可在设置中关闭）
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
       },
       {
         // 触感反馈（DESIGN §4.4：粘滞键切换/复制成功等轻震，T7/T8）
@@ -48,6 +58,11 @@
         "label": "$string:EntryAbility_label",
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
+        // P1：dataTransfer 长时任务（SSH 会话本身就是数据传输通道）。
+        // 注意系统会对低速的 dataTransfer 任务挂起/取消，降级链见 service/background/
+        "backgroundModes": [
+          "dataTransfer"
+        ],
         "exported": true,
         "skills": [
           {

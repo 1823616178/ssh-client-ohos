@@ -13,8 +13,8 @@
  * 职责边界：
  *  - 尺寸协商：onAreaChange → computeTerminalLayout 得 cols/rows → 默认组件内部
  *    直接调 terminal.resize()（窗格像素尺寸 → PTY 尺寸是渲染几何的直接结果，
- *    放组件内可保证「拖分隔条后每个窗格各自发 request_pty_size」不漏；U4b 若需
- *    集中编排，置 autoResizeTerminal=false 并监听 onGridSizeChanged 自行调用）；
+ *    放组件内可保证「拖分隔条后每个窗格各自发 request_pty_size」不漏；暂时置
+ *    autoResizeTerminal=false 时只缓存最新网格，恢复 true 会合并提交一次 resize）；
  *  - 光标：block 反色 / bar / underline；cursorBlink 与 ATTR_BLINK 字符首版按
  *    静止绘制——闪烁需要低频定时翻转，定时器本身违背「静止 CPU≈0」，留给 A3
  *    光标设置落地时在调度层加低频 tick 一并做（真机验证后启用）；
@@ -47,7 +47,8 @@
  * 移动端交互（T7/T8/T9，DESIGN §4.4「移动端专属交互」表）：
  *  - T7：sendExternalInput() 是功能键条/片段等外部字节源的统一出口
  *    （按 FocusManager 焦点路由投递；粘滞修饰由 KeyBar 侧在出字节前并入）；
- *  - T8：长按（LongPressGesture）进入选择模式 → 拖动（PanGesture）更新活动端
+ *  - T8：长按（LongPressGesture）进入选择模式 → 选区框 + 两端拖拽手柄
+ *    → 拖动手柄改起点/终点，或在画布上拖更新活动端
  *    → 气泡菜单「复制/全选」（粘贴/分享归 U4）；选区高亮为 selectionColor
  *    半透明叠加层，随帧重绘；跨行拼接/宽字符边界等纯逻辑在
  *    terminal/SelectionModel.ets；**首版只支持主屏选择**——回滚区
@@ -82,16 +83,27 @@ import {
 import {
   TextMeasureContext,
   TextMeasureResult,
+  computeBaselineOffsetFromCenter,
   measureTerminalCells,
   verifyCjkAlignment
 } from './terminal/FontMetrics';
-import { TerminalLayoutMetrics, computeTerminalLayout } from './terminal/TerminalLayout';
+import {
+  TerminalLayoutMetrics,
+  areaLengthToVp,
+  computeTerminalLayout,
+  computeTerminalLayoutInsets
+} from './terminal/TerminalLayout';
 import {
   hexColorToArgb,
   paletteToArgb,
   withOpacity
 } from './terminal/TerminalPalette';
 import { FocusManager } from './terminal/FocusManager';
+import {
+  TerminalActionHub,
+  TerminalActionExecutor,
+  TerminalClipboardAction
+} from './terminal/TerminalActionHub';
 import { isModifierKeyCode, isPrintableKeyCode, mapKeyEvent } from './terminal/KeyMap';
 import { StickyModifiers } from './terminal/StickyModifiers';
 import {
@@ -128,6 +140,10 @@ let nextCanvasId = 0;
 
 /** 字符度量失败（字体未注册）时的近似格宽系数 */
 const FALLBACK_CELL_WIDTH_FRACTION = 0.6;
+/** 字符网格在 Canvas 内部的最小左右留白；只改变绘制坐标，不改变 Canvas 节点尺寸。 */
+const MIN_GRID_HORIZONTAL_INSET_VP = 12;
+/** 字符网格在 Canvas 内部的最小顶部留白。 */
+const MIN_GRID_TOP_INSET_VP = 12;
 /** underline/strike 线宽 = 字号 × 该系数（下限 1vp） */
 const TEXT_DECO_THICKNESS_FRACTION = 0.06;
 /** 进入选择模式的长按时长（ms） */
@@ -139,6 +155,14 @@ const MENU_HEIGHT_VP = 36;
 const MENU_WIDTH_VP = 152;
 /** 气泡菜单与选区起点行的垂直间距（vp） */
 const MENU_GAP_VP = 4;
+/** 选区两端手柄圆钮直径（Token 表无「手柄」项） */
+const HANDLE_KNOB_VP = 22;
+/** 手柄竖条宽度 */
+const HANDLE_BAR_WIDTH_VP = 4;
+/** 手柄整体触摸宽度：圆钮 + 竖条 + 两侧热区 */
+const HANDLE_HIT_WIDTH_VP = 36;
+/** 选区边框线宽 */
+const SELECTION_BORDER_VP = 2;
 
 /**
  * CanvasRenderingContext2D → TextMeasureContext 的名义类型适配（U4 修复）：
@@ -162,7 +186,27 @@ class CanvasTextMeasureContext implements TextMeasureContext {
   }
 
   measureText(text: string): TextMeasureResult {
-    return { width: this.context.measureText(text).width };
+    const metrics = this.context.measureText(text);
+    return {
+      width: metrics.width,
+      actualBoundingBoxAscent: metrics.actualBoundingBoxAscent,
+      actualBoundingBoxDescent: metrics.actualBoundingBoxDescent,
+      fontBoundingBoxAscent: metrics.fontBoundingBoxAscent,
+      fontBoundingBoxDescent: metrics.fontBoundingBoxDescent
+    };
+  }
+}
+
+/** TerminalActionHub 执行器适配（ArkTS 禁止 struct 实现接口，故包一层类转回实例方法） */
+class CanvasClipboardExecutor implements TerminalActionExecutor {
+  private readonly handler: (action: TerminalClipboardAction) => void;
+
+  constructor(handler: (action: TerminalClipboardAction) => void) {
+    this.handler = handler;
+  }
+
+  executeClipboardAction(action: TerminalClipboardAction): void {
+    this.handler(action);
   }
 }
 
@@ -180,8 +224,8 @@ export struct TerminalCanvas {
   @Prop @Watch('onVisibleChanged') visible: boolean = true;
   /** cols/rows 变化回调（每次变化一次；autoResizeTerminal=false 时由持有方据此调 resize） */
   onGridSizeChanged: (cols: number, rows: number) => void = () => {};
-  /** true（默认）= 组件内部直接调 terminal.resize()；职责说明见文件头注 */
-  autoResizeTerminal: boolean = true;
+  /** true（默认）= 组件内部调 terminal.resize()；false 期间缓存最新网格，恢复时一次提交。 */
+  @Prop @Watch('onAutoResizeTerminalChanged') autoResizeTerminal: boolean = true;
   /**
    * R-2 兜底开关：整屏滚动 OffscreenCanvas 位块搬移（blitScrollUp）。
    * 默认 false，T0/Q2 帧率不达标再启用（前置条件与风险见文件头注「性能策略」）
@@ -192,6 +236,8 @@ export struct TerminalCanvas {
    * 仅聚焦窗格收发；空串 = 单窗格模式（输入直通，不做路由判定）
    */
   @Prop focusId: string = '';
+  /** 页面首次进入时，聚焦窗格把系统输入焦点直接交给隐藏 IME 承接框。 */
+  @Prop @Watch('onAutoFocusChanged') autoFocus: boolean = false;
   /**
    * 终端应用光标模式（DECCKM）：native 尚未暴露该模式位（T1 未加），
    * 先参数化透传给 mapKeyEvent；native 暴露后由 U4 接线（KeyMap 头注）
@@ -230,14 +276,22 @@ export struct TerminalCanvas {
   private readonly schedulerId: string = `terminal-canvas-${++nextCanvasId}`;
   /** 隐藏 IME 承接框的全局唯一 id（focusControl.requestFocus 用） */
   private readonly imeSinkId: string = `terminal-ime-${++nextCanvasId}`;
+  /** struct 不能 implements 接口，故用适配器把剪贴板动作转回本实例 */
+  private readonly clipboardExecutor: TerminalActionExecutor =
+    new CanvasClipboardExecutor((action: TerminalClipboardAction): void => {
+      this.executeClipboardAction(action);
+    });
 
   private canvasReady = false;
+  private inputFocusTimer: number = -1;
   private areaWidthVp = 0;
   private areaHeightVp = 0;
   // ---- 字符度量缓存（DESIGN §4.4：字体/字号变化时才重测）----
   private measuredFontKey = '';
   private cellWidthVp = 0;
   private cellHeightVp = 0;
+  /** alphabetic baseline 相对 cell 中线的偏移；由字体 ascent/descent 实测。 */
+  private textBaselineOffsetVp = 0;
   private fontNormal = '';
   private fontBold = '';
   private fontItalic = '';
@@ -254,6 +308,8 @@ export struct TerminalCanvas {
     computeTerminalLayout(0, 0, 0, 0, 0);
   private notifiedCols = 0;
   private notifiedRows = 0;
+  /** autoResizeTerminal=false 期间合并的最新 PTY resize 请求。 */
+  private pendingTerminalResize = false;
   private lastRenderedRevision = -1;
   private lastGridCols = 0;
   private lastGridRows = 0;
@@ -269,6 +325,17 @@ export struct TerminalCanvas {
   @State private selectionMenuVisible: boolean = false;
   @State private selectionMenuX: number = 0;
   @State private selectionMenuY: number = 0;
+  @State private selectionHandlesVisible: boolean = false;
+  @State private startHandleX: number = 0;
+  @State private startHandleY: number = 0;
+  @State private endHandleX: number = 0;
+  @State private endHandleY: number = 0;
+  @State private handleBarHeight: number = 16;
+  @State private selectionHandleColor: string = '#4D8DFF';
+  /** 正在拖的手柄；空串 = 未拖。起点用选区当时另一端作锚。 */
+  private draggingHandle: string = '';
+  private handleDragOriginX: number = 0;
+  private handleDragOriginY: number = 0;
   // ---- T9 滚动/缩放 ----
   /** 回滚视图偏移（行；0 = 紧贴最新主屏） */
   private scrollOffsetLines = 0;
@@ -288,6 +355,19 @@ export struct TerminalCanvas {
     this.applyAppearance();
     FrameScheduler.get().register(this.schedulerId, this.renderFrame);
     FrameScheduler.get().setVisible(this.schedulerId, this.visible);
+    // 键条「复制/粘贴」按 paneId 路由到本实例（页面拿不到画布引用，见 Hub 头注）
+    TerminalActionHub.get().register(this.focusId, this.clipboardExecutor);
+  }
+
+  /** TerminalActionHub 执行器：键条剪贴板动作复用与快捷键完全相同的实现 */
+  executeClipboardAction(action: TerminalClipboardAction): void {
+    if (action === 'copy') {
+      this.copySelection();
+      return;
+    }
+    pasteFromPasteboard(this.terminal).catch((err: Object) => {
+      Logger.warn(`键条粘贴失败：${JSON.stringify(err)}`, 'Terminal');
+    });
   }
 
   private onShortcutJsonChanged(): void {
@@ -295,6 +375,10 @@ export struct TerminalCanvas {
   }
 
   aboutToDisappear(): void {
+    if (this.inputFocusTimer >= 0) {
+      clearTimeout(this.inputFocusTimer);
+      this.inputFocusTimer = -1;
+    }
     FrameScheduler.get().unregister(this.schedulerId);
   }
 
@@ -390,7 +474,14 @@ export struct TerminalCanvas {
     if (terminal === null || bytes.length === 0) {
       return;
     }
-    terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    // 输入发出前先预热 displaySync：远端回显到达时可直接赶上下一帧，避免从
+    // 自动休眠状态启动 ticker 所产生的额外可感知等待。
+    FrameScheduler.get().wakeup();
+    const accepted: boolean =
+      terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    if (!accepted) {
+      Logger.warn(`终端输入未被通道受理（bytes=${bytes.length}）`, 'Terminal');
+    }
   }
 
   /**
@@ -451,11 +542,33 @@ export struct TerminalCanvas {
 
   /**
    * 硬件修饰状态查询。KeyEvent.getModifierKeyState 在 SDK 声明中为可选方法
-   * （支持 'ctrl'|'alt'|'shift'；Meta 暂不支持，mapKeyEvent 内 Meta 按 Alt 处理），
-   * 缺失时退化为无修饰（真机待验项，见 ImeInputHandler 头注）。
+   * （KeyEvent 只接受大小写敏感的 'Ctrl'|'Alt'|'Shift'；Meta 不在支持列表）。
+   * 参数非法会同步抛 BusinessError 401，因此必须兜底，不能让一次按键终止应用。
    */
   private queryModifierState(event: KeyEvent, name: string): boolean {
-    return event.getModifierKeyState !== undefined ? event.getModifierKeyState([name]) : false;
+    if (event.getModifierKeyState === undefined || name === 'meta') {
+      return false;
+    }
+    let apiName: string = '';
+    switch (name) {
+      case 'ctrl':
+        apiName = 'Ctrl';
+        break;
+      case 'alt':
+        apiName = 'Alt';
+        break;
+      case 'shift':
+        apiName = 'Shift';
+        break;
+      default:
+        return false;
+    }
+    try {
+      return event.getModifierKeyState([apiName]);
+    } catch (_err) {
+      // API 12+ 声明为可选，部分输入源/系统版本仍可能拒绝查询；退化为无修饰。
+      return false;
+    }
   }
 
   /**
@@ -543,6 +656,21 @@ export struct TerminalCanvas {
         this.layout.originY + r * this.cellHeightVp,
         (hi - lo + 1) * this.cellWidthVp, this.cellHeightVp);
     }
+    ctx.strokeStyle = this.cursorArgb;
+    ctx.lineWidth = SELECTION_BORDER_VP;
+    for (let r = range.startRow; r <= lastRow; r++) {
+      if (r < 0) {
+        continue;
+      }
+      const lo = r === range.startRow ? range.startCol : 0;
+      const hi = Math.min(r === range.endRow ? range.endCol : frame.cols - 1, frame.cols - 1);
+      if (hi < lo) {
+        continue;
+      }
+      ctx.strokeRect(this.layout.originX + lo * this.cellWidthVp,
+        this.layout.originY + r * this.cellHeightVp,
+        (hi - lo + 1) * this.cellWidthVp, this.cellHeightVp);
+    }
   }
 
   // ---------------------------------------------------------------- T8 选择模式
@@ -569,7 +697,7 @@ export struct TerminalCanvas {
     }
     const finger = event.fingerList[0];
     this.selection.begin(this.gridPosFromPoint(finger.localX, finger.localY));
-    this.updateSelectionMenuPosition();
+    this.updateSelectionChrome();
     this.forceFullRedraw();
     vibrateLight(this.hapticEnabled);
   }
@@ -581,6 +709,8 @@ export struct TerminalCanvas {
     }
     this.selection.cancel();
     this.selectionMenuVisible = false;
+    this.selectionHandlesVisible = false;
+    this.draggingHandle = '';
     this.forceFullRedraw(); // 重绘覆盖掉高亮叠加层
   }
 
@@ -620,8 +750,14 @@ export struct TerminalCanvas {
     const rows = this.lastGridRows > 0 ? this.lastGridRows : this.layout.rows;
     const cols = this.lastGridCols > 0 ? this.lastGridCols : this.layout.cols;
     this.selection.selectAll(rows, cols);
-    this.updateSelectionMenuPosition();
+    this.updateSelectionChrome();
     this.forceFullRedraw();
+  }
+
+  /** 气泡菜单 + 两端手柄一起刷新。 */
+  private updateSelectionChrome(): void {
+    this.updateSelectionMenuPosition();
+    this.updateSelectionHandles();
   }
 
   /** 气泡菜单位置：选区起点上方，顶部放不下时贴顶（底部溢出由钳制兜底） */
@@ -639,6 +775,64 @@ export struct TerminalCanvas {
     this.selectionMenuVisible = true;
   }
 
+  /** 起点手柄贴第一格左边、终点手柄贴末格右边，竖条与行等高。 */
+  private updateSelectionHandles(): void {
+    const range: SelectionRange | null = this.selection.range();
+    if (range === null || this.cellWidthVp <= 0 || this.cellHeightVp <= 0) {
+      this.selectionHandlesVisible = false;
+      return;
+    }
+    const barH: number = this.cellHeightVp;
+    this.handleBarHeight = barH;
+    const startLeft: number = this.layout.originX + range.startCol * this.cellWidthVp;
+    const startTop: number = this.layout.originY + range.startRow * this.cellHeightVp;
+    this.startHandleX = startLeft - HANDLE_HIT_WIDTH_VP;
+    this.startHandleY = startTop;
+    const endRight: number = this.layout.originX + (range.endCol + 1) * this.cellWidthVp;
+    const endTop: number = this.layout.originY + range.endRow * this.cellHeightVp;
+    this.endHandleX = endRight;
+    this.endHandleY = endTop;
+    this.selectionHandlesVisible = true;
+  }
+
+  private beginHandleDrag(which: string): void {
+    const range: SelectionRange | null = this.selection.range();
+    if (range === null) {
+      return;
+    }
+    this.draggingHandle = which;
+    if (which === 'start') {
+      this.handleDragOriginX = this.layout.originX + range.startCol * this.cellWidthVp +
+        this.cellWidthVp / 2;
+      this.handleDragOriginY = this.layout.originY + range.startRow * this.cellHeightVp +
+        this.cellHeightVp / 2;
+    } else {
+      this.handleDragOriginX = this.layout.originX + range.endCol * this.cellWidthVp +
+        this.cellWidthVp / 2;
+      this.handleDragOriginY = this.layout.originY + range.endRow * this.cellHeightVp +
+        this.cellHeightVp / 2;
+    }
+  }
+
+  private onHandleDrag(event: GestureEvent): void {
+    if (this.draggingHandle.length === 0) {
+      return;
+    }
+    const pos: CellPos = this.gridPosFromPoint(
+      this.handleDragOriginX + event.offsetX, this.handleDragOriginY + event.offsetY);
+    if (this.draggingHandle === 'start') {
+      this.selection.moveStart(pos);
+    } else {
+      this.selection.moveEnd(pos);
+    }
+    this.updateSelectionChrome();
+    this.forceFullRedraw();
+  }
+
+  private endHandleDrag(): void {
+    this.draggingHandle = '';
+  }
+
   // ---------------------------------------------------------------- T9 手势
 
   /**
@@ -650,7 +844,7 @@ export struct TerminalCanvas {
       if (event.fingerList.length > 0) {
         const finger = event.fingerList[0];
         this.selection.extend(this.gridPosFromPoint(finger.localX, finger.localY));
-        this.updateSelectionMenuPosition();
+        this.updateSelectionChrome();
         this.forceFullRedraw();
       }
       return;
@@ -846,7 +1040,9 @@ export struct TerminalCanvas {
         lastFont = font;
       }
       ctx.fillStyle = run.fgArgb;
-      ctx.fillText(run.text, run.x, run.y);
+      // HarmonyOS Canvas 的 middle baseline 不是字形包围盒的视觉中心；统一使用
+      // alphabetic baseline，并按实测 ascent/descent 把字形中心对齐到 cell 中线。
+      ctx.fillText(run.text, run.x, run.y + this.textBaselineOffsetVp);
       if (run.underline) {
         ctx.fillRect(run.x, run.y + this.cellHeightVp / 2 - thickness,
           run.cellSpan * this.cellWidthVp, thickness);
@@ -866,11 +1062,14 @@ export struct TerminalCanvas {
     this.relayout();
     this.needsFullRedraw = true;
     FrameScheduler.get().wakeup();
+    if (this.autoFocus) {
+      this.scheduleInputFocus();
+    }
   }
 
   private onCanvasAreaChange(oldArea: Area, newArea: Area): void {
-    const w = newArea.width as number;
-    const h = newArea.height as number;
+    const w = areaLengthToVp(newArea.width);
+    const h = areaLengthToVp(newArea.height);
     if (w === this.areaWidthVp && h === this.areaHeightVp) {
       return;
     }
@@ -878,6 +1077,9 @@ export struct TerminalCanvas {
     this.areaHeightVp = h;
     this.relayout();
     this.needsFullRedraw = true; // 尺寸变化后 onReady 会清画布
+    if (this.selection.selecting) {
+      this.updateSelectionChrome();
+    }
     FrameScheduler.get().wakeup();
   }
 
@@ -893,6 +1095,13 @@ export struct TerminalCanvas {
     this.lastAltScreen = false;
     this.lastMouseMode = 0;
     this.lastScrollbackCount = 0;
+    // notifiedCols/Rows 记的是「已计算并通知页面的尺寸」，换终端后必须清零：
+    // 否则版面在终端 attach 之前就已算出并记账，attach 后 relayout 会因
+    // 「尺寸没变」提前返回，PTY 永远停在 attach 时的 80×24（表现为终端只占版面一角）。
+    this.notifiedCols = 0;
+    this.notifiedRows = 0;
+    this.pendingTerminalResize = false;
+    this.pushDefaultColorsToNative();
     this.relayout(); // autoResizeTerminal 时把当前版面同步给新终端
     FrameScheduler.get().wakeup();
   }
@@ -903,6 +1112,31 @@ export struct TerminalCanvas {
 
   private onVisibleChanged(): void {
     FrameScheduler.get().setVisible(this.schedulerId, this.visible);
+  }
+
+  private onAutoResizeTerminalChanged(): void {
+    if (this.autoResizeTerminal) {
+      this.flushPendingTerminalResize();
+    }
+  }
+
+  private onAutoFocusChanged(): void {
+    if (this.autoFocus) {
+      this.scheduleInputFocus();
+    }
+  }
+
+  /** 等隐藏 TextInput 完成挂载后再请求焦点；标签/窗格切换也复用同一路径。 */
+  private scheduleInputFocus(): void {
+    if (this.inputFocusTimer >= 0) {
+      clearTimeout(this.inputFocusTimer);
+    }
+    this.inputFocusTimer = setTimeout((): void => {
+      this.inputFocusTimer = -1;
+      if (this.autoFocus && this.visible && this.isInputTarget()) {
+        focusControl.requestFocus(this.imeSinkId);
+      }
+    }, 32);
   }
 
   // ---------------------------------------------------------------- 内部装配
@@ -927,10 +1161,23 @@ export struct TerminalCanvas {
       this.selectionArgb = hexColorToArgb(fallback.selectionColor);
     }
     this.backgroundArgb = withOpacity(this.defaultBgArgb, a.backgroundOpacity);
+    this.selectionHandleColor = a.cursorColor;
+    this.pushDefaultColorsToNative();
     this.measureCells();
     this.relayout();
+    if (this.selection.selecting) {
+      this.updateSelectionChrome();
+    }
     this.needsFullRedraw = true;
     FrameScheduler.get().wakeup();
+  }
+
+  /** 外观默认色写进 PTY 网格，字符格底色才跟 Canvas/页面一致。 */
+  private pushDefaultColorsToNative(): void {
+    if (this.terminal === null) {
+      return;
+    }
+    this.terminal.setDefaultColors(this.defaultFgArgb, this.defaultBgArgb);
   }
 
   /**
@@ -947,6 +1194,8 @@ export struct TerminalCanvas {
       return;
     }
     this.measuredFontKey = key;
+    // measureText 的 bounding-box 距离以当前 baseline 为参照，必须先固定为 alphabetic。
+    this.context.textBaseline = 'alphabetic';
     const m = measureTerminalCells(new CanvasTextMeasureContext(this.context), a.fontFamily,
       a.fontSize, a.fontWeight);
     this.fontNormal = m.fontNormal;
@@ -955,7 +1204,7 @@ export struct TerminalCanvas {
     this.fontBoldItalic = m.fontBoldItalic;
     this.context.font = this.fontNormal;
     this.context.textAlign = 'left';
-    this.context.textBaseline = 'middle';
+    this.context.textBaseline = 'alphabetic';
     let glyphWidth = m.glyphWidthVp;
     if (!m.measured) {
       // 字体未注册（启动注册失败的兜底路径）或度量失败的保底格宽。
@@ -964,7 +1213,11 @@ export struct TerminalCanvas {
       this.measuredFontKey = '';
     }
     this.cellWidthVp = glyphWidth + a.letterSpacing;
+    // 字形度量只用于算 baseline，不能反向覆盖用户行高；字体全局框在真机上
+    // 显著大于实际字形，若参与行高会把 1.2 的配置拉大到约 1.8。
     this.cellHeightVp = a.fontSize * a.lineHeight;
+    this.textBaselineOffsetVp = computeBaselineOffsetFromCenter(a.fontSize,
+      m.fontAscentVp, m.fontDescentVp);
     if (m.measured) {
       this.checkCjkAlignment();
     }
@@ -996,10 +1249,16 @@ export struct TerminalCanvas {
       this.areaWidthVp <= 0 || this.areaHeightVp <= 0) {
       return;
     }
-    const metrics = computeTerminalLayout(this.areaWidthVp, this.areaHeightVp,
-      this.appearance.padding, this.cellWidthVp, this.cellHeightVp);
+    // 只改变 Canvas 坐标系内的网格原点和可用行列，绝不靠组件 padding 制造留白。
+    // 对历史上曾保存为 0 的外观也强制保留最低内部留白。
+    const horizontalInset: number =
+      Math.max(MIN_GRID_HORIZONTAL_INSET_VP, this.appearance.padding);
+    const topInset: number = Math.max(MIN_GRID_TOP_INSET_VP, this.appearance.padding);
+    const metrics = computeTerminalLayoutInsets(this.areaWidthVp, this.areaHeightVp,
+      horizontalInset, horizontalInset, topInset, 0, this.cellWidthVp, this.cellHeightVp);
     this.layout = metrics;
     if (metrics.cols === this.notifiedCols && metrics.rows === this.notifiedRows) {
+      this.flushPendingTerminalResize();
       return;
     }
     this.notifiedCols = metrics.cols;
@@ -1007,9 +1266,18 @@ export struct TerminalCanvas {
     // T9：网格尺寸变化后回滚窗口的绝对行号语义失效，回到底部（resize 自愈）
     this.scrollOffsetLines = 0;
     this.onGridSizeChanged(metrics.cols, metrics.rows);
-    if (this.autoResizeTerminal && this.terminal !== null) {
-      this.terminal.resize(metrics.cols, metrics.rows); // 职责边界见文件头注
+    this.pendingTerminalResize = true;
+    this.flushPendingTerminalResize();
+  }
+
+  /** 拖动期多次网格变化只保留最后一次；恢复 autoResize 后同步当前 PTY 尺寸。 */
+  private flushPendingTerminalResize(): void {
+    if (!this.pendingTerminalResize || !this.autoResizeTerminal || this.terminal === null ||
+      this.notifiedCols <= 0 || this.notifiedRows <= 0) {
+      return;
     }
+    this.terminal.resize(this.notifiedCols, this.notifiedRows);
+    this.pendingTerminalResize = false;
   }
 
   private renderEnv(): RowRenderEnv {
@@ -1037,11 +1305,93 @@ export struct TerminalCanvas {
     return italic ? this.fontItalic : this.fontNormal;
   }
 
+  /** 起点手柄：贴在选区第一格左侧，圆钮 + 竖条。 */
+  @Builder
+  SelectionStartHandle() {
+    Row() {
+      Column()
+        .width(HANDLE_KNOB_VP)
+        .height(HANDLE_KNOB_VP)
+        .borderRadius(HANDLE_KNOB_VP / 2)
+        .backgroundColor(this.selectionHandleColor)
+        .border({ width: 2, color: '#FFFFFFFF' })
+      Column()
+        .width(HANDLE_BAR_WIDTH_VP)
+        .height(this.handleBarHeight)
+        .backgroundColor(this.selectionHandleColor)
+        .margin({ left: 1 })
+    }
+    .width(HANDLE_HIT_WIDTH_VP)
+    .height(Math.max(this.handleBarHeight, HANDLE_KNOB_VP))
+    .justifyContent(FlexAlign.End)
+    .alignItems(VerticalAlign.Center)
+    .position({ x: this.startHandleX, y: this.startHandleY })
+    .zIndex(3)
+    .hitTestBehavior(HitTestMode.Default)
+    .gesture(
+      PanGesture()
+        .onActionStart(() => {
+          this.beginHandleDrag('start');
+        })
+        .onActionUpdate((event: GestureEvent) => {
+          this.onHandleDrag(event);
+        })
+        .onActionEnd(() => {
+          this.endHandleDrag();
+        })
+        .onActionCancel(() => {
+          this.endHandleDrag();
+        })
+    )
+  }
+
+  /** 终点手柄：贴在选区末格右侧，竖条 + 圆钮。 */
+  @Builder
+  SelectionEndHandle() {
+    Row() {
+      Column()
+        .width(HANDLE_BAR_WIDTH_VP)
+        .height(this.handleBarHeight)
+        .backgroundColor(this.selectionHandleColor)
+        .margin({ right: 1 })
+      Column()
+        .width(HANDLE_KNOB_VP)
+        .height(HANDLE_KNOB_VP)
+        .borderRadius(HANDLE_KNOB_VP / 2)
+        .backgroundColor(this.selectionHandleColor)
+        .border({ width: 2, color: '#FFFFFFFF' })
+    }
+    .width(HANDLE_HIT_WIDTH_VP)
+    .height(Math.max(this.handleBarHeight, HANDLE_KNOB_VP))
+    .justifyContent(FlexAlign.Start)
+    .alignItems(VerticalAlign.Center)
+    .position({ x: this.endHandleX, y: this.endHandleY })
+    .zIndex(3)
+    .hitTestBehavior(HitTestMode.Default)
+    .gesture(
+      PanGesture()
+        .onActionStart(() => {
+          this.beginHandleDrag('end');
+        })
+        .onActionUpdate((event: GestureEvent) => {
+          this.onHandleDrag(event);
+        })
+        .onActionEnd(() => {
+          this.endHandleDrag();
+        })
+        .onActionCancel(() => {
+          this.endHandleDrag();
+        })
+    )
+  }
+
   build() {
     Stack() {
       Canvas(this.context)
         .width('100%')
         .height('100%')
+        .padding(0)
+        .backgroundColor(this.appearance.background)
         .onReady(() => {
           this.onCanvasReady();
         })
@@ -1051,6 +1401,7 @@ export struct TerminalCanvas {
       // 隐藏 IME 承接框（T6）：1vp 近全透明、不拦截触摸，物理键 IME 前拦截
       ImeInputSink({
         sinkId: this.imeSinkId,
+        autoFocus: this.autoFocus,
         onDelta: this.onImeDelta,
         onInterceptKey: this.onImeInterceptKey
       })
@@ -1083,10 +1434,17 @@ export struct TerminalCanvas {
         .backgroundColor(Tokens.Color.accent)
         .borderRadius(Tokens.radius.md)
         .position({ x: this.selectionMenuX, y: this.selectionMenuY })
+        .zIndex(2)
+      }
+      if (this.selectionHandlesVisible) {
+        this.SelectionStartHandle()
+        this.SelectionEndHandle()
       }
     }
     .width('100%')
     .height('100%')
+    .padding(0)
+    .backgroundColor(this.appearance.background)
     // T8/T9 触摸手势：互斥识别（先识别到的胜出，其余取消）——
     // 快速点按 = 聚焦/退出选择（TapGesture，替代 onClick：长按后的抬指
     // 不会再误触发点击）；按住不动 = 进入选择；直接拖动 = 滚动/拖选；

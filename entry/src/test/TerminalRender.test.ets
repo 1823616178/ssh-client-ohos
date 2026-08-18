@@ -26,7 +26,11 @@ import {
   HARMONY_DARK_PALETTE,
   createDefaultAppearanceProfile
 } from '../main/ets/common/model/models';
-import { TerminalLayoutMetrics, computeTerminalLayout } from '../main/ets/view/terminal/TerminalLayout';
+import {
+  TerminalLayoutMetrics,
+  computeTerminalLayout,
+  computeTerminalLayoutInsets
+} from '../main/ets/view/terminal/TerminalLayout';
 import {
   applyBoldAsBright,
   applyDim,
@@ -39,7 +43,9 @@ import {
   RowRenderEnv,
   buildFontString,
   generateCursorCommands,
-  generateRowsCommands
+  generateRowsCommands,
+  NATIVE_DEFAULT_BG_ARGB,
+  NATIVE_DEFAULT_FG_ARGB
 } from '../main/ets/view/terminal/TerminalDrawCommands';
 import {
   TerminalAppearance,
@@ -123,6 +129,14 @@ export default function terminalRenderTest() {
       const negPad = computeTerminalLayout(800, 600, -5, CELL_W, 16);
       expect(negPad.cols).assertEqual(80);
       expect(negPad.originX).assertEqual(0);
+    });
+
+    it('layout_终端页只保留左右和顶部内边距', 0, () => {
+      const m = computeTerminalLayoutInsets(816, 408, 8, 8, 8, 0, CELL_W, 16);
+      expect(m.cols).assertEqual(80);
+      expect(m.rows).assertEqual(25);
+      expect(m.originX).assertEqual(8);
+      expect(m.originY).assertEqual(8);
     });
 
     // ---------------------------------------------------------------- 颜色
@@ -209,6 +223,19 @@ export default function terminalRenderTest() {
       expect(cmds.texts[0].y).assertEqual(8 + CELL_H / 2);
       expect(cmds.texts[0].cellSpan).assertEqual(4);
       expect(cmds.texts[0].fgArgb).assertEqual(FG);
+    });
+
+    it('指令_native默认黑底替换为外观背景', 0, () => {
+      const grid = makeGrid(1, 2);
+      putCell(grid, 0, 0x41, NATIVE_DEFAULT_FG_ARGB, NATIVE_DEFAULT_BG_ARGB, 0);
+      putCell(grid, 1, 0x42, NATIVE_DEFAULT_FG_ARGB, 0xFF112233, 0);
+      const cmds = generateRowsCommands(grid, 0, 1, 2, makeEnv());
+      expect(cmds.backgrounds.length).assertEqual(1);
+      expect(cmds.backgrounds[0].argb).assertEqual(0xFF112233);
+      expect(cmds.backgrounds[0].x).assertEqual(8 + CELL_W);
+      expect(cmds.texts.length).assertEqual(2);
+      expect(cmds.texts[0].fgArgb).assertEqual(FG);
+      expect(cmds.texts[1].fgArgb).assertEqual(FG);
     });
 
     it('指令_默认背景段不产出背景指令', 0, () => {
@@ -385,11 +412,13 @@ export default function terminalRenderTest() {
 
     // ---------------------------------------------------------------- 字体串与外观
 
+    // buildFontString 现在恒在字族栈末尾兜通用 monospace：真机 Canvas 解析不到
+    // registerFont 注册的自定义字族（度量与不存在的字体名一致），只有通用族名可靠。
     it('buildFontString_组合', 0, () => {
       expect(buildFontString(false, false, 400, 14, 'JetBrains Mono'))
-        .assertEqual('normal normal 14vp "JetBrains Mono"');
+        .assertEqual('normal normal 14vp "JetBrains Mono", monospace');
       expect(buildFontString(true, true, 400, 14, 'JetBrains Mono'))
-        .assertEqual('italic bold 14vp "JetBrains Mono"');
+        .assertEqual('italic bold 14vp "JetBrains Mono", monospace');
       expect(buildFontString(false, false, 500, 12, 'monospace'))
         .assertEqual('normal 500 12vp "monospace"');
     });
@@ -397,9 +426,9 @@ export default function terminalRenderTest() {
     it('buildFontString_字族栈逐项加引号', 0, () => {
       // T5：逗号分隔的字族栈须逐项加引号，整串加引号会被当成单个含逗号的字族名
       expect(buildFontString(false, false, 400, 14, 'JetBrains Mono, Sarasa Term SC'))
-        .assertEqual('normal normal 14vp "JetBrains Mono", "Sarasa Term SC"');
+        .assertEqual('normal normal 14vp "JetBrains Mono", "Sarasa Term SC", monospace');
       expect(buildFontString(false, true, 400, 14, 'JetBrains Mono,Sarasa Term SC'))
-        .assertEqual('normal bold 14vp "JetBrains Mono", "Sarasa Term SC"');
+        .assertEqual('normal bold 14vp "JetBrains Mono", "Sarasa Term SC", monospace');
     });
 
     it('外观_默认值与C3一致', 0, () => {

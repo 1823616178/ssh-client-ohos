@@ -11,6 +11,8 @@
  */
 #pragma once
 
+#include "sync_params.h"
+
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,10 +20,7 @@
 namespace sshclient {
 namespace crypto {
 
-// DESIGN §6.2 的三个域分隔字符串。其它代码只准引用这些常量，不得再写字面量。
-inline constexpr std::string_view kAadDomainSyncDocument = "ssh-client-ohos/sync-document/v1";
-inline constexpr std::string_view kAadDomainVaultKeyPassword = "ssh-client-ohos/vault-key/password/v1";
-inline constexpr std::string_view kAadDomainVaultKeyRecovery = "ssh-client-ohos/vault-key/recovery/v1";
+// 三个 AAD 域字符串的唯一出处是 sync_params.h（S1）。此处不再重复定义。
 
 // 通用编码：<domain>|<len1>:<value1>|<len2>:<value2>...
 // fields 为空时返回 domain 本身（无尾部分隔符）。长度取 UTF-8 字节数（string_view::size）。

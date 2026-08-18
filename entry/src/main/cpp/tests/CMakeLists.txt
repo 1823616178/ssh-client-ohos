@@ -58,6 +58,7 @@ set(CPP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # NATIVE_SOURCES（同一份文件，两处编译）。
 set(TESTED_SOURCES
     ${CPP_ROOT}/crypto/aad.cpp
+    ${CPP_ROOT}/crypto/vault.cpp
     ${CPP_ROOT}/io/EventLoop.cpp
     ${CPP_ROOT}/io/SessionThread.cpp
     ${CPP_ROOT}/bridge/data_aggregator.cpp
@@ -91,6 +92,8 @@ if(CMAKE_CROSSCOMPILING)
     # T1：term/ 的 libvterm 复用仓库 prebuilt（OHOS target，只编不跑）
     set(VTERM_INCLUDE_DIR ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/include)
     set(VTERM_LIBS ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libvterm.a)
+    set(ARGON2_INCLUDE_DIR ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/include)
+    set(ARGON2_LIBS ${CPP_ROOT}/prebuilt/${OHOS_ARCH}/lib/libargon2.a)
 else()
     if(NOT EXISTS "${SSH_TESTS_HOST_LIBSSH2}/lib/libssh2.a"
             OR NOT EXISTS "${SSH_TESTS_HOST_LIBSSH2}/include/libssh2.h")
@@ -115,6 +118,25 @@ else()
     endif()
     set(VTERM_INCLUDE_DIR ${SSH_TESTS_HOST_LIBVTERM}/include)
     set(VTERM_LIBS ${SSH_TESTS_HOST_LIBVTERM}/lib/libvterm.a)
+
+    # S2：宿主机 libargon2（apt install libargon2-dev，或源码装到 host-deps/argon2）
+    find_path(ARGON2_INCLUDE_DIR argon2.h)
+    find_library(ARGON2_LIB argon2)
+    if(NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIB)
+        set(SSH_TESTS_HOST_ARGON2 "$ENV{HOME}/ohos-probe/build/host-deps/argon2"
+            CACHE PATH "宿主机版 libargon2 安装前缀")
+        if(EXISTS "${SSH_TESTS_HOST_ARGON2}/include/argon2.h"
+                AND EXISTS "${SSH_TESTS_HOST_ARGON2}/lib/libargon2.a")
+            set(ARGON2_INCLUDE_DIR ${SSH_TESTS_HOST_ARGON2}/include)
+            set(ARGON2_LIB ${SSH_TESTS_HOST_ARGON2}/lib/libargon2.a)
+        endif()
+    endif()
+    if(NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIB)
+        message(FATAL_ERROR
+            "找不到宿主机 libargon2（argon2.h / libargon2）。\n"
+            "请 apt install libargon2-dev，或把静态库装到 ~/ohos-probe/build/host-deps/argon2。")
+    endif()
+    set(ARGON2_LIBS ${ARGON2_LIB})
 endif()
 
 add_executable(ssh_core_tests
@@ -134,9 +156,12 @@ add_executable(ssh_core_tests
     vterm_screen_test.cpp
     scrollback_test.cpp
     frame_sync_test.cpp
+    vault_test.cpp
+    vault_ops_test.cpp
     ${TESTED_SOURCES}
 )
-target_include_directories(ssh_core_tests PRIVATE ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR} ${VTERM_INCLUDE_DIR})
+target_include_directories(ssh_core_tests PRIVATE
+    ${CPP_ROOT} ${LIBSSH2_INCLUDE_DIR} ${VTERM_INCLUDE_DIR} ${ARGON2_INCLUDE_DIR})
 if(SSH_TESTS_INTEGRATION)
     target_compile_definitions(ssh_core_tests PRIVATE SSH_TESTS_INTEGRATION=1)
 endif()
@@ -145,7 +170,8 @@ endif()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 # 链接顺序：被测对象 → vterm → libssh2 → crypto/z → gtest（静态库依赖者在前）
-target_link_libraries(ssh_core_tests PRIVATE ${VTERM_LIBS} ${LIBSSH2_LIBS} ${GTEST_LIBS} Threads::Threads)
+target_link_libraries(ssh_core_tests PRIVATE
+    ${VTERM_LIBS} ${LIBSSH2_LIBS} ${ARGON2_LIBS} ${GTEST_LIBS} Threads::Threads)
 
 # 交叉编译（ohos target）时测试二进制无法在宿主机执行，不能在建后跑 --gtest_list_tests
 if(NOT CMAKE_CROSSCOMPILING)

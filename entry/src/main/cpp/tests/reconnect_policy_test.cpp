@@ -10,6 +10,9 @@
  *   KeepaliveMissTracker / keepaliveInboundObserved（ssh/keepalive.h）：
  *     - 连续无入站达到阈值判黑洞；有入站即清零；maxMisses=0 只发不判；1 = 一次即判
  *     - 入站观测合并：fd 事件标志 / 待读字节增长 两信号取或
+ *   KeepaliveProbe（ssh/keepalive.h，P1 网络切换主动探测的判定窗口）：
+ *     - 开窗/关窗与基线记录；到期裁决与周期判定同信号；重开窗即换基线
+ *     - 「libssh2 跳过本次发送」时沿用旧基线，在途应答仍算存活证据
  *   isAutoReconnectable（ssh/session.h）：
  *     - disconnected 一律可重连；error 按链路类/凭据类分；closed 与非终态不可
  *   SshSessionOptions 默认值（30 s / 3 次，DESIGN §7.1）
@@ -29,6 +32,7 @@
 
 using sshclient::ssh::BackoffSchedule;
 using sshclient::ssh::KeepaliveMissTracker;
+using sshclient::ssh::KeepaliveProbe;
 using sshclient::ssh::SshSessionError;
 using sshclient::ssh::SshSessionOptions;
 using sshclient::ssh::SshSessionState;
@@ -182,6 +186,63 @@ TEST(KeepaliveInboundObservedTest, EventFlagOrPendingGrowth)
     EXPECT_FALSE(keepaliveInboundObserved(false, 48, 48));
     EXPECT_FALSE(keepaliveInboundObserved(false, 0, 48));
     EXPECT_FALSE(keepaliveInboundObserved(false, 0, 0));
+}
+
+// ================================================================== KeepaliveProbe（P1 探测窗口）
+
+TEST(KeepaliveProbeTest, InactiveUntilArmed)
+{
+    KeepaliveProbe probe;
+    EXPECT_FALSE(probe.active());
+    probe.arm(48);
+    EXPECT_TRUE(probe.active());
+    EXPECT_EQ(probe.baseline(), 48);
+    probe.disarm();
+    EXPECT_FALSE(probe.active());
+    EXPECT_EQ(probe.baseline(), 48); // disarm 只关窗，基线保留供到期裁决读取
+}
+
+TEST(KeepaliveProbeTest, VerdictFollowsInboundObservation)
+{
+    KeepaliveProbe probe;
+    probe.arm(48);
+    // 窗口内有 EPOLLIN（有通道时探测应答被通道泵送抽干）→ 存活
+    EXPECT_TRUE(probe.verdictAlive(true, 48));
+    // 无事件但待读字节增长（无通道时应答留在内核缓冲）→ 存活
+    EXPECT_TRUE(probe.verdictAlive(false, 96));
+    // 无事件且字节数不涨（含回落）→ 黑洞：切网后旧 socket 收不到任何应答的典型形态
+    EXPECT_FALSE(probe.verdictAlive(false, 48));
+    EXPECT_FALSE(probe.verdictAlive(false, 0));
+}
+
+TEST(KeepaliveProbeTest, RearmResetsBaseline)
+{
+    KeepaliveProbe probe;
+    probe.arm(48);
+    EXPECT_FALSE(probe.verdictAlive(false, 48));
+    // 第二次探测以新基线开窗：同样的 96 字节，相对新基线不再算增长
+    probe.arm(96);
+    EXPECT_EQ(probe.baseline(), 96);
+    EXPECT_FALSE(probe.verdictAlive(false, 96));
+    EXPECT_TRUE(probe.verdictAlive(false, 97));
+}
+
+TEST(KeepaliveProbeTest, StaleBaselineKeepsInFlightReplyAsEvidence)
+{
+    // session.cpp doProbeNow 的 willSend == false 分支：libssh2 会跳过本次发送时
+    // 沿用旧基线，上一拍应答落地即算存活证据（重置基线会把它抹掉造成误判）
+    KeepaliveProbe probe;
+    const long staleBaseline = 48;
+    probe.arm(staleBaseline);
+    EXPECT_TRUE(probe.verdictAlive(false, 64)); // 上一拍的应答落在窗口内
+}
+
+TEST(KeepaliveProbeTest, DefaultTimeoutMatchesAcceptance)
+{
+    // TASKS.md P1「WiFi ⇄ 蜂窝切换 5 s 内触发重连」
+    EXPECT_EQ(sshclient::ssh::kDefaultKeepaliveProbeTimeoutSec, 5u);
+    // libssh2 1.11.1 keepalive.c 的最小周期（doProbeNow 借它逼出发送）
+    EXPECT_EQ(sshclient::ssh::kLibssh2MinKeepaliveIntervalSec, 2u);
 }
 
 // ================================================================== isAutoReconnectable

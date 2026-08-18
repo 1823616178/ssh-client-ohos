@@ -33,6 +33,12 @@ export enum SshErrorCode {
   AUTH_PASSPHRASE_FAILED = 204,
   /** 认证超时（对端在认证期不应答） */
   AUTH_TIMEOUT = 205,
+  /**
+   * 本机凭据库里没有该主机的凭据（native 不产出，纯上层编排码）。
+   * 与 AUTH_* 系列的区别：不是服务器拒绝，而是压根还没拿到凭据——
+   * 上层据此弹出输入框补录，而不是当成连接失败。
+   */
+  CREDENTIAL_MISSING = 206,
   /** 算法协商失败 */
   ALGORITHM_NEGOTIATION_FAILED = 301,
   /** 主机密钥未知（TOFU 待用户确认；native 不产出，由上层编排使用） */
@@ -135,6 +141,8 @@ export class SshError extends Error {
         return '私钥解密失败，请检查私钥密码短语或私钥文件是否损坏';
       case SshErrorCode.AUTH_TIMEOUT:
         return '认证超时，服务器在认证过程中未应答';
+      case SshErrorCode.CREDENTIAL_MISSING:
+        return '本机还没有保存该主机的凭据';
       case SshErrorCode.ALGORITHM_NEGOTIATION_FAILED:
         return '加密算法协商失败，客户端与服务器无共同支持的算法';
       case SshErrorCode.HOST_KEY_UNKNOWN:

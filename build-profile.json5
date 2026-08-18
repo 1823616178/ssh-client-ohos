@@ -1,6 +1,20 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\lx182\\.ohos\\config\\default_ssh_client_ohos_CUvYij5uV72oITJNfzTkzFlPzcWIzI5GmLxqQ4X5N6s=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B4E5E93E2A0A1FA5A0795F7218187BFF95447DBB840E82F3493704F671A7FF694ABF418504B9B5B",
+          "profile": "C:\\Users\\lx182\\.ohos\\config\\default_ssh_client_ohos_CUvYij5uV72oITJNfzTkzFlPzcWIzI5GmLxqQ4X5N6s=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\lx182\\.ohos\\config\\default_ssh_client_ohos_CUvYij5uV72oITJNfzTkzFlPzcWIzI5GmLxqQ4X5N6s=.p12",
+          "storePassword": "0000001B4C36ACBBB505A112900C3D6A6B6ADB37BD76E32FF3B9F968AF36B974466448A82EF771CE5B7DC8"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",

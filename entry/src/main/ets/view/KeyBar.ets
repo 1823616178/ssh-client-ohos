@@ -10,7 +10,7 @@
  *  - 组件 KeyBar：横向 Scroll + 等高等宽键位；Ctrl/Alt 键点击=tap、长按=lock
  *    （StickyModifiers 三态状态机），高亮态用 app_accent，切换时轻震
  *    （vibrateLight，设备不支持时静默降级）；
- *  - 键高 40vp、横向滑动，满足「单手可完成 Ctrl+C / Ctrl+Z / Esc / Tab 补全」：
+ *  - 可见键面 34vp、横向滑动，紧凑但保留外层触摸空间：
  *    Ctrl+C 路径 = 点 Ctrl（高亮）→ 软键盘敲 C（T6 IME 出口消费粘滞 → 0x03）；
  *    也可在自定义布局里直接放字母键。
  *
@@ -47,11 +47,19 @@ import { StickyModifiers, StickyState } from './terminal/StickyModifiers';
 import { vibrateLight } from '../common/utils/Haptics';
 import { Logger } from '../common/utils/Logger';
 import { Tokens } from '../theme/Tokens';
+import { TerminalClipboardAction } from './terminal/TerminalActionHub';
+import {
+  TerminalAppearance,
+  createDefaultTerminalAppearance
+} from './terminal/TerminalAppearance';
 
 // ---------------------------------------------------------------- 键位模型与默认布局
 
-/** 键位类别：char=直接字符 / keyCode=经 KeyMap 映射的功能键 / ctrl/alt=粘滞修饰 */
-export type KeyBarKeyKind = 'char' | 'keyCode' | 'ctrl' | 'alt';
+/**
+ * 键位类别：char=直接字符 / keyCode=经 KeyMap 映射的功能键 / ctrl/alt=粘滞修饰 /
+ * copy|paste=剪贴板动作（不产出字节，经 onAction 交给宿主的终端画布执行）
+ */
+export type KeyBarKeyKind = 'char' | 'keyCode' | 'ctrl' | 'alt' | 'copy' | 'paste';
 
 /** 一个键位（自定义布局 JSON 反序列化结果；字段补全为完整形态便于渲染） */
 export interface KeyBarKeySpec {
@@ -87,7 +95,9 @@ export const DEFAULT_KEY_BAR_LAYOUT: KeyBarKeySpec[] = [
   makeCharKey('-'),
   makeCharKey('|'),
   makeCharKey('~'),
-  makeCharKey('/')
+  makeCharKey('/'),
+  { id: 'copy', label: '复制', kind: 'copy', char: '', keyCode: 0 },
+  { id: 'paste', label: '粘贴', kind: 'paste', char: '', keyCode: 0 }
 ];
 
 /** 自定义布局里可按名引用的已知功能键（key 字段 → 规格；char 键走另一条路径） */
@@ -121,6 +131,10 @@ function knownKeySpec(name: string): KeyBarKeySpec | null {
       return makeKeyCodeKey('enter', '⏎', KEY_ENTER);
     case 'backspace':
       return makeKeyCodeKey('backspace', '⌫', KEY_BACKSPACE);
+    case 'copy':
+      return { id: 'copy', label: '复制', kind: 'copy', char: '', keyCode: 0 };
+    case 'paste':
+      return { id: 'paste', label: '粘贴', kind: 'paste', char: '', keyCode: 0 };
     default:
       return null;
   }
@@ -210,14 +224,32 @@ export function keyBarBytesForKey(spec: KeyBarKeySpec, ctrl: boolean, alt: boole
 
 // ---------------------------------------------------------------- 组件
 
-/** 键高（vp）：单手拇指可达的紧凑尺寸（DESIGN §4.4 底栏） */
-const KEY_HEIGHT_VP = 40;
+/** 可见键面更紧凑；外层键栏仍提供足够的纵向触摸区域。 */
+const KEY_HEIGHT_VP = 34;
 /** 键最小宽度（vp） */
-const KEY_MIN_WIDTH_VP = 44;
+const KEY_MIN_WIDTH_VP = 40;
 /** 键间距（vp） */
-const KEY_SPACE_VP = 6;
+const KEY_SPACE_VP = 4;
 /** 锁定态描边宽（vp）：与 pressed 态区分（pressed 无描边） */
 const KEY_LOCKED_BORDER_VP = 2;
+/** 键面底色：叠在终端背景上的低透明度白，深/浅终端外观下都能与底色拉开层次 */
+const KEY_FACE_DARK_OVERLAY = '#26FFFFFF';
+const KEY_FACE_LIGHT_OVERLAY = '#1F000000';
+
+function terminalBackgroundIsDark(color: string): boolean {
+  if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
+    return true;
+  }
+  const red: number = parseInt(color.substring(1, 3), 16);
+  const green: number = parseInt(color.substring(3, 5), 16);
+  const blue: number = parseInt(color.substring(5, 7), 16);
+  return red * 299 + green * 587 + blue * 114 < 128000;
+}
+
+/** 终端背景明暗 → 键面叠加色；导出供纯逻辑测试覆盖浅色主题适配。 */
+export function keyFaceOverlayForBackground(color: string): string {
+  return terminalBackgroundIsDark(color) ? KEY_FACE_DARK_OVERLAY : KEY_FACE_LIGHT_OVERLAY;
+}
 
 @Component
 export struct KeyBar {
@@ -234,6 +266,16 @@ export struct KeyBar {
   stickyModifiers: StickyModifiers = new StickyModifiers();
   /** 字节发送出口：宿主路由到聚焦窗格（TerminalCanvas.sendExternalInput） */
   onSendBytes: (bytes: Uint8Array) => void = () => {};
+  /**
+   * 剪贴板动作出口（复制/粘贴不产字节）：宿主按聚焦 paneId 经
+   * TerminalActionHub 转给对应画布执行
+   */
+  onClipboardAction: (action: TerminalClipboardAction) => void = () => {};
+  /**
+   * 终端外观：键条紧贴终端画布，配色必须取终端外观而非跟随系统色彩模式的
+   * Design Token——浅色模式下 Token 会把键面画成白底黑字，与深色终端割裂。
+   */
+  @Prop appearance: TerminalAppearance = createDefaultTerminalAppearance();
 
   @State private keys: KeyBarKeySpec[] = DEFAULT_KEY_BAR_LAYOUT;
   // StickyModifiers 非 @Observed：点击后手动读回状态驱动高亮刷新
@@ -264,6 +306,11 @@ export struct KeyBar {
     if (spec.kind === 'alt') {
       this.stickyModifiers.tapAlt();
       this.syncModifierStates();
+      vibrateLight(this.hapticEnabled);
+      return;
+    }
+    if (spec.kind === 'copy' || spec.kind === 'paste') {
+      this.onClipboardAction(spec.kind);
       vibrateLight(this.hapticEnabled);
       return;
     }
@@ -300,6 +347,14 @@ export struct KeyBar {
     return false;
   }
 
+  /**
+   * 键面底色：终端背景之上抬一档亮度的半透明白，深浅色终端外观下都自洽，
+   * 不引入新的 Design Token 也不跟随系统色彩模式。
+   */
+  private keyFaceColor(): string {
+    return keyFaceOverlayForBackground(this.appearance.background);
+  }
+
   private isModifierLocked(spec: KeyBarKeySpec): boolean {
     if (spec.kind === 'ctrl') {
       return this.ctrlState === StickyState.LOCKED;
@@ -317,15 +372,15 @@ export struct KeyBar {
           Text(spec.label)
             .height(KEY_HEIGHT_VP)
             .constraintSize({ minWidth: KEY_MIN_WIDTH_VP })
-            .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
+            .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
             .fontSize(Tokens.fontSize.body)
-            .fontColor(this.isModifierActive(spec) ? Tokens.Color.appBg : Tokens.Color.text)
+            .fontColor(this.isModifierActive(spec) ? '#08131A' : this.appearance.foreground)
             .textAlign(TextAlign.Center)
-            .backgroundColor(this.isModifierActive(spec) ? Tokens.Color.accent : Tokens.Color.surface)
+            .backgroundColor(this.isModifierActive(spec) ? Tokens.Color.accent : this.keyFaceColor())
             .borderRadius(Tokens.radius.sm)
             .border({
               width: this.isModifierLocked(spec) ? KEY_LOCKED_BORDER_VP : 0,
-              color: Tokens.Color.text
+              color: this.appearance.foreground
             })
             .gesture(
               // 互斥识别：快速点按 = tap，按住超阈值 = lock（长按仅修饰键响应）
@@ -342,11 +397,12 @@ export struct KeyBar {
             )
         }, (spec: KeyBarKeySpec) => spec.id)
       }
-      .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
+      .padding({ left: Tokens.space.xs, right: Tokens.space.xs, top: 4, bottom: 4 })
     }
     .scrollable(ScrollDirection.Horizontal)
     .scrollBar(BarState.Off)
     .align(Alignment.Start)
     .width('100%')
+    .backgroundColor(this.appearance.background)
   }
 }

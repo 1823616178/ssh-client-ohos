@@ -43,6 +43,11 @@ scripts/                       交叉编译、native 单测、CI 门禁脚本
 
 ## 硬性约束
 
-- **不改外部仓库**：`E:\code\ssh-tool` 与 `G:\code\ssh-tool-server` 一行不改；同步后端按原样复用，本项目用独立账号接入。
+- **不改外部仓库**：`E:\code\ssh-tool` 与 `G:\code\ssh-tool-server` 一行不改；同步后端按原样复用。
+- **与桌面端共用同步格式**：保险库与同步文档跟桌面端 ssh-tool 完全互通（同账号双向同步），
+  故 AAD 域用 `ssh-port-mapper/*`、恢复密钥前缀 `SPM1`，文档必须严格产出桌面端的 `SyncDocumentV1`
+  （`E:\code\ssh-tool\src\shared\sync-schemas.ts` 是 `z.strictObject`，多一个键对端会整份拒绝）。
+  只同步「主机基础字段 / 端口转发 / 分组」交集；外观、片段、known_hosts、跳板、初始命令、
+  环境变量、终端类型等为本机专有，不上云，且**下行时不得被覆盖清空**。
 - **禁止硬编码颜色/尺寸**：组件中不得出现魔法数字，一律使用 Design Token（`resources` 的 `color.json` / `float.json` 与 `theme/` 封装）。
 - **日志脱敏**：不记录密码、token、私钥、请求体与同步密文。

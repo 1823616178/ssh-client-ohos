@@ -22,6 +22,10 @@ import hostEditViewModelTest from './HostEditViewModel.test';
 import terminalViewModelTest from './TerminalViewModel.test';
 import paneTreeTest from './PaneTree.test';
 import shortcutMapTest from './ShortcutMap.test';
+import syncProtocolTest from './SyncProtocol.test';
+import syncLayerTest from './SyncLayer.test';
+import hexColorTest from './HexColor.test';
+import backgroundKeepAliveTest from './BackgroundKeepAlive.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -49,4 +53,8 @@ export default function testsuite() {
   terminalViewModelTest();
   paneTreeTest();
   shortcutMapTest();
+  syncProtocolTest();
+  syncLayerTest();
+  hexColorTest();
+  backgroundKeepAliveTest();
 }

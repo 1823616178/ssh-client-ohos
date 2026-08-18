@@ -14,6 +14,7 @@ set(NATIVE_SOURCES
     bridge/data_aggregator.cpp
     bridge/session_bridge.cpp
     bridge/terminal_bridge.cpp
+    bridge/vault_bridge.cpp
     # ssh/
     ssh/session.cpp
     ssh/hostkey.cpp
@@ -27,6 +28,7 @@ set(NATIVE_SOURCES
     term/frame_sync.cpp
     # crypto/
     crypto/aad.cpp
+    crypto/vault.cpp
     # io/
     io/EventLoop.cpp
     io/SessionThread.cpp
@@ -44,7 +46,7 @@ foreach(lib IN ITEMS ssh2 vterm argon2 crypto)
         IMPORTED_LOCATION ${PREBUILT_DIR}/lib/lib${lib}.a)
 endforeach()
 
-target_include_directories(ssh_core PRIVATE ${PREBUILT_DIR}/include)
+target_include_directories(ssh_core PRIVATE ${PREBUILT_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
 
 # 链接顺序：依赖者在前。libssh2 依赖 libcrypto 与 z；vterm/argon2 独立；
 # ace_napi.z 为 NAPI 运行时，hilog_ndk.z 供后续日志封装使用。

@@ -5,8 +5,8 @@
  * TerminalCanvas 改为调用这里的函数（本模块不感知组件，hypium 可注入假 ctx 直测）。
  *
  * 缓存策略：
- *  - measureText('W') 的宽度按「字族|字号|字重」缓存（模块级 Map，多 Canvas 实例共享；
- *    同一 font 字符串在不同 ctx 上测得宽度一致，故可跨实例复用）；
+ *  - measureText('W') 的宽度与字体 ascent/descent 按「字族|字号|字重」缓存
+ *    （模块级 Map，多 Canvas 实例共享；同一 font 字符串可跨实例复用）；
  *  - letterSpacing / lineHeight 不进缓存 key——它们不影响字形宽度，
  *    格宽 = 字宽 + letterSpacing、格高 = fontSize × lineHeight 由调用方换算；
  *  - 度量失败（字体未注册等，宽度非正或抛异常）不写缓存，下次调用自动重测；
@@ -22,6 +22,11 @@ import { buildFontString } from './TerminalDrawCommands';
 /** measureText 返回值的最小形状（Canvas SizeOptions 结构兼容） */
 export interface TextMeasureResult {
   width: number;
+  /** 字形与字体全局上伸/下伸；旧设备或测试假实现可缺省，调用方会走比例兜底。 */
+  actualBoundingBoxAscent?: number;
+  actualBoundingBoxDescent?: number;
+  fontBoundingBoxAscent?: number;
+  fontBoundingBoxDescent?: number;
 }
 
 /** 可注入的度量上下文：CanvasRenderingContext2D 的度量子集（测试用假实现注入） */
@@ -38,6 +43,9 @@ export interface TerminalCellMetrics {
   fontBoldItalic: string;
   /** 实测字形宽（vp，不含 letterSpacing）；measured=false 时为 0 */
   glyphWidthVp: number;
+  /** alphabetic baseline 上下的代表性字形包围盒，用于在 cell 内垂直居中。 */
+  fontAscentVp: number;
+  fontDescentVp: number;
   /** false = measureText 失败/宽度非正（字体未注册），调用方走保底宽度且不落定缓存 key */
   measured: boolean;
 }
@@ -53,13 +61,34 @@ export interface CjkAlignmentResult {
 
 /** 度量探针：等宽字体 cell 宽 = 'W' 的 advance width */
 const MEASURE_PROBE_ASCII = 'W';
+/** 垂直探针：M 覆盖大写上伸，g 覆盖小写下伸，比字体全局框更接近视觉边界。 */
+const MEASURE_PROBE_VERTICAL = 'Mg';
 /** CJK 对齐校验探针 */
 const MEASURE_PROBE_CJK = '中';
 /** CJK 对齐容差：|cjk − 2×ascii| ≤ 2×ascii × 5% 视为对齐（Sarasa 设计保证严格 1:2，容差防浮点抖动） */
 export const CJK_ALIGNMENT_TOLERANCE = 0.05;
 
 /** 字形宽缓存：key 见 fontMeasureKey；只缓存成功度量 */
-const widthCache: Map<string, number> = new Map();
+interface CachedFontMeasure {
+  width: number;
+  ascent: number;
+  descent: number;
+}
+
+const widthCache: Map<string, CachedFontMeasure> = new Map();
+
+/**
+ * alphabetic baseline 相对 cell 几何中心的下移量。
+ * 字体度量可用时严格按 (ascent-descent)/2 居中；不可用时采用常见 0.8/0.2
+ * em 比例，仍比 Canvas 的 middle baseline 在 HarmonyOS 上稳定。
+ */
+export function computeBaselineOffsetFromCenter(fontSizeVp: number, ascentVp: number,
+  descentVp: number): number {
+  if (ascentVp > 0 && descentVp >= 0 && ascentVp + descentVp > 0) {
+    return (ascentVp - descentVp) / 2;
+  }
+  return Math.max(0, fontSizeVp) * 0.3;
+}
 
 /** 度量缓存 key：字族 + 字号 + 字重 */
 export function fontMeasureKey(fontFamily: string, fontSizeVp: number, fontWeight: number): string {
@@ -84,25 +113,52 @@ export function measureTerminalCells(ctx: TextMeasureContext, fontFamily: string
     fontItalic: buildFontString(true, false, fontWeight, fontSizeVp, fontFamily),
     fontBoldItalic: buildFontString(true, true, fontWeight, fontSizeVp, fontFamily),
     glyphWidthVp: 0,
+    fontAscentVp: 0,
+    fontDescentVp: 0,
     measured: false
   };
   const key = fontMeasureKey(fontFamily, fontSizeVp, fontWeight);
   const cached = widthCache.get(key);
   if (cached !== undefined) {
-    metrics.glyphWidthVp = cached;
+    metrics.glyphWidthVp = cached.width;
+    metrics.fontAscentVp = cached.ascent;
+    metrics.fontDescentVp = cached.descent;
     metrics.measured = true;
     return metrics;
   }
   ctx.font = metrics.fontNormal;
   let width = 0;
+  let ascent = 0;
+  let descent = 0;
   try {
-    width = ctx.measureText(MEASURE_PROBE_ASCII).width;
+    const measured = ctx.measureText(MEASURE_PROBE_ASCII);
+    width = measured.width;
+    // 旧实现/设备没有 actualBoundingBox 时，先以字体全局框作后备。
+    const measuredAscent = measured.fontBoundingBoxAscent;
+    const measuredDescent = measured.fontBoundingBoxDescent;
+    if (measuredAscent !== undefined && measuredAscent > 0) {
+      ascent = measuredAscent;
+    }
+    if (measuredDescent !== undefined && measuredDescent >= 0) {
+      descent = measuredDescent;
+    }
+    const vertical = ctx.measureText(MEASURE_PROBE_VERTICAL);
+    const actualAscent = vertical.actualBoundingBoxAscent;
+    const actualDescent = vertical.actualBoundingBoxDescent;
+    if (actualAscent !== undefined && actualAscent > 0) {
+      ascent = actualAscent;
+    }
+    if (actualDescent !== undefined && actualDescent >= 0) {
+      descent = actualDescent;
+    }
   } catch (e) {
     Logger.warn(`FontMetrics measureText 失败：${JSON.stringify(e)}`, 'Terminal');
   }
   if (width > 0) {
-    widthCache.set(key, width);
+    widthCache.set(key, { width: width, ascent: ascent, descent: descent });
     metrics.glyphWidthVp = width;
+    metrics.fontAscentVp = ascent;
+    metrics.fontDescentVp = descent;
     metrics.measured = true;
   }
   return metrics;

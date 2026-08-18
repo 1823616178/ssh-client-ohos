@@ -24,12 +24,13 @@
  *     若不上报则退化为候选字母直发（可接受降级，不丢字不错字）；
  *   - onKeyPreIme 对 F1–F12/方向键的拦截率（不同外接键盘）。
  */
-import { util } from '@kit.ArkTS';
-import { mapPrintableChar } from './KeyMap';
+import { mapPrintableChar, utf8Bytes } from './KeyMap';
 import { StickySnapshot } from './StickyModifiers';
 
 const DEL = 0x7F;
 const ESC = 0x1B;
+/** 隐藏 TextInput 的已提交文本上限；到阈值即清空，避免长会话 diff 退化。 */
+export const IME_BUFFER_RESET_THRESHOLD = 64;
 
 /** IME 一次提交的内容增量（extractCommittedDelta 输出） */
 export interface CommittedDelta {
@@ -110,7 +111,7 @@ export function committedDeltaToInputBytes(delta: CommittedDelta,
       }
       push(mapped);
     } else {
-      push(util.TextEncoder.create('utf-8').encodeInto(delta.text));
+      push(utf8Bytes(delta.text));
     }
   }
   const out = new Uint8Array(total);
@@ -132,6 +133,8 @@ export function committedDeltaToInputBytes(delta: CommittedDelta,
 export struct ImeInputSink {
   /** 全局唯一组件 id（focusControl.requestFocus 用）；由宿主注入保证多窗格唯一 */
   sinkId: string = '';
+  /** true 时组件首次挂载即取得输入焦点并拉起软键盘。 */
+  autoFocus: boolean = false;
   /** 提交增量回调（宿主负责：粘滞修饰 → 字节 → 按焦点路由写入通道） */
   onDelta: (delta: CommittedDelta) => void = () => {};
   /**
@@ -143,6 +146,8 @@ export struct ImeInputSink {
   private controller: TextInputController = new TextInputController();
   /** 上次已提交基线（候选期不更新，见头注） */
   private lastValue: string = '';
+  /** controller.deleteText 产生的空值 onChange 只同步基线，不转成退格发送。 */
+  private resettingBuffer: boolean = false;
 
   /** 请求软键盘焦点（点击窗格时调用）；id 未配置时静默忽略 */
   requestFocus(): void {
@@ -152,6 +157,14 @@ export struct ImeInputSink {
   }
 
   private handleChange(value: string, previewText?: PreviewText): void {
+    if (this.resettingBuffer) {
+      this.resettingBuffer = false;
+      if (value.length === 0) {
+        this.lastValue = '';
+        return;
+      }
+      // 少数输入法不回调清空态而直接回调下一字符；从空基线继续正常处理。
+    }
     const previewActive = previewText !== undefined && previewText.value.length > 0;
     const delta = extractCommittedDelta(this.lastValue, value, previewActive);
     if (!previewActive) {
@@ -159,6 +172,13 @@ export struct ImeInputSink {
     }
     if (delta !== null) {
       this.onDelta(delta);
+    }
+    if (!previewActive && value.length >= IME_BUFFER_RESET_THRESHOLD) {
+      // 只在候选提交结束后清理，绝不打断中文 composition。先清逻辑基线，再删
+      // TextInput 内容；随后产生的 value='' 回调由 resettingBuffer 吞掉。
+      this.lastValue = '';
+      this.resettingBuffer = true;
+      this.controller.deleteText({ start: 0, end: value.length });
     }
   }
 
@@ -170,6 +190,7 @@ export struct ImeInputSink {
       .opacity(0.01) // 保持 focusable 的最小可见度（0 会被渲染管线裁掉）
       .showUnderline(false)
       .enableKeyboardOnFocus(true)
+      .defaultFocus(this.autoFocus)
       .hitTestBehavior(HitTestMode.None) // 永不拦截触摸，点击全归终端画布
       .onChange((value: string, previewText?: PreviewText) => {
         this.handleChange(value, previewText);

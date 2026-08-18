@@ -106,6 +106,23 @@ export default function paneTreeTest() {
       expect((tab as PaneTab).root).assertEqual(node);
     });
 
+    it('dockTree_把另一棵树接到当前根的B侧', 0, () => {
+      const set: PaneTabSet = makeSet();
+      const a = set.addTab('A');
+      const b = set.addTab('B');
+      expect(set.tabs.length).assertEqual(2);
+      const incoming = b.tab.root;
+      expect(set.closeTab(b.tab.tabId) !== null).assertTrue();
+      const split: PaneSplit | null = set.dockTree(a.tab.tabId, incoming, 'row');
+      expect(split !== null).assertTrue();
+      expect(set.tabs.length).assertEqual(1);
+      const node: PaneSplit = split as PaneSplit;
+      expect(node.direction).assertEqual('row');
+      expect(node.childA).assertEqual(a.leaf);
+      expect(node.childB).assertEqual(incoming);
+      expect(leavesOf((set.activeTab() as PaneTab).root).length).assertEqual(2);
+    });
+
     it('嵌套分屏_在B侧再切_查找与遍历序先A后B', 0, () => {
       const set: PaneTabSet = makeSet();
       const a = set.addTab('A');
@@ -197,6 +214,10 @@ export default function paneTreeTest() {
       expect(split.ratio).assertEqual(0.3);
       expect(set.setRatio(split.splitId, 0)).assertEqual(PANE_MIN_RATIO);
       expect(set.setRatio(split.splitId, 1)).assertEqual(PANE_MAX_RATIO);
+      expect(set.setRatio(split.splitId, Number.NaN)).assertEqual(PANE_MAX_RATIO);
+      expect(split.ratio).assertEqual(PANE_MAX_RATIO);
+      expect(set.setRatio(split.splitId, Number.POSITIVE_INFINITY)).assertEqual(PANE_MAX_RATIO);
+      expect(split.ratio).assertEqual(PANE_MAX_RATIO);
     });
 
     it('布局_row按ratio切分_1px舍入A取floor_B吃余量', 0, () => {
@@ -256,7 +277,7 @@ export default function paneTreeTest() {
       expect(visibleLeaves(root, a.leaf.paneId, 'lg').length).assertEqual(2);
     });
 
-    it('layoutVisibleTree_sm铺满无分隔条_lg完整切分_树本身不动', 0, () => {
+    it('layoutVisibleTree_sm双窗格完整显示_三窗格以上降级聚焦叶_树不动', 0, () => {
       const set: PaneTabSet = makeSet();
       const a = set.addTab('A');
       const b: PaneLeaf = createPaneLeaf(set.newPaneId());
@@ -265,22 +286,29 @@ export default function paneTreeTest() {
       const beforeKind: string = root.kind;
       const sm: PaneLayout = layoutVisibleTree(root, b.paneId, 'sm', 400, 300,
         PANE_DIVIDER_SIZE_VP);
-      expect(sm.leaves.length).assertEqual(1);
-      expect(sm.leaves[0].paneId).assertEqual(b.paneId);
-      expect(sm.leaves[0].w).assertEqual(400);
+      expect(sm.leaves.length).assertEqual(2);
+      expect(sm.leaves[0].w).assertEqual(196);
       expect(sm.leaves[0].h).assertEqual(300);
-      expect(sm.dividers.length).assertEqual(0);
+      expect(sm.dividers.length).assertEqual(1);
       const lg: PaneLayout = layoutVisibleTree(root, b.paneId, 'lg', 400, 300,
         PANE_DIVIDER_SIZE_VP);
       expect(lg.leaves.length).assertEqual(2);
       expect(lg.dividers.length).assertEqual(1);
+      const c: PaneLeaf = createPaneLeaf(set.newPaneId());
+      set.splitLeaf(b.paneId, 'column', c);
+      const compact: PaneLayout = layoutVisibleTree(root, c.paneId, 'sm', 400, 300,
+        PANE_DIVIDER_SIZE_VP);
+      expect(compact.leaves.length).assertEqual(1);
+      expect(compact.leaves[0].paneId).assertEqual(c.paneId);
+      expect(compact.dividers.length).assertEqual(0);
       // lg→sm→lg 树恒等
       expect(root.kind).assertEqual(beforeKind);
-      expect(leavesOf(root).length).assertEqual(2);
+      expect(leavesOf(root).length).assertEqual(3);
       expect(findParentSplit(root, a.leaf.paneId) !== null).assertTrue();
       const ref: ParentSplitRef | null = findParentSplit(root, b.paneId);
       expect(ref !== null).assertTrue();
-      expect(ref?.isChildA).assertFalse();
+      expect(ref?.isChildA).assertTrue();
+      expect(ref?.parent.direction).assertEqual('column');
     });
 
     it('leafBySession与allLeaves_clear清空', 0, () => {

@@ -7,7 +7,7 @@
  *     SessionManager.connect / 复用既有会话 → bindPane → 订阅事件与 dirty 唤醒；
  *   - 多标签 / 分屏编排（U4b）：持有 PaneTabSet；newTab / splitFocused 按聚焦叶的
  *     主机快照再拨号；closePane 兄弟上提；closeTab 批量释放；拖分隔条只改 ratio；
- *     断点降级只改可见矩形（layoutVisibleTree），树与会话不动（lg→sm→lg 往返保活）；
+ *     两窗格在窄屏仍完整显示，3+ 窗格才降级聚焦叶；树与会话始终不动；
  *   - 焦点：全局单一聚焦叶；currentSessionId / terminal / overlay / 顶栏字段始终
  *     投影聚焦叶（KeyBar sendInput 直写 this.terminal 仍然正确）；FocusHost 可注入
  *     （生产 = FocusManager 适配，缺省 no-op 以免单测污染单例）；
@@ -22,6 +22,8 @@
  */
 
 import { HostProfile } from '../common/model/models';
+import { SshError, SshErrorCode } from '../common/SshError';
+import { CredentialStore } from '../repository/CredentialStore';
 import { Logger } from '../common/utils/Logger';
 import { SshEvent, SshNativeSession } from '../napi/SshNative';
 import { SshTerminal } from '../napi/SshTerminal';
@@ -32,11 +34,14 @@ import {
   PANE_DIVIDER_SIZE_VP,
   PaneBreakpoint,
   PaneFocusDirection,
+  PaneLayout,
   PaneLeaf,
+  PaneRect,
   PaneTabSet,
   SplitDirection,
   breakpointOfWidth,
   createPaneLeaf,
+  firstLeafOf,
   layoutPaneTree,
   layoutVisibleTree,
   leavesOf,
@@ -62,17 +67,33 @@ export interface TerminalRouteParams {
   readonly sessionId: string;
 }
 
+/** 路由参数取值：只要字符串；包装对象（偶发）用 toString，拒绝 [object Object] */
+function routeParamAsString(value: Object | undefined): string {
+  if (value === undefined || value === null) {
+    return '';
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return '';
+  }
+  const text: string = `${value}`;
+  if (text.length === 0 || text === '[object Object]') {
+    return '';
+  }
+  return text;
+}
+
 /** 解析 router.getParams() 原始值；缺省/非字符串一律收敛为空串（绝不抛） */
 export function parseTerminalRouteParams(raw: Object | null | undefined): TerminalRouteParams {
   if (raw === null || raw === undefined) {
     return { hostId: '', sessionId: '' };
   }
   const record: Record<string, Object> = raw as Record<string, Object>;
-  const hostId: Object | undefined = record['hostId'];
-  const sessionId: Object | undefined = record['sessionId'];
   return {
-    hostId: typeof hostId === 'string' ? hostId : '',
-    sessionId: typeof sessionId === 'string' ? sessionId : ''
+    hostId: routeParamAsString(record['hostId']),
+    sessionId: routeParamAsString(record['sessionId'])
   };
 }
 
@@ -126,6 +147,9 @@ function makeOverlay(kind: OverlayKind, dimmed: boolean, title: string, detail: 
     showClose: showClose
   };
 }
+
+/** 空白「新连接」标签不属于连接阶段，不应显示“正在连接”蒙层。 */
+const NO_OVERLAY: OverlayModel = makeOverlay('none', false, '', '', false, false, false);
 
 /** 连接中阶段的次文案（按 C4 状态名细分，给用户可感知的进度反馈） */
 function connectingStageDetail(state: string): string {
@@ -195,6 +219,16 @@ export interface TabRenderItem {
 export interface PaneRenderItem {
   readonly paneId: string;
   readonly sessionId: string;
+  /** true = “+” 新建的连接选择标签；尚未创建或绑定 SSH 会话。 */
+  readonly connectionPicker: boolean;
+  /** 窗格当前绑定的主机；临时连接也从会话快照取回，供标签与外观按主机路由 */
+  readonly hostId: string;
+  /** 服务器标签：HostProfile.name 优先，回退 SessionInfo.hostName / host */
+  readonly hostName: string;
+  /** 次级标识：user@host:port；主机快照不可用时为空 */
+  readonly endpoint: string;
+  /** 该窗格自己的连接状态，不再错误复用聚焦窗格状态 */
+  readonly state: string;
   readonly terminal: TerminalLike | null;
   readonly overlay: OverlayModel;
   readonly x: number;
@@ -291,6 +325,54 @@ export interface TerminalSessionHostLike {
 /** 主机 DAO 窄接口（生产 = AppDatabase.hosts()，调用时惰性解析） */
 export interface TerminalHostDaoLike {
   getById(id: string): HostProfile | null;
+  listAll(): HostProfile[];
+}
+
+/** 连接选择面板的打开目标。replace=替换聚焦窗格但保留旧会话，row/column 对应左右/上下。 */
+export type ConnectionOpenMode = 'replace' | 'tab' | 'row' | 'column';
+
+/**
+ * 凭据写入窄接口（生产 = CredentialStore.setSecret，落系统 ASSET 加密存储）。
+ * 补录的密码必须持久化：§7.1 的自动重连会重新走 prepareAuth 取凭据，
+ * 只在内存里存一份的话第一次断线重连就又没密码了。
+ */
+export interface TerminalSecretWriterLike {
+  savePassword(hostId: string, password: string): Promise<void>;
+}
+
+/** 生产凭据写入：转发 CredentialStore（明文只进出 ASSET，不落沙箱、不进日志） */
+class CredentialStoreSecretWriter implements TerminalSecretWriterLike {
+  savePassword(hostId: string, password: string): Promise<void> {
+    return CredentialStore.setSecret(hostId, 'password', password);
+  }
+}
+
+/** 密码补录框的渲染模型（页面只读这一个对象） */
+export interface PasswordPromptModel {
+  readonly visible: boolean;
+  /** 标题里显示的主机名 */
+  readonly hostName: string;
+  /** 提交中（禁用按钮、显示「连接中」） */
+  readonly busy: boolean;
+  /** 上一次提交的失败原因（空串不渲染） */
+  readonly error: string;
+}
+
+const HIDDEN_PASSWORD_PROMPT: PasswordPromptModel = {
+  visible: false,
+  hostName: '',
+  busy: false,
+  error: ''
+};
+
+/** 密码错或认证超时：应重新弹出密码框，让用户改密再试。 */
+export function isPasswordRetryError(event: SshEvent): boolean {
+  const code: number = event.errorCode !== undefined ? event.errorCode : 0;
+  if (code === SshErrorCode.AUTH_PASSWORD_FAILED || code === SshErrorCode.AUTH_TIMEOUT) {
+    return true;
+  }
+  const name: string = event.errorCodeName !== undefined ? event.errorCodeName : '';
+  return name === 'auth_password_failed' || name === 'auth_timeout';
 }
 
 /** 生产会话宿主：C4 SessionManager 的窄接口适配 */
@@ -357,6 +439,10 @@ class AppDatabaseHostDao implements TerminalHostDaoLike {
   getById(id: string): HostProfile | null {
     return AppDatabase.hosts().getById(id);
   }
+
+  listAll(): HostProfile[] {
+    return AppDatabase.hosts().listAll();
+  }
 }
 
 /** 生产终端工厂：SshTerminal.attach 薄包装（NativeSessionHandleLike 的生产实现即 SshNativeSession） */
@@ -375,8 +461,15 @@ export interface TerminalViewModelDeps {
   vibrate?: () => void;
   /** 内容脏钩子（输出迹象 → 唤醒帧循环；T4 硬依赖，语义等价 canvas.notifyContentDirty） */
   onContentDirty?: () => void;
+  /**
+   * UI 刷新钩子：V1 @Component 订阅不到 @ObservedV2/@Trace。
+   * 页面用 @State 计数器在此回调里自增，驱动整页重绘。
+   */
+  onUiChange?: () => void;
   /** 焦点宿主（生产页注入 FocusManager 适配；缺省 no-op） */
   focusHost?: TerminalFocusHostLike;
+  /** 凭据写入（生产 = CredentialStore；单测注入内存 fake，不碰 ASSET） */
+  secretWriter?: TerminalSecretWriterLike;
 }
 
 /** 已 attach 终端的缓存条目：终端 + 绑定的 native 句柄（重连换柄检测依据） */
@@ -407,15 +500,17 @@ export class TerminalViewModel {
   @Trace terminal: TerminalLike | null = null;
   /** 抽屉会话列表快照（任何会话事件后整体替换刷新） */
   @Trace sessionList: TerminalSessionLike[] = [];
+  /** 连接选择面板的已保存主机快照 */
+  @Trace hostList: HostProfile[] = [];
   /** 聚焦叶绑定会话（'' = 尚未建立/参数非法） */
   @Trace currentSessionId: string = '';
   /** 标签栏快照 */
   @Trace tabs: TabRenderItem[] = [];
   /** 当前激活标签（'' = 无标签） */
   @Trace activeTabId: string = '';
-  /** 当前可见叶（sm 仅聚焦叶；md/lg 激活标签全树） */
+  /** 当前可见叶（sm 的 1–2 叶全量、3+ 叶仅聚焦；md/lg 激活标签全树） */
   @Trace visiblePanes: PaneRenderItem[] = [];
-  /** 当前可见分隔条（sm 恒空） */
+  /** 当前可见分隔条（sm 的双窗格也保留；3+ 窗格降级时为空） */
   @Trace dividers: DividerRect[] = [];
   /** 聚焦叶 paneId */
   @Trace focusedPaneId: string = '';
@@ -423,13 +518,25 @@ export class TerminalViewModel {
   @Trace breakpoint: PaneBreakpoint = 'sm';
   /** 关末叶/末标签后为 true，页面据此返回列表 */
   @Trace shouldExit: boolean = false;
+  /** 密码补录框（凭据库里没有该主机密码时弹出，替代「无法进入终端」死路） */
+  @Trace passwordPrompt: PasswordPromptModel = HIDDEN_PASSWORD_PROMPT;
 
   private readonly injectedHost: TerminalSessionHostLike | null;
   private readonly injectedHostDao: TerminalHostDaoLike | null;
   private readonly factory: TerminalFactory;
   private readonly vibrateHook: () => void;
   private readonly dirtyHook: () => void;
+  private readonly uiHook: () => void;
   private readonly focusHost: TerminalFocusHostLike;
+  private readonly secretWriter: TerminalSecretWriterLike;
+  /** 等待密码补录的主机（补录成功后按它重新拨号；非补录期为 null） */
+  private pendingPasswordHost: HostProfile | null = null;
+  /** 补录成功后的落点；页面初次进入等价 replace，连接面板可指定标签或分屏。 */
+  private pendingPasswordMode: ConnectionOpenMode = 'replace';
+  /** 是否为页面初次进入；取消时只有初次进入需要落整页错误蒙层。 */
+  private pendingPasswordInitial: boolean = false;
+  /** 认证失败后补录对应的已有会话；空串 = 还没有会话，提交后走 connect。 */
+  private pendingPasswordSessionId: string = '';
   private readonly tabSet: PaneTabSet = new PaneTabSet();
   /** sessionId → 已 attach 终端（含切换走的会话：换回时复用，画面/回滚保留） */
   private readonly attachedTerminals: Map<string, AttachedTerminal> = new Map();
@@ -456,7 +563,9 @@ export class TerminalViewModel {
     this.factory = deps?.terminalFactory ?? productionTerminalFactory;
     this.vibrateHook = deps?.vibrate ?? ((): void => {});
     this.dirtyHook = deps?.onContentDirty ?? ((): void => {});
+    this.uiHook = deps?.onUiChange ?? ((): void => {});
     this.focusHost = deps?.focusHost ?? new NoopFocusHost();
+    this.secretWriter = deps?.secretWriter ?? new CredentialStoreSecretWriter();
     this.unsubFocus = this.focusHost.addListener((id: string): void => {
       this.onExternalFocus(id);
     });
@@ -486,6 +595,11 @@ export class TerminalViewModel {
       return;
     }
     this.started = true;
+    this.refreshHostList();
+    this.refreshSessionList();
+    Logger.info(
+      `终端页启动 hostId=${params.hostId.length > 0 ? '有' : '无'} sessionId=${params.sessionId.length > 0 ? '有' : '无'}`,
+      LOG_TAG);
     if (params.sessionId.length > 0) {
       const info: TerminalSessionLike | null = this.sessionHost().getSession(params.sessionId);
       if (info === null) {
@@ -506,6 +620,9 @@ export class TerminalViewModel {
     }
     this.hostName = host.name.length > 0 ? host.name : host.host;
     this.lastHost = host;
+    this.refreshOverlay();
+    this.notifyUi();
+    Logger.info(`发起连接 authType=${host.authType} port=${host.port}`, LOG_TAG);
     try {
       const info: TerminalSessionLike = await this.sessionHost().connect(host);
       if (this.disposed) {
@@ -513,10 +630,162 @@ export class TerminalViewModel {
         this.sessionHost().close(info.sessionId);
         return;
       }
+      Logger.info(`连接已受理 state=${info.state}`, LOG_TAG);
       this.adoptSession(info, host);
     } catch (err) {
-      this.failStart(err instanceof Error ? err.message : '连接发起失败');
+      this.handleConnectFailure(err, host);
     }
+  }
+
+  /** 从数据库刷新连接选择列表；页面从主机编辑页返回或打开面板时调用。 */
+  reloadConnections(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.refreshHostList();
+    this.refreshSessionList();
+    this.notifyUi();
+  }
+
+  /**
+   * 拨号失败分流：凭据缺失且为密码认证 → 弹补录框（可恢复）；其余 → 错误蒙层（死路）。
+   * 私钥缺失不弹框——私钥要走文件导入，不是一个输入框能解决的，仍落蒙层引导去主机配置。
+   */
+  private handleConnectFailure(err: Object, host: HostProfile): void {
+    const missingCredential: boolean =
+      err instanceof SshError && err.code === SshErrorCode.CREDENTIAL_MISSING;
+    if (missingCredential && host.authType === 'password') {
+      Logger.info('凭据库无该主机密码，弹出补录框', LOG_TAG);
+      this.showPasswordPrompt(host, 'replace', this.tabSet.tabs.length === 0, '', '');
+      return;
+    }
+    this.failStart(err instanceof Error ? err.message : '连接发起失败');
+  }
+
+  // ---------------------------------------------------------------- 密码补录
+
+  /**
+   * 提交补录的密码：先落 ASSET 凭据库（重连要复用，见 TerminalSecretWriterLike 头注），
+   * 再按同一主机重新拨号。失败时留在框内并回显原因，用户可改了再试。
+   * 密码只在本方法调用栈内以局部量存在，不写字段、不进日志。
+   */
+  async submitPassword(password: string): Promise<void> {
+    const host: HostProfile | null = this.pendingPasswordHost;
+    if (this.disposed || host === null || this.passwordPrompt.busy) {
+      return;
+    }
+    if (password.length === 0) {
+      this.setPromptError('请输入登录密码');
+      return;
+    }
+    this.passwordPrompt = {
+      visible: true,
+      hostName: this.passwordPrompt.hostName,
+      busy: true,
+      error: ''
+    };
+    this.refreshViews();
+    try {
+      await this.secretWriter.savePassword(host.id, password);
+    } catch (err) {
+      Logger.error(`密码写入凭据库失败: ${JSON.stringify(err)}`, LOG_TAG);
+      this.setPromptError('密码保存失败，请重试');
+      return;
+    }
+    if (this.disposed) {
+      return;
+    }
+    const existingSessionId: string = this.pendingPasswordSessionId;
+    if (existingSessionId.length > 0) {
+      const existing: TerminalSessionLike | null = this.sessionHost().getSession(existingSessionId);
+      if (existing !== null && (existing.state === 'error' || existing.state === 'disconnected')) {
+        this.pendingPasswordHost = null;
+        this.pendingPasswordSessionId = '';
+        this.pendingPasswordInitial = false;
+        this.passwordPrompt = HIDDEN_PASSWORD_PROMPT;
+        this.sessionHost().reconnectNow(existingSessionId);
+        this.refreshViews();
+        return;
+      }
+    }
+    try {
+      const info: TerminalSessionLike = await this.sessionHost().connect(host);
+      if (this.disposed) {
+        this.sessionHost().close(info.sessionId);
+        return;
+      }
+      const mode: ConnectionOpenMode = this.pendingPasswordMode;
+      this.pendingPasswordHost = null;
+      this.pendingPasswordSessionId = '';
+      this.pendingPasswordInitial = false;
+      this.passwordPrompt = HIDDEN_PASSWORD_PROMPT;
+      Logger.info(`补录密码后连接已受理 state=${info.state}`, LOG_TAG);
+      this.placeSession(info, host, mode);
+    } catch (err) {
+      this.setPromptError(err instanceof Error ? err.message : '连接发起失败');
+    }
+  }
+
+  /** 取消补录：没有可用凭据，落错误蒙层（用户可从蒙层「关闭」退回列表） */
+  cancelPasswordPrompt(): void {
+    if (this.disposed) {
+      return;
+    }
+    const initial: boolean = this.pendingPasswordInitial;
+    this.pendingPasswordHost = null;
+    this.pendingPasswordSessionId = '';
+    this.pendingPasswordInitial = false;
+    this.passwordPrompt = HIDDEN_PASSWORD_PROMPT;
+    if (initial) {
+      this.failStart('未提供登录密码，无法连接');
+    } else {
+      this.refreshViews();
+    }
+  }
+
+  private setPromptError(message: string): void {
+    this.passwordPrompt = {
+      visible: true,
+      hostName: this.passwordPrompt.hostName,
+      busy: false,
+      error: message
+    };
+    this.refreshViews();
+  }
+
+  private showPasswordPrompt(host: HostProfile, mode: ConnectionOpenMode, initial: boolean,
+    sessionId: string, error: string): void {
+    this.pendingPasswordHost = host;
+    this.pendingPasswordMode = mode;
+    this.pendingPasswordInitial = initial;
+    this.pendingPasswordSessionId = sessionId;
+    this.passwordPrompt = {
+      visible: true,
+      hostName: host.name.length > 0 ? host.name : host.host,
+      busy: false,
+      error: error
+    };
+    this.refreshViews();
+  }
+
+  /**
+   * 已受理的密码会话在认证失败 / 认证超时时重新弹出密码框。
+   * 取消自动重连，避免旧密码还在后台连、用户同时在改密。
+   */
+  private maybePromptPasswordAfterAuthFailure(session: TerminalSessionLike, event: SshEvent): void {
+    if (!isPasswordRetryError(event) || this.passwordPrompt.busy) {
+      return;
+    }
+    const host: HostProfile | null =
+      this.hostForSession(session.sessionId) ?? this.lookupHost(session.hostId);
+    if (host === null || host.authType !== 'password') {
+      return;
+    }
+    this.sessionHost().cancelAutoReconnect(session.sessionId);
+    const code: SshErrorCode = event.errorCode !== undefined && event.errorCode > 0
+      ? SshError.fromNativeCode(event.errorCode)
+      : SshErrorCode.AUTH_PASSWORD_FAILED;
+    this.showPasswordPrompt(host, 'replace', false, session.sessionId, SshError.toUserMessage(code));
   }
 
   /** 采用一个会话：建首标签/首叶 → 绑窗格 → 注册监听 → 已 established 则立即装配终端 */
@@ -561,10 +830,13 @@ export class TerminalViewModel {
     if (info.state === 'established') {
       this.ensureTerminalAttached(info.sessionId);
     }
+    Logger.info(`已采用会话 state=${info.state}`, LOG_TAG);
     this.refreshViews();
   }
 
   private failStart(message: string): void {
+    // 这里过去是静默的：用户看到错误蒙层，日志里却什么都没有，真机排查无从下手
+    Logger.error(`终端页进入失败：${message}`, LOG_TAG);
     this.startError = message;
     this.refreshOverlay();
     this.refreshViews();
@@ -634,6 +906,12 @@ export class TerminalViewModel {
       this.termTypes.set(sessionId, host.termType);
       this.lastHost = host;
     }
+    const paneTab = this.tabSet.tabOfPane(paneId);
+    if (paneTab !== null && paneTab.root.kind === 'leaf') {
+      paneTab.title = host !== null
+        ? (host.name.length > 0 ? host.name : host.host)
+        : (info.hostName.length > 0 ? info.hostName : '终端');
+    }
     const cached: AttachedTerminal | undefined = this.attachedTerminals.get(sessionId);
     this.terminal = cached === undefined ? null : cached.terminal;
     if (info.state === 'established') {
@@ -643,6 +921,29 @@ export class TerminalViewModel {
   }
 
   // ---------------------------------------------------------------- 多标签 / 分屏
+
+  /**
+   * 新建一个独立的连接选择标签。这里故意不拨号：页面先在新标签内展示连接信息，
+   * 用户选择服务器后再以 replace 模式把会话绑定到这片空叶，原标签保持不变。
+   */
+  openConnectionTab(): void {
+    if (this.disposed) {
+      return;
+    }
+    const added = this.tabSet.addTab('新连接');
+    this.focusHost.register(added.leaf.paneId);
+    this.focusedPaneId = added.leaf.paneId;
+    this.lastFocusByTab.set(added.tab.tabId, added.leaf.paneId);
+    this.focusHost.focus(added.leaf.paneId);
+    this.hostName = '新连接';
+    this.terminalTitle = '';
+    this.startError = '';
+    this.shouldExit = false;
+    this.refreshHostList();
+    this.refreshSessionList();
+    this.refreshViews();
+    this.dirtyHook();
+  }
 
   /** 视口宽度 → 断点（树不动，只刷新可见矩形） */
   setViewportWidth(widthVp: number): void {
@@ -669,17 +970,34 @@ export class TerminalViewModel {
     }
     this.areaWidthVp = w;
     this.areaHeightVp = h;
+    Logger.info(`窗格区尺寸 ${w}x${h}`, LOG_TAG);
     this.refreshLayout();
   }
 
-  /** 拖分隔条：改 ratio 并重算矩形（钳制在模型内） */
-  setDividerRatio(splitId: string, ratio: number): void {
+  /**
+   * 拖分隔条：改 ratio 并走轻量几何快照路径。
+   * forceSnapshot 只在松手时使用，确保亚像素内未改变矩形的最终 ratio 也进入公开快照。
+   */
+  setDividerRatio(splitId: string, ratio: number, forceSnapshot: boolean = false): void {
     if (this.disposed) {
       return;
     }
     if (this.tabSet.setRatio(splitId, ratio) !== null) {
-      this.refreshLayout();
+      this.refreshDividerGeometry(forceSnapshot);
     }
+  }
+
+  /** 双窗格布局方向切换；不改叶、不重连，会话与终端实例原地保留。 */
+  setActiveSplitDirection(direction: SplitDirection): void {
+    if (this.disposed) {
+      return;
+    }
+    const tab = this.tabSet.activeTab();
+    if (tab === null || tab.root.kind !== 'split' || tab.root.direction === direction) {
+      return;
+    }
+    tab.root.direction = direction;
+    this.refreshLayout();
   }
 
   /** 聚焦指定叶（未知 id 为 no-op）；同步 FocusHost 与顶栏投影 */
@@ -726,74 +1044,188 @@ export class TerminalViewModel {
     }
   }
 
-  /**
-   * 新标签：按聚焦叶主机再拨号。md「最多 2 窗格」首版不做硬限制。
-   * 拨号失败则撤掉空标签。
-   */
-  async newTab(): Promise<void> {
+  /** 连接选择面板：按保存的主机打开到聚焦窗格 / 新标签 / 左右或上下分屏。 */
+  async openHost(hostId: string, mode: ConnectionOpenMode): Promise<void> {
     if (this.disposed) {
       return;
     }
-    const host: HostProfile | null = this.hostForFocused();
+    const host: HostProfile | null = this.lookupHost(hostId);
     if (host === null) {
+      Logger.warn(`连接选择目标不存在（hostId=${hostId}）`, LOG_TAG);
       return;
     }
-    const title: string = host.name.length > 0 ? host.name : host.host;
-    const added = this.tabSet.addTab(title);
-    this.focusHost.register(added.leaf.paneId);
-    this.focusedPaneId = added.leaf.paneId;
-    this.lastFocusByTab.set(added.tab.tabId, added.leaf.paneId);
-    this.focusHost.focus(added.leaf.paneId);
-    this.refreshViews();
+    await this.openHostProfile(host, mode);
+  }
+
+  /**
+   * 连接选择面板：复用活跃会话。
+   * replace 且已在某窗格 → 只聚焦（同一 PTY 不能绑两个窗格）；
+   * 新标签 / 分屏 → 按同一主机再拨一路独立会话，允许同一连接开两次。
+   */
+  openSession(sessionId: string, mode: ConnectionOpenMode): void {
+    if (this.disposed) {
+      return;
+    }
+    const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
+    if (info === null) {
+      return;
+    }
+    const existing: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
+    if (existing !== null && mode === 'replace') {
+      this.focusPane(existing.paneId);
+      return;
+    }
+    if (existing !== null) {
+      const host: HostProfile | null = this.hostForSession(sessionId) ?? this.lookupHost(info.hostId);
+      if (host === null) {
+        Logger.warn(`活跃会话缺少主机快照（sessionId=${sessionId}）`, LOG_TAG);
+        return;
+      }
+      this.openHostProfile(host, mode).catch((err: Object) => {
+        Logger.error(`同一主机再次打开失败: ${JSON.stringify(err)}`, LOG_TAG);
+      });
+      return;
+    }
+    const host: HostProfile | null = this.hostForSession(sessionId) ?? this.lookupHost(info.hostId);
+    if (host === null) {
+      Logger.warn(`活跃会话缺少主机快照（sessionId=${sessionId}）`, LOG_TAG);
+      return;
+    }
+    this.placeSession(info, host, mode);
+  }
+
+  /**
+   * 把源标签拖进当前画面成分屏。
+   * 源标签就是当前标签：按聚焦叶主机再拨一路，实现「同一连接再开一次」。
+   * 源是别的标签：摘下其窗格树接到当前根上，不关会话。
+   */
+  dockTabAsSplit(sourceTabId: string, direction: SplitDirection): void {
+    if (this.disposed) {
+      return;
+    }
+    const source = this.tabSet.findTab(sourceTabId);
+    const target = this.tabSet.activeTab();
+    if (source === null || target === null) {
+      return;
+    }
+    if (source.tabId === target.tabId) {
+      this.splitFocused(direction).catch((err: Object) => {
+        Logger.error(`拖标签分屏（同标签再拨）失败: ${JSON.stringify(err)}`, LOG_TAG);
+      });
+      return;
+    }
+    const incoming = source.root;
+    const incomingFocus: PaneLeaf | null = firstLeafOf(incoming);
+    const removed = this.tabSet.closeTab(source.tabId);
+    if (removed === null) {
+      return;
+    }
+    this.lastFocusByTab.delete(source.tabId);
+    if (this.tabSet.dockTree(target.tabId, incoming, direction) === null) {
+      this.tabSet.tabs.push(removed);
+      this.tabSet.activeTabId = target.tabId;
+      return;
+    }
+    this.tabSet.activateTab(target.tabId);
+    if (incomingFocus !== null) {
+      this.focusPane(incomingFocus.paneId);
+    } else {
+      this.refreshViews();
+    }
+  }
+
+  /** 新标签：保留原快捷键语义，默认仍按聚焦叶主机新拨一个独立会话。 */
+  async newTab(): Promise<void> {
+    const host: HostProfile | null = this.hostForFocused();
+    if (this.disposed || host === null) {
+      return;
+    }
+    await this.openHostProfile(host, 'tab');
+  }
+
+  /** 分屏快捷入口：保留原语义，按聚焦叶主机新拨会话。 */
+  async splitFocused(direction: SplitDirection): Promise<void> {
+    const host: HostProfile | null = this.hostForFocused();
+    if (this.disposed || host === null) {
+      return;
+    }
+    await this.openHostProfile(host, direction);
+  }
+
+  private async openHostProfile(host: HostProfile, mode: ConnectionOpenMode): Promise<void> {
     try {
       const info: TerminalSessionLike = await this.sessionHost().connect(host);
-      if (this.disposed || this.tabSet.findLeaf(added.leaf.paneId) === null) {
+      if (this.disposed) {
         this.sessionHost().close(info.sessionId);
         return;
       }
-      this.bindLeafSession(added.leaf, info, host);
-      this.refreshViews();
+      this.refreshSessionList();
+      this.placeSession(info, host, mode);
     } catch (err) {
-      Logger.error(`新标签连接失败: ${JSON.stringify(err)}`, LOG_TAG);
-      this.closeTab(added.tab.tabId);
+      const missingCredential: boolean =
+        err instanceof SshError && err.code === SshErrorCode.CREDENTIAL_MISSING;
+      if (missingCredential && host.authType === 'password') {
+        this.showPasswordPrompt(host, mode, this.tabSet.tabs.length === 0, '', '');
+        return;
+      }
+      Logger.error(`连接目标打开失败（mode=${mode}）: ${JSON.stringify(err)}`, LOG_TAG);
     }
   }
 
   /**
-   * 分屏：聚焦叶原位变 Split，B 侧新叶按同一主机拨号。
-   * sm 也改树（断点降级只藏矩形）；页面在 sm 隐藏入口。
-   * 拨号失败则关掉空新叶，兄弟上提恢复原状。
+   * 当前窗格已有会话时，replace 升级为新标签，避免把旧连接顶掉。
+   * 空的「新连接」选择页仍走 replace，把会话填进这片空叶。
    */
-  async splitFocused(direction: SplitDirection): Promise<void> {
+  private resolvePlacementMode(mode: ConnectionOpenMode): ConnectionOpenMode {
+    if (mode !== 'replace') {
+      return mode;
+    }
+    const focused: PaneLeaf | null = this.tabSet.findLeaf(this.focusedPaneId);
+    if (focused === null || focused.sessionId.length === 0) {
+      return 'replace';
+    }
+    return 'tab';
+  }
+
+  /** 把已受理会话放到目标位置；会话拨号与布局变更分离，失败时不会留下空白窗格。 */
+  private placeSession(info: TerminalSessionLike, host: HostProfile, mode: ConnectionOpenMode): void {
     if (this.disposed) {
+      this.sessionHost().close(info.sessionId);
+      return;
+    }
+    if (this.tabSet.tabs.length === 0) {
+      this.adoptSession(info, host);
+      return;
+    }
+    const placement: ConnectionOpenMode = this.resolvePlacementMode(mode);
+    if (placement === 'replace') {
+      this.switchSession(info.sessionId);
+      return;
+    }
+    const title: string = host.name.length > 0 ? host.name : host.host;
+    if (placement === 'tab') {
+      const added = this.tabSet.addTab(title);
+      this.focusHost.register(added.leaf.paneId);
+      this.focusedPaneId = added.leaf.paneId;
+      this.lastFocusByTab.set(added.tab.tabId, added.leaf.paneId);
+      this.focusHost.focus(added.leaf.paneId);
+      this.bindLeafSession(added.leaf, info, host);
+      this.focusPane(added.leaf.paneId);
       return;
     }
     const focused: PaneLeaf | null = this.tabSet.findLeaf(this.focusedPaneId);
     if (focused === null) {
-      return;
-    }
-    const host: HostProfile | null = this.hostForFocused();
-    if (host === null) {
+      this.sessionHost().close(info.sessionId);
       return;
     }
     const newLeaf: PaneLeaf = createPaneLeaf(this.tabSet.newPaneId());
-    if (this.tabSet.splitLeaf(focused.paneId, direction, newLeaf) === null) {
+    if (this.tabSet.splitLeaf(focused.paneId, placement, newLeaf) === null) {
+      this.sessionHost().close(info.sessionId);
       return;
     }
     this.focusHost.register(newLeaf.paneId);
-    this.refreshViews();
-    try {
-      const info: TerminalSessionLike = await this.sessionHost().connect(host);
-      if (this.disposed || this.tabSet.findLeaf(newLeaf.paneId) === null) {
-        this.sessionHost().close(info.sessionId);
-        return;
-      }
-      this.bindLeafSession(newLeaf, info, host);
-      this.focusPane(newLeaf.paneId);
-    } catch (err) {
-      Logger.error(`分屏连接失败: ${JSON.stringify(err)}`, LOG_TAG);
-      this.closePane(newLeaf.paneId);
-    }
+    this.bindLeafSession(newLeaf, info, host);
+    this.focusPane(newLeaf.paneId);
   }
 
   /** 关闭聚焦叶（末叶则 shouldExit） */
@@ -1012,7 +1444,13 @@ export class TerminalViewModel {
     if (this.disposed || terminal === null || bytes.length === 0) {
       return;
     }
-    terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    // 键条不经过 TerminalCanvas.sendInputBytes，同样要在写入前预热全局帧循环。
+    this.dirtyHook();
+    const accepted: boolean =
+      terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    if (!accepted) {
+      Logger.warn(`键条输入未被终端通道受理（bytes=${bytes.length}）`, LOG_TAG);
+    }
   }
 
   // ---------------------------------------------------------------- 退出
@@ -1045,6 +1483,11 @@ export class TerminalViewModel {
     if (this.disposed) {
       return;
     }
+    // 终端字节流已在 native 内完成 feed/publish；terminalData 只用于唤醒帧调度器，
+    // 不应为每个数据块重建标签、窗格与蒙层。对应 dirtyListener 会紧接着执行。
+    if (event.type === 'terminalData') {
+      return;
+    }
     this.refreshSessionList();
     const inTree: boolean = this.tabSet.leafBySession(session.sessionId) !== null;
     if (!inTree) {
@@ -1061,6 +1504,8 @@ export class TerminalViewModel {
           }
         } else if (event.to === 'closed') {
           this.closedBySession.set(session.sessionId, true);
+        } else if (event.to === 'error' || event.to === 'disconnected') {
+          this.maybePromptPasswordAfterAuthFailure(session, event);
         }
         break;
       case 'terminalOpen':
@@ -1219,10 +1664,15 @@ export class TerminalViewModel {
 
   // ---------------------------------------------------------------- 内部：状态刷新与依赖解析
 
+  private notifyUi(): void {
+    this.uiHook();
+  }
+
   private refreshViews(): void {
     this.refreshTabs();
     this.refreshFocusedProjection();
-    this.refreshLayout();
+    this.refreshLayout(false);
+    this.notifyUi();
   }
 
   private refreshTabs(): void {
@@ -1249,6 +1699,14 @@ export class TerminalViewModel {
       return;
     }
     this.currentSessionId = leaf.sessionId;
+    if (leaf.sessionId.length === 0) {
+      this.terminal = null;
+      this.hostName = '新连接';
+      this.terminalTitle = '';
+      this.sessionState = '';
+      this.overlay = NO_OVERLAY;
+      return;
+    }
     const cached: AttachedTerminal | undefined =
       leaf.sessionId.length > 0 ? this.attachedTerminals.get(leaf.sessionId) : undefined;
     this.terminal = cached === undefined ? null : cached.terminal;
@@ -1260,11 +1718,102 @@ export class TerminalViewModel {
     this.refreshOverlay();
   }
 
-  private refreshLayout(): void {
+  /**
+   * 拖动专用的热路径：只重算树的矩形并复用现有窗格业务快照。
+   *
+   * 常规 refreshLayout 会为每个输入采样重新查询 SessionHost / HostDao、重建主机名、
+   * endpoint 与 overlay；这些字段拖动时完全不变。这里把开销收敛为一次纯布局和两个
+   * 小对象复制，并在 floor 后几何未跨过 1vp 时不通知 UI。
+   */
+  private refreshDividerGeometry(forceSnapshot: boolean): void {
+    const tab = this.tabSet.activeTab();
+    if (tab === null) {
+      this.refreshLayout();
+      return;
+    }
+    const layout: PaneLayout = layoutVisibleTree(tab.root, this.focusedPaneId, this.breakpoint,
+      this.areaWidthVp, this.areaHeightVp, PANE_DIVIDER_SIZE_VP);
+    if (layout.leaves.length !== this.visiblePanes.length) {
+      this.refreshLayout();
+      return;
+    }
+
+    const currentPanes: PaneRenderItem[] = [];
+    let geometryChanged: boolean = layout.dividers.length !== this.dividers.length;
+    for (const rect of layout.leaves) {
+      let current: PaneRenderItem | null = null;
+      for (const item of this.visiblePanes) {
+        if (item.paneId === rect.paneId) {
+          current = item;
+          break;
+        }
+      }
+      if (current === null) {
+        this.refreshLayout();
+        return;
+      }
+      if (current.x !== rect.x || current.y !== rect.y ||
+        current.w !== rect.w || current.h !== rect.h) {
+        geometryChanged = true;
+      }
+      currentPanes.push(current);
+    }
+
+    if (!geometryChanged) {
+      for (let i = 0; i < layout.dividers.length; i++) {
+        if (!this.sameDividerGeometry(this.dividers[i], layout.dividers[i])) {
+          geometryChanged = true;
+          break;
+        }
+      }
+    }
+    if (!geometryChanged && !forceSnapshot) {
+      return;
+    }
+    const panes: PaneRenderItem[] = [];
+    for (let i = 0; i < layout.leaves.length; i++) {
+      panes.push(this.copyPaneWithRect(currentPanes[i], layout.leaves[i]));
+    }
+    this.visiblePanes = panes;
+    this.dividers = layout.dividers;
+    this.notifyUi();
+  }
+
+  private copyPaneWithRect(current: PaneRenderItem, rect: PaneRect): PaneRenderItem {
+    const item: PaneRenderItem = {
+      paneId: current.paneId,
+      sessionId: current.sessionId,
+      connectionPicker: current.connectionPicker,
+      hostId: current.hostId,
+      hostName: current.hostName,
+      endpoint: current.endpoint,
+      state: current.state,
+      terminal: current.terminal,
+      overlay: current.overlay,
+      x: rect.x,
+      y: rect.y,
+      w: rect.w,
+      h: rect.h,
+      focused: current.focused
+    };
+    return item;
+  }
+
+  /** ratio 故意不参与比较：同一像素内的输入采样无需触发 ArkUI 重排。 */
+  private sameDividerGeometry(current: DividerRect, next: DividerRect): boolean {
+    return current.splitId === next.splitId && current.direction === next.direction &&
+      current.x === next.x && current.y === next.y && current.w === next.w &&
+      current.h === next.h && current.span === next.span;
+  }
+
+  private refreshLayout(notify: boolean = true): void {
     const tab = this.tabSet.activeTab();
     if (tab === null) {
       this.visiblePanes = [];
       this.dividers = [];
+      if (notify) {
+        this.notifyUi();
+      }
       return;
     }
     const layout = layoutVisibleTree(tab.root, this.focusedPaneId, this.breakpoint,
@@ -1273,14 +1822,30 @@ export class TerminalViewModel {
     for (const rect of layout.leaves) {
       const leaf: PaneLeaf | null = this.tabSet.findLeaf(rect.paneId);
       const sessionId: string = leaf === null ? '' : leaf.sessionId;
+      const connectionPicker: boolean = leaf !== null && sessionId.length === 0;
       const cached: AttachedTerminal | undefined =
         sessionId.length > 0 ? this.attachedTerminals.get(sessionId) : undefined;
       const term: TerminalLike | null = cached === undefined ? null : cached.terminal;
+      const info: TerminalSessionLike | null =
+        sessionId.length > 0 ? this.sessionHost().getSession(sessionId) : null;
+      const host: HostProfile | null = sessionId.length > 0 ? this.hostForSession(sessionId) : null;
+      const paneHostId: string = host !== null ? host.id : (info === null ? '' : info.hostId);
+      const paneHostName: string = host !== null
+        ? (host.name.length > 0 ? host.name : host.host)
+        : (info !== null && info.hostName.length > 0 ? info.hostName :
+          (connectionPicker ? '新连接' : '终端'));
+      const endpoint: string = host === null ? '' :
+        `${host.username}@${host.host}${host.port === 22 ? '' : `:${host.port}`}`;
       const item: PaneRenderItem = {
         paneId: rect.paneId,
         sessionId: sessionId,
+        connectionPicker: connectionPicker,
+        hostId: paneHostId,
+        hostName: paneHostName,
+        endpoint: endpoint,
+        state: info === null ? '' : info.state,
         terminal: term,
-        overlay: this.overlayForSession(sessionId, term !== null),
+        overlay: connectionPicker ? NO_OVERLAY : this.overlayForSession(sessionId, term !== null),
         x: rect.x,
         y: rect.y,
         w: rect.w,
@@ -1291,6 +1856,9 @@ export class TerminalViewModel {
     }
     this.visiblePanes = panes;
     this.dividers = layout.dividers;
+    if (notify) {
+      this.notifyUi();
+    }
   }
 
   private overlayForSession(sessionId: string, hasTerminal: boolean): OverlayModel {
@@ -1338,6 +1906,15 @@ export class TerminalViewModel {
 
   private refreshSessionList(): void {
     this.sessionList = this.sessionHost().listSessions();
+  }
+
+  private refreshHostList(): void {
+    try {
+      this.hostList = this.hostDao().listAll();
+    } catch (err) {
+      Logger.warn(`主机列表读取失败，连接选择仅显示活跃会话：${JSON.stringify(err)}`, LOG_TAG);
+      this.hostList = [];
+    }
   }
 
   private registerListeners(): void {

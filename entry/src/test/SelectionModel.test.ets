@@ -151,6 +151,31 @@ export default function selectionModelTest() {
       expect(m.range()).assertNull();
     });
 
+    it('手柄分别拖动起点与终点', 0, () => {
+      const m = new SelectionModel();
+      m.begin({ row: 0, col: 2 });
+      m.extend({ row: 0, col: 5 });
+      m.moveStart({ row: 0, col: 1 });
+      expect(m.range()?.startCol).assertEqual(1);
+      expect(m.range()?.endCol).assertEqual(5);
+      m.moveEnd({ row: 1, col: 3 });
+      expect(m.range()?.startCol).assertEqual(1);
+      expect(m.range()?.endRow).assertEqual(1);
+      expect(m.range()?.endCol).assertEqual(3);
+      m.moveStart({ row: 2, col: 4 });
+      expect(m.range()?.startRow).assertEqual(1);
+      expect(m.range()?.startCol).assertEqual(3);
+      expect(m.range()?.endRow).assertEqual(2);
+      expect(m.range()?.endCol).assertEqual(4);
+    });
+
+    it('手柄在未选择时静默忽略', 0, () => {
+      const m = new SelectionModel();
+      m.moveStart({ row: 0, col: 0 });
+      m.moveEnd({ row: 1, col: 1 });
+      expect(m.selecting).assertFalse();
+    });
+
     it('全选覆盖整个主屏', 0, () => {
       const reader = readerOf(['ab', 'cde'], 8);
       const m = new SelectionModel();

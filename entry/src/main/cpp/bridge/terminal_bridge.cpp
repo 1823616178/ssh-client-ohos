@@ -170,7 +170,7 @@ ssh::SshChannelCallbacks MakeTerminalCallbacks(SessionHandle *shRaw,
             ScheduleCoreDestroy(th); // 打开失败即终态（不再有 onClose）
         }
     };
-    cb.onData = [weakTh](const std::string &data, ssh::ChannelStream /*stream*/) {
+    cb.onData = [shRaw, weakTh](const std::string &data, ssh::ChannelStream /*stream*/) {
         auto th = weakTh.lock();
         if (!th || th->closing.load(std::memory_order_relaxed)) {
             return;
@@ -183,6 +183,12 @@ ssh::SshChannelCallbacks MakeTerminalCallbacks(SessionHandle *shRaw,
         }
         core->vterm->feed(data.data(), data.size());
         th->frameSync.publish(*core->vterm);
+        // 数据面留在 native；只投递轻量 dirty 信号唤醒可能已休眠的 displaySync。
+        // 不发此事件时，输入与远端输出虽然都成功，网格却会停在上一帧，表现为
+        // 「物理键盘、软键盘、功能键条全部无法输入」。
+        auto *evt = new BridgeEvent{EventKind::kTerminalData};
+        evt->terminal = th->handle;
+        SendTerminalDataEvent(shRaw, evt);
     };
     cb.onClose = [shRaw, weakTh](const ssh::ChannelCloseInfo &info) {
         auto th = weakTh.lock();
@@ -620,6 +626,38 @@ napi_value ResizeTerminal(napi_env env, napi_callback_info info)
     return MakeBool(env, true);
 }
 
+napi_value SetTerminalDefaultColors(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t h = 0;
+    uint32_t fgArgb = 0;
+    uint32_t bgArgb = 0;
+    if (argc < 3 || !GetHandleArg(env, argv[0], h) || !GetUint32Arg(env, argv[1], fgArgb) ||
+        !GetUint32Arg(env, argv[2], bgArgb)) {
+        return MakeBool(env, false);
+    }
+    auto th = LookupTerminal(h);
+    if (!th || th->closing.load(std::memory_order_relaxed)) {
+        return MakeBool(env, false);
+    }
+    std::weak_ptr<TerminalHandle> weakTh = th;
+    th->session->thread.post([weakTh, fgArgb, bgArgb]() {
+        auto th2 = weakTh.lock();
+        if (!th2) {
+            return;
+        }
+        auto core = th2->coreCopy();
+        if (!core || !core->vterm) {
+            return;
+        }
+        core->vterm->setDefaultColors(fgArgb, bgArgb);
+        th2->frameSync.publish(*core->vterm);
+    });
+    return MakeBool(env, true);
+}
+
 } // namespace
 
 void ForgetTerminal(uint64_t terminalHandle)
@@ -644,6 +682,8 @@ void RegisterTerminalBridge(napi_env env, napi_value exports)
         {"writeTerminal", nullptr, WriteTerminal, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resizeTerminal", nullptr, ResizeTerminal, nullptr, nullptr, nullptr, napi_default,
          nullptr},
+        {"setTerminalDefaultColors", nullptr, SetTerminalDefaultColors, nullptr, nullptr, nullptr,
+         napi_default, nullptr},
     };
     if (napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc) != napi_ok) {
         OH_LOG_ERROR(LOG_APP, "RegisterTerminalBridge: napi_define_properties failed");

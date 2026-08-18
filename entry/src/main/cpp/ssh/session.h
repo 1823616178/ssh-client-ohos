@@ -34,6 +34,8 @@
  * 「拔网线无 RST」的静默黑洞检测由 N12 keepalive 落地（established 态周期发
  * 全局请求，连续 keepaliveMaxMisses 个周期无入站活动 → kKeepaliveTimeout 进
  * disconnected；判定口径与近似性见 keepalive.h 头注与 onKeepaliveTick）。
+ * 30 s × 3 的周期判定对「切网后旧 socket 成黑洞」太慢，故 P1 另给 probeNow()：
+ * ArkTS 侧监听到默认网变化时主动开一个 5 s 短判定窗口（见 doProbeNow / KeepaliveProbe）。
  *
  * 纯逻辑代码：只依赖 C/C++ 标准库、POSIX 与 libssh2 公共头，
  * 禁止 include <napi/native_api.h> / <hilog/log.h>（桥接层是 N11）。
@@ -110,6 +112,12 @@ enum class SshSessionError {
 // 成员初始式共用，避免两处写死漂移
 inline constexpr uint32_t kDefaultKeepaliveIntervalSec = 30;
 inline constexpr unsigned kDefaultKeepaliveMaxMisses = 3;
+// P1 主动探测的默认判定窗口（秒）：网络切换后 5 s 内给出存活/黑洞裁决，
+// 与 TASKS.md P1「WiFi ⇄ 蜂窝切换 5 s 内触发重连」的验收标准同口径
+inline constexpr uint32_t kDefaultKeepaliveProbeTimeoutSec = 5;
+// libssh2 的 keepalive 最小周期（1.11.1 keepalive.c 把 interval < 2 提升为 2）；
+// doProbeNow 借它把「按时间门控的发送」逼出来，语义见该函数注释
+inline constexpr uint32_t kLibssh2MinKeepaliveIntervalSec = 2;
 
 struct SshSessionOptions {
     uint32_t connectTimeoutMs = 10000;    // TCP 连接超时
@@ -252,10 +260,16 @@ public:
     // 返回 false 表示未受理）。进入 established 时生效（libssh2_keepalive_config +
     // 周期定时器），语义见 options 字段注释与 keepalive.h 头注。
     bool setKeepaliveConfig(uint32_t intervalSec, uint32_t maxMisses);
+    // P1：主动探测（任意线程；仅 established 受理，返回 false = 未受理）。
+    // 网络切换后由 ArkTS 侧调用：立刻发一拍 keepalive 并开 timeoutSec 短窗口，
+    // 窗口内无入站活动即以 kKeepaliveTimeout 进 disconnected（走既有重连链）。
+    // timeoutSec == 0 用默认 kDefaultKeepaliveProbeTimeoutSec。语义见 keepalive.h KeepaliveProbe。
+    bool probeNow(uint32_t timeoutSec);
     // 观测钩子（任意线程，供集成测试与诊断）：进入 established 后 keepalive 的
-    // 实际发送次数 / 当前连续无入站活动周期数
+    // 实际发送次数 / 当前连续无入站活动周期数 / 已受理并执行的主动探测次数
     uint32_t keepaliveSendCount() const { return keepaliveSendCount_.load(std::memory_order_acquire); }
     uint32_t keepaliveMissCount() const { return keepaliveMissCount_.load(std::memory_order_acquire); }
+    uint32_t keepaliveProbeCount() const { return keepaliveProbeCount_.load(std::memory_order_acquire); }
 
     // 迁移合法性表（静态纯函数，供单测直接校验状态机边界）
     static bool isLegalTransition(SshSessionState from, SshSessionState to);
@@ -286,6 +300,8 @@ private:
     // ---- N12 keepalive（全部仅事件循环线程执行）----
     void armKeepalive();    // 进入 established 时装配：libssh2_keepalive_config + 首拍定时
     void onKeepaliveTick(); // 每拍：观测入站活动 → 发送 → 按 seconds_to_next 预约下一拍
+    void doProbeNow(uint32_t timeoutSec);        // P1：强发一拍 + 开短判定窗口（probeNow 的循环线程侧）
+    void onProbeDeadline(uint32_t timeoutSec);   // P1：短窗口到期裁决——无入站判黑洞，有入站续回周期链
 
     // ---- N8 认证驱动（循环线程；实现在 auth.cpp，避免 session.cpp 臃肿）----
     // 进行中的认证尝试：方式、凭据副本（受理时复制并清零调用方 buffer）、超时定时器。
@@ -374,9 +390,16 @@ private:
     KeepaliveMissTracker keepaliveMissTracker_{kDefaultKeepaliveMaxMisses}; // 受理配置时重建
     bool keepaliveInboundSeen_ = false;  // 本周期内 fd 事件出现过 EPOLLIN
     long keepalivePendingBaseline_ = 0;  // 上一拍 socket 待读字节数（FIONREAD 基线）
+    // P1 主动探测窗口（仅循环线程访问；到期定时器复用 keepaliveTimer_ 槽位，
+    // 故断线/关闭时的 cancelTimers 一并覆盖它）
+    KeepaliveProbe keepaliveProbe_;
+    // 上一次「真正发出」keepalive 的时刻（steady_clock 毫秒；0 = 尚未发过）。
+    // doProbeNow 据此判断 libssh2 是否会跳过本次发送（见其实现注释）
+    uint64_t keepaliveLastSentMs_ = 0;
     // 观测钩子：循环线程写、任意线程读（集成测试断言 keepalive 在跑且不误判）
     std::atomic<uint32_t> keepaliveSendCount_{0};
     std::atomic<uint32_t> keepaliveMissCount_{0};
+    std::atomic<uint32_t> keepaliveProbeCount_{0};
 };
 
 const char *toString(SshSessionState state);

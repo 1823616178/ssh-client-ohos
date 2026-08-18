@@ -7,12 +7,13 @@
  * 显式设置需 ohos.permission.STORE_PERSISTENT_DATA 权限，故不设）——
  * 验收标准「hdc 导出沙箱无明文 / 卸载后不可恢复」依赖该系统属性，实现侧保证
  * 不绕开 ASSET 自行落盘，两条均列为真机待验项。
- * 账号 token / Vault key 缓存属 M5 同步任务，不在本文件范围，别名方案已预留命名空间。
+ * 账号 token（M5，SettingsAuthStore 使用）复用同一套 asset 读写；Vault key 缓存
+ * 仍是预留命名空间，未使用。
  *
  * 别名方案（唯一声明处，纯函数可测）：
  *   host_secret:<hostId>:<kind>   主机凭据，kind ∈ password / passphrase / private_key
- *   sync_token:<name>             （预留）M5 云端同步账号 token
- *   vault_key:<name>              （预留）M5 Vault key 缓存
+ *   sync_token:<name>             M5 云端同步账号 token（access / refresh）
+ *   vault_key:<name>              （预留，未使用）Vault key 缓存
  * hostId 为 HostProfile.id（UUID，只含十六进制与连字符，不含冒号），按冒号切分无歧义。
  *
  * 使用方式（全部为异步 Promise API，无需 context/init）：
@@ -20,6 +21,8 @@
  *   const pwd: string | null = await CredentialStore.getSecret(host.id, 'password');
  *   await CredentialStore.removeSecret(host.id, 'password');
  *   await CredentialStore.removeAllSecrets(host.id);  // 删除主机时级联清理三种凭据
+ *   await CredentialStore.setSyncToken('access', token);
+ *   const token: string | null = await CredentialStore.getSyncToken('access');
  *
  * 错误策略（与 C1 DAO 惯例一致，调用方只依赖「null = 不存在」「抛 SshError = 失败」）：
  *   - 别名不存在（24000002 NOT_FOUND）：getSecret 返回 null，removeSecret 幂等成功；
@@ -41,7 +44,10 @@ const LOG_TAG: string = 'CredentialStore';
 
 /** 主机凭据别名前缀 */
 const ALIAS_PREFIX_HOST_SECRET: string = 'host_secret:';
-/** 预留命名空间（M5 使用，本文件不产出）：sync_token:<name> / vault_key:<name> */
+/** 同步账号 token 别名前缀（M5，SettingsAuthStore 使用）：sync_token:<name> */
+const ALIAS_PREFIX_SYNC_TOKEN: string = 'sync_token:';
+/** 保险库同步密码别名前缀：vault_key:<name>（用于冷启动自动解锁保险库） */
+const ALIAS_PREFIX_VAULT_KEY: string = 'vault_key:';
 
 /**
  * 凭据种类：password 登录密码 / passphrase 私钥密码短语 / private_key 私钥内容（PEM 文本）。
@@ -161,7 +167,74 @@ export class CredentialStore {
    *   读取改走 asset.preQuery → userAuth 用户认证 → asset.query → asset.postQuery 流程。
    */
   static async setSecret(hostId: string, kind: CredentialKind, value: string): Promise<void> {
-    const alias: string = secretAlias(hostId, kind);
+    await CredentialStore.writeAlias(secretAlias(hostId, kind), value);
+  }
+
+  /** 读取凭据；不存在返回 null（NOT_FOUND 归一），真故障抛 SshError(INTERNAL_ERROR) */
+  static async getSecret(hostId: string, kind: CredentialKind): Promise<string | null> {
+    return CredentialStore.readAlias(secretAlias(hostId, kind));
+  }
+
+  /** 删除单个凭据；不存在视为幂等成功，真故障抛 SshError(INTERNAL_ERROR) */
+  static async removeSecret(hostId: string, kind: CredentialKind): Promise<void> {
+    await CredentialStore.deleteAlias(secretAlias(hostId, kind));
+  }
+
+  /** 删除主机时级联清理三种凭据（密码 / 密码短语 / 私钥） */
+  static async removeAllSecrets(hostId: string): Promise<void> {
+    for (const kind of ALL_CREDENTIAL_KINDS) {
+      await CredentialStore.removeSecret(hostId, kind);
+    }
+  }
+
+  /** 写入同步账号 token（M5，SettingsAuthStore 用）；value 为空串等价删除 */
+  static async setSyncToken(name: string, value: string): Promise<void> {
+    if (value.length === 0) {
+      await CredentialStore.removeSyncToken(name);
+      return;
+    }
+    await CredentialStore.writeAlias(`${ALIAS_PREFIX_SYNC_TOKEN}${name}`, value);
+  }
+
+  /** 读取同步账号 token；不存在返回 null */
+  static async getSyncToken(name: string): Promise<string | null> {
+    return CredentialStore.readAlias(`${ALIAS_PREFIX_SYNC_TOKEN}${name}`);
+  }
+
+  /** 删除同步账号 token；不存在视为幂等成功 */
+  static async removeSyncToken(name: string): Promise<void> {
+    await CredentialStore.deleteAlias(`${ALIAS_PREFIX_SYNC_TOKEN}${name}`);
+  }
+
+  /**
+   * 持久化保险库同步密码（用于冷启动自动解锁保险库）。
+   * 存入系统 ASSET 加密存储，不落应用沙箱明文；
+   * DEVICE_FIRST_UNLOCKED + SYNC_TYPE.NEVER 保证本机安全。
+   * 登出时须调用 removeSyncPassword 清理。
+   */
+  static async setSyncPassword(value: string): Promise<void> {
+    if (value.length === 0) {
+      await CredentialStore.removeSyncPassword();
+      return;
+    }
+    await CredentialStore.writeAlias(`${ALIAS_PREFIX_VAULT_KEY}sync_password`, value);
+  }
+
+  /** 读取已保存的同步密码；不存在返回 null */
+  static async getSyncPassword(): Promise<string | null> {
+    return CredentialStore.readAlias(`${ALIAS_PREFIX_VAULT_KEY}sync_password`);
+  }
+
+  /** 删除已保存的同步密码；不存在视为幂等成功 */
+  static async removeSyncPassword(): Promise<void> {
+    await CredentialStore.deleteAlias(`${ALIAS_PREFIX_VAULT_KEY}sync_password`);
+  }
+
+  /**
+   * 别名写入的公共实现（add 冲突自动转 update，访问控制见 setSecret 文档注释）。
+   * 供 setSecret / setSyncToken 共用。
+   */
+  private static async writeAlias(alias: string, value: string): Promise<void> {
     const attributes: asset.AssetMap = new Map();
     attributes.set(asset.Tag.ALIAS, encodeUtf8(alias));
     attributes.set(asset.Tag.SECRET, encodeUtf8(value));
@@ -188,9 +261,8 @@ export class CredentialStore {
     }
   }
 
-  /** 读取凭据；不存在返回 null（NOT_FOUND 归一），真故障抛 SshError(INTERNAL_ERROR) */
-  static async getSecret(hostId: string, kind: CredentialKind): Promise<string | null> {
-    const alias: string = secretAlias(hostId, kind);
+  /** 别名读取的公共实现，供 getSecret / getSyncToken 共用 */
+  private static async readAlias(alias: string): Promise<string | null> {
     const query: asset.AssetMap = CredentialStore.aliasQuery(alias);
     query.set(asset.Tag.RETURN_TYPE, asset.ReturnType.ALL);
     let results: asset.AssetMap[];
@@ -213,9 +285,8 @@ export class CredentialStore {
     return decodeUtf8(secret);
   }
 
-  /** 删除单个凭据；不存在视为幂等成功，真故障抛 SshError(INTERNAL_ERROR) */
-  static async removeSecret(hostId: string, kind: CredentialKind): Promise<void> {
-    const alias: string = secretAlias(hostId, kind);
+  /** 别名删除的公共实现，供 removeSecret / removeSyncToken 共用 */
+  private static async deleteAlias(alias: string): Promise<void> {
     try {
       await asset.remove(CredentialStore.aliasQuery(alias));
     } catch (err) {
@@ -223,13 +294,6 @@ export class CredentialStore {
         return;
       }
       throw CredentialStore.fatal('remove', alias, err);
-    }
-  }
-
-  /** 删除主机时级联清理三种凭据（密码 / 密码短语 / 私钥） */
-  static async removeAllSecrets(hostId: string): Promise<void> {
-    for (const kind of ALL_CREDENTIAL_KINDS) {
-      await CredentialStore.removeSecret(hostId, kind);
     }
   }
 

@@ -130,6 +130,30 @@ export function runTestConnect(deps: TestConnectDeps, request: TestConnectReques
       resolve(result);
     };
 
+    /**
+     * 进入 authenticating 后提交认证材料（只提交一次）。
+     * 受理后 native 已持有凭据副本，立即原地清零请求对象中的明文，此后 ArkTS 侧零持有。
+     */
+    let authSubmitted: boolean = false;
+    const submitAuth = (): void => {
+      if (authSubmitted || settled || session === null) {
+        return;
+      }
+      authSubmitted = true;
+      const accepted: boolean = request.authType === 'password'
+        ? session.authenticatePassword(request.password)
+        : session.authenticatePublicKey(request.privateKey, '', request.passphrase);
+      request.password = '';
+      request.privateKey = '';
+      request.passphrase = '';
+      if (!accepted) {
+        const code: SshErrorCode = request.authType === 'password'
+          ? SshErrorCode.AUTH_PASSWORD_FAILED
+          : SshErrorCode.AUTH_PUBLICKEY_FAILED;
+        finish(makeResult(false, '认证请求未被受理', code, hostKey));
+      }
+    };
+
     const onEvent = (event: SshEvent): void => {
       if (event.type === 'hostKey') {
         // 首连指纹素材：随最终结果返回给页面展示；确认入库闭环归 U4
@@ -144,6 +168,12 @@ export function runTestConnect(deps: TestConnectDeps, request: TestConnectReques
         return;
       }
       const to: string = event.to ?? '';
+      if (to === 'authenticating') {
+        // 认证只能在 authenticating 态发起（cpp/ssh/auth.cpp）；connect() 是受理语义，
+        // 其返回时握手尚未完成，在那里同步发起必被拒。故推迟到本事件。
+        submitAuth();
+        return;
+      }
       if (to === 'established') {
         finish(makeResult(true, '连接测试成功', null, hostKey));
         return;
@@ -169,19 +199,6 @@ export function runTestConnect(deps: TestConnectDeps, request: TestConnectReques
     if (!session.connect(request.host, request.port, request.username)) {
       finish(makeResult(false, '连接请求未被受理', SshErrorCode.INTERNAL_ERROR, null));
       return;
-    }
-    const accepted: boolean = request.authType === 'password'
-      ? session.authenticatePassword(request.password)
-      : session.authenticatePublicKey(request.privateKey, '', request.passphrase);
-    // 受理后 native 已持有凭据副本：立即原地清零请求对象中的明文，此后 ArkTS 侧零持有
-    request.password = '';
-    request.privateKey = '';
-    request.passphrase = '';
-    if (!accepted) {
-      const code: SshErrorCode = request.authType === 'password'
-        ? SshErrorCode.AUTH_PASSWORD_FAILED
-        : SshErrorCode.AUTH_PUBLICKEY_FAILED;
-      finish(makeResult(false, '认证请求未被受理', code, hostKey));
     }
   });
 }

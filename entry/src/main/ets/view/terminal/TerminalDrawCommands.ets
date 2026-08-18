@@ -12,8 +12,8 @@
  *    不出字形（背景照常参与合并）；
  *  - ATTR_BLINK 首版按静止绘制（闪烁定时器见 TerminalCanvas 头注）。
  *
- * 坐标约定：x/y 为像素（vp 单位模式），文本 y 为行垂直中心
- * （组件侧 textBaseline = 'middle'）。
+ * 坐标约定：x/y 为像素（vp 单位模式），文本 y 为行垂直中心；组件执行时
+ * 使用 alphabetic baseline，并叠加 FontMetrics 实测的视觉居中偏移。
  */
 import {
   ATTR_BOLD,
@@ -30,6 +30,14 @@ import {
 import { CursorStyle } from '../../common/model/models';
 import { applyBoldAsBright, applyDim } from './TerminalPalette';
 
+/**
+ * native VtermBridge 未注入外观时的默认色（vterm_screen.h kDefault*）。
+ * 真实 SSH 网格里「默认底/字」就是这两个值；绘制时替换成外观前后景，
+ * 否则改 appearance.background 只动页面外框，字符格仍是纯黑。
+ */
+export const NATIVE_DEFAULT_FG_ARGB: number = 0xFFE5E5E5;
+export const NATIVE_DEFAULT_BG_ARGB: number = 0xFF000000;
+
 /** 一段背景填充（对应一次 fillRect） */
 export interface BgRun {
   x: number;
@@ -45,7 +53,7 @@ export interface TextRun {
   text: string;
   /** 起始格像素 x */
   x: number;
-  /** 行垂直中心 y（textBaseline='middle' 的绘制原点） */
+  /** 行垂直中心 y（组件执行时换算为 alphabetic baseline） */
   y: number;
   /** 覆盖格数（宽字符计 2）：underline/strike 的线长 = cellSpan × cellWidth */
   cellSpan: number;
@@ -92,8 +100,8 @@ interface ResolvedStyle {
 
 /** 属性管线：reverse 互换 → bold-as-bright → dim（blink 首版忽略，见文件头注） */
 function resolveStyle(cell: DecodedCell, env: RowRenderEnv): ResolvedStyle {
-  let fg = cell.fgArgb;
-  let bg = cell.bgArgb;
+  let fg = cell.fgArgb === NATIVE_DEFAULT_FG_ARGB ? env.defaultFgArgb : cell.fgArgb;
+  let bg = cell.bgArgb === NATIVE_DEFAULT_BG_ARGB ? env.defaultBgArgb : cell.bgArgb;
   const bold = (cell.attrs & ATTR_BOLD) !== 0;
   if ((cell.attrs & ATTR_REVERSE) !== 0) {
     const swap = fg;
@@ -286,14 +294,26 @@ export function generateCursorCommands(style: CursorStyle, view: DataView | null
  * 含逗号的字族名（匹配不到任何字体）。
  * ⚠️ 字族列表的逐字回退（ASCII 用前者、CJK 落后者）是否生效需真机验证（TASKS T5）。
  */
+/** 通用等宽族名：Canvas 唯一可靠解析到真等宽字体的写法（不加引号，CSS 通用族） */
+const GENERIC_MONOSPACE: string = 'monospace';
+
 export function buildFontString(italic: boolean, bold: boolean, fontWeight: number,
   fontSizeVp: number, fontFamily: string): string {
   const styleToken = italic ? 'italic' : 'normal';
   const weightToken = bold ? 'bold' : (fontWeight === 400 ? 'normal' : `${fontWeight}`);
-  const families = fontFamily.split(',')
+  const quoted: string[] = fontFamily.split(',')
     .map((name: string) => name.trim())
     .filter((name: string) => name.length > 0)
-    .map((name: string) => name.startsWith('"') ? name : `"${name}"`)
-    .join(', ');
-  return `${styleToken} ${weightToken} ${fontSizeVp}vp ${families}`;
+    .map((name: string) => name.startsWith('"') ? name : `"${name}"`);
+  // 末尾恒兜通用 monospace：真机实测 Canvas 解析不了 registerFont 注册的自定义
+  // 字族（"JetBrains Mono" 的度量与一个不存在的字体名完全一致：W=13.52/i=3.37，
+  // 即回落到了默认比例字体，终端列宽全错），而字族列表回退是生效的，
+  // 且 monospace 是真等宽（W=i=8.40）。保留自定义名在前，便于日后设备支持时自动启用。
+  // 去重按去引号后的名字比较：字族栈里已显式写了 monospace 时不再重复追加
+  const alreadyMono: boolean = quoted.some((name: string) =>
+    name.replace(/"/g, '') === GENERIC_MONOSPACE);
+  if (!alreadyMono) {
+    quoted.push(GENERIC_MONOSPACE);
+  }
+  return `${styleToken} ${weightToken} ${fontSizeVp}vp ${quoted.join(', ')}`;
 }

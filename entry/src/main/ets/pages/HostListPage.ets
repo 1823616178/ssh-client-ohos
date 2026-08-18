@@ -7,6 +7,7 @@
  *   - 快速连接卡：host[:port] + 用户名 → 构造临时 HostProfile 调 SessionManager.connect
  *     受理后持 sessionId 跳 TerminalPage（不落库；临时主机不在库中，终端页无法按
  *     hostId 取回，故先受理再跳转，U4 接线）；
+ *   - 点已保存主机一律按 hostId 新拨，允许同一连接同时开多路；
  *   - 分组列表：List + LazyForEach + IDataSource 懒加载（对应验收「100 台主机滚动 ≥55fps」
  *     的代码侧要求），按 order 升序分组区 + 未分组区，组头点击折叠（持久化到 C3
  *     hostGroupCollapsed 键，重启复原）；
@@ -31,12 +32,14 @@ import { SshEvent } from '../napi/SshNative';
 import { CredentialStore } from '../repository/CredentialStore';
 import { SessionEventListener, SessionInfo, SessionManager } from '../service/SessionManager';
 import { Tokens } from '../theme/Tokens';
+import { SyncRuntime } from '../service/sync/SyncRuntime';
 import {
   HostConnStatus,
   HostListRow,
   HostListViewModel,
   QuickConnectTarget,
-  parseQuickConnectAddress
+  parseQuickConnectAddress,
+  recordHostLastUsed
 } from '../viewmodel/HostListViewModel';
 
 const LOG_TAG: string = 'HostListPage';
@@ -86,6 +89,8 @@ export struct HostListPage {
    * 首次 aboutToAppear 已 reload，此处仅响应后续变化（@Watch 只在值变化时触发）。
    */
   @Prop @Watch('onRefreshTick') refreshTick: number = 0;
+  @State private syncChipSub: string = '云同步';
+  @State private syncLinked: boolean = false;
   /** 视图模型：搜索串 / 折叠集合 / 派生行（生产依赖惰性解析 AppDatabase / SettingsRepository） */
   private readonly viewModel: HostListViewModel = new HostListViewModel();
   private readonly dataSource: HostRowDataSource = new HostRowDataSource();
@@ -107,7 +112,16 @@ export struct HostListPage {
     this.viewModel.reload();
     this.refreshConnStatus();
     this.reloadRows();
+    this.refreshSyncChip();
+    // SyncRuntime.start() 是 fire-and-forget，token 落 asset 是异步的；冷启动本页多半比
+    // hydrate 先跑完，这里补一次，避免芯片瞬间误报「未登录」
+    void this.refreshSyncChipAfterHydrate();
     SessionManager.get().addEventListener(this.sessionListener);
+  }
+
+  private async refreshSyncChipAfterHydrate(): Promise<void> {
+    await SyncRuntime.get().ensureHydrated();
+    this.refreshSyncChip();
   }
 
   aboutToDisappear(): void {
@@ -139,6 +153,29 @@ export struct HostListPage {
     this.viewModel.reload();
     this.refreshConnStatus();
     this.reloadRows();
+    this.refreshSyncChip();
+  }
+
+  /** 顶栏芯片：登录/锁定/已连接，从同步运行时快照（页面重建时刷新） */
+  private refreshSyncChip(): void {
+    try {
+      const runtime: SyncRuntime = SyncRuntime.get();
+      if (!runtime.auth.isSignedIn()) {
+        this.syncChipSub = '未登录';
+        this.syncLinked = false;
+        return;
+      }
+      if (!runtime.vault.isReady()) {
+        this.syncChipSub = '已锁定';
+        this.syncLinked = false;
+        return;
+      }
+      this.syncChipSub = '已连接';
+      this.syncLinked = true;
+    } catch (_err) {
+      this.syncChipSub = '云同步';
+      this.syncLinked = false;
+    }
   }
 
   /** 「+」与空状态按钮共用：跳 HostEditPage 新建（U2 接线） */
@@ -147,31 +184,14 @@ export struct HostListPage {
   }
 
   /**
-   * 点按主机行：跳 TerminalPage（U4 接线，连接编排移交给终端页）。
-   * 该主机已有 established 会话时传 sessionId 复用，否则只传 hostId 由终端页发起
-   * 新连接（终端页路由参数二选一、同传 sessionId 优先，见 TerminalViewModel 头注）。
+   * 点按主机行：始终按 hostId 进终端页，再拨一路独立会话。
+   * 同一主机允许同时开多个连接；已有会话从终端页标签 / 连接抽屉切回去。
    */
   private openTerminal(host: HostProfile): void {
-    // arkts-no-untyped-obj-literals：非空 Record 字面量禁，空字面量 + 逐键赋值
+    recordHostLastUsed(host.id);
     const params: Record<string, Object> = {};
-    const established: string | null = this.establishedSessionOf(host.id);
-    if (established !== null) {
-      params['sessionId'] = established;
-    } else {
-      params['hostId'] = host.id;
-    }
+    params['hostId'] = host.id;
     router.pushUrl({ url: 'pages/TerminalPage', params: params });
-  }
-
-  /** 该主机当前 established 会话的 sessionId（复用入口；无则 null，由终端页新连） */
-  private establishedSessionOf(hostId: string): string | null {
-    const sessions: SessionInfo[] = SessionManager.get().listSessions();
-    for (let i = 0; i < sessions.length; i++) {
-      if (sessions[i].hostId === hostId && sessions[i].state === 'established') {
-        return sessions[i].sessionId;
-      }
-    }
-    return null;
   }
 
   /** 快速连接：host[:port] + 用户名 → 临时 HostProfile（不落库）→ 先受理连接再持 sessionId 跳 TerminalPage */
@@ -290,26 +310,40 @@ export struct HostListPage {
 
   build() {
     Column() {
-      // 顶栏：标题 + 「+」新增入口
+      // 顶栏：字标 + 标题 + 云同步胶囊 + 「+」新增入口
       Row() {
-        Text('主机')
-          .fontSize(Tokens.fontSize.headline)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Tokens.Color.text)
+        Column() {
+          Text('SSH CLIENT')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.accent)
+            .fontWeight(FontWeight.Bold)
+            .letterSpacing(1.2)
+          Text('主机')
+            .fontSize(Tokens.fontSize.headline)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Tokens.Color.text)
+            .margin({ top: Tokens.space.xs2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+
         Blank()
-        Text('+')
-          .fontSize(Tokens.fontSize.headline)
-          .fontColor(Tokens.Color.accent)
-          .padding(Tokens.space.xs)
-          .onClick(() => {
-            this.onAddHost();
-          })
+
+        this.SyncChip()
+        this.SettingsButton()
+        this.ConfigManagerButton()
+        this.AddHostButton()
       }
       .width('100%')
+      .alignItems(VerticalAlign.Center)
 
       // 搜索框：实时过滤（名称/主机/用户名，大小写不敏感）
-      TextInput({ placeholder: '搜索名称 / 主机地址 / 用户名' })
+      TextInput({ placeholder: '搜索名称 / IP / 用户名...' })
         .fontSize(Tokens.fontSize.body)
+        .fontColor(Tokens.Color.text)
+        .placeholderColor(Tokens.Color.textFaint)
+        .backgroundColor(Tokens.Color.surface)
+        .borderRadius(Tokens.radius.sm)
+        .height(42)
         .width('100%')
         .margin({ top: Tokens.space.sm })
         .onChange((value: string) => {
@@ -319,18 +353,43 @@ export struct HostListPage {
 
       // 快速连接卡（页首）：host[:port] + 用户名，临时配置不落库
       Column() {
-        Text('快速连接')
-          .fontSize(Tokens.fontSize.title)
-          .fontColor(Tokens.Color.text)
         Row() {
-          TextInput({ placeholder: 'host[:port]' })
+          Column() {
+            Text('QUICK CONNECT')
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(Tokens.Color.accent)
+              .fontWeight(FontWeight.Bold)
+              .letterSpacing(1)
+            Text('快速直连')
+              .fontSize(Tokens.fontSize.title)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(Tokens.Color.text)
+              .margin({ top: Tokens.space.xs2 })
+          }
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+
+        Row() {
+          TextInput({ placeholder: 'IP 或域名:端口 (如 192.168.1.1:22)' })
             .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.text)
+            .placeholderColor(Tokens.Color.textFaint)
+            .backgroundColor(Tokens.Color.surfaceHover)
+            .borderRadius(Tokens.radius.sm)
+            .height(42)
             .layoutWeight(2)
             .onChange((value: string) => {
               this.quickAddress = value;
             })
-          TextInput({ placeholder: '用户名' })
+
+          TextInput({ placeholder: '用户名 (如 root)' })
             .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.text)
+            .placeholderColor(Tokens.Color.textFaint)
+            .backgroundColor(Tokens.Color.surfaceHover)
+            .borderRadius(Tokens.radius.sm)
+            .height(42)
             .layoutWeight(1)
             .margin({ left: Tokens.space.xs })
             .onChange((value: string) => {
@@ -338,13 +397,15 @@ export struct HostListPage {
             })
         }
         .width('100%')
-        .margin({ top: Tokens.space.xs })
+        .margin({ top: Tokens.space.sm })
 
-        Button('连接')
+        Button('立即连接终端')
           .fontSize(Tokens.fontSize.body)
-          .fontColor(Color.White)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.onAccent)
           .backgroundColor(Tokens.Color.accent)
           .borderRadius(Tokens.radius.sm)
+          .height(42)
           .width('100%')
           .margin({ top: Tokens.space.sm })
           .onClick(() => {
@@ -391,13 +452,117 @@ export struct HostListPage {
         }
         .width('100%')
         .layoutWeight(1)
+        .margin({ top: Tokens.space.xs })
         .scrollBar(BarState.Off)
+        .contentEndOffset(Tokens.space.md)
       }
     }
     .width('100%')
     .height('100%')
     .backgroundColor(Tokens.Color.appBg)
-    .padding(Tokens.space.md)
+    .padding({
+      top: Tokens.space.md,
+      left: Tokens.space.md,
+      right: Tokens.space.md,
+      bottom: 0
+    })
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+  }
+
+  @Builder
+  SyncChip() {
+    Row() {
+      Column()
+        .width(Tokens.space.xs)
+        .height(Tokens.space.xs)
+        .borderRadius(Tokens.space.xs2)
+        .backgroundColor(this.syncLinked ? Tokens.Color.success : Tokens.Color.textFaint)
+        .margin({ right: Tokens.space.xs })
+
+      Column() {
+        Text('SYNC')
+          .fontSize(Tokens.fontSize.caption)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.Color.accent)
+          .letterSpacing(0.8)
+        Text(this.syncChipSub)
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.textDim)
+          .margin({ top: Tokens.space.xs2 })
+      }
+      .alignItems(HorizontalAlign.Start)
+    }
+    .padding({
+      left: Tokens.space.sm,
+      right: Tokens.space.sm,
+      top: Tokens.space.xs,
+      bottom: Tokens.space.xs
+    })
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.sm)
+    .margin({ right: Tokens.space.xs })
+    .onClick(() => {
+      router.pushUrl({ url: 'pages/AccountSyncPage' });
+    })
+  }
+
+  /** 设置入口（P1：后台保活/息屏断开两个开关此前无处可改） */
+  @Builder
+  SettingsButton() {
+    Row() {
+      Text('☰')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.textDim)
+    }
+    .width(36)
+    .height(36)
+    .justifyContent(FlexAlign.Center)
+    .alignItems(VerticalAlign.Center)
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.sm)
+    .margin({ right: Tokens.space.xs })
+    .onClick(() => {
+      router.pushUrl({ url: 'pages/SettingsPage' });
+    })
+  }
+
+  @Builder
+  ConfigManagerButton() {
+    Row() {
+      Text('⚙')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.textDim)
+    }
+    .width(36)
+    .height(36)
+    .justifyContent(FlexAlign.Center)
+    .alignItems(VerticalAlign.Center)
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.sm)
+    .margin({ right: Tokens.space.xs })
+    .onClick(() => {
+      router.pushUrl({ url: 'pages/ConfigManagerPage' });
+    })
+  }
+
+  @Builder
+  AddHostButton() {
+    Row() {
+      Text('+')
+        .fontSize(Tokens.fontSize.headline)
+        .fontColor(Tokens.Color.onAccent)
+        .fontWeight(FontWeight.Regular)
+        .textAlign(TextAlign.Center)
+    }
+    .width(36)
+    .height(36)
+    .justifyContent(FlexAlign.Center)
+    .alignItems(VerticalAlign.Center)
+    .backgroundColor(Tokens.Color.accent)
+    .borderRadius(Tokens.radius.sm)
+    .onClick(() => {
+      this.onAddHost();
+    })
   }
 
   /** 组头行：chevron + 组名 + 成员数；点击切换折叠（持久化，旋转动画可省——以字符切换代替） */
@@ -405,19 +570,29 @@ export struct HostListPage {
   GroupHeaderItem(row: HostListRow) {
     Row() {
       Text(row.collapsed ? '▸' : '▾')
-        .fontSize(Tokens.fontSize.body)
-        .fontColor(Tokens.Color.textFaint)
-      Text(row.groupName)
         .fontSize(Tokens.fontSize.title)
         .fontColor(Tokens.Color.textDim)
+      Text(row.groupName)
+        .fontSize(Tokens.fontSize.title)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.Color.text)
         .margin({ left: Tokens.space.xs })
-      Text(`${row.groupHostCount}`)
+      Text(`${row.groupHostCount} 台`)
         .fontSize(Tokens.fontSize.caption)
         .fontColor(Tokens.Color.textFaint)
+        .backgroundColor(Tokens.Color.surfaceHover)
+        .borderRadius(Tokens.radius.xs)
+        .padding({
+          left: Tokens.space.xs,
+          right: Tokens.space.xs,
+          top: Tokens.space.xs2,
+          bottom: Tokens.space.xs2
+        })
         .margin({ left: Tokens.space.xs })
     }
     .width('100%')
-    .padding({ top: Tokens.space.sm, bottom: Tokens.space.xs })
+    .alignItems(VerticalAlign.Center)
+    .padding({ top: Tokens.space.md, bottom: Tokens.space.xs })
     .onClick(() => {
       this.viewModel.toggleGroupCollapsed(row.groupId);
       this.reloadRows();
@@ -429,19 +604,30 @@ export struct HostListPage {
   HostItem(row: HostListRow) {
     if (row.host !== null) {
       Row() {
-        // 状态点：space_xs(8vp) 方块 + xs2(4vp) 圆角 = 正圆（仅用 Token）
-        Column()
-          .width(Tokens.space.xs)
-          .height(Tokens.space.xs)
-          .borderRadius(Tokens.space.xs2)
-          .backgroundColor(this.connStatusColor(row.connStatus))
-          .margin({ right: Tokens.space.sm })
+        // 状态呼吸指示器：带浅色圆底衬
+        Row() {
+          Column()
+            .width(Tokens.space.xs)
+            .height(Tokens.space.xs)
+            .borderRadius(Tokens.space.xs2)
+            .backgroundColor(this.connStatusColor(row.connStatus))
+        }
+        .width(24)
+        .height(24)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(VerticalAlign.Center)
+        .backgroundColor(Tokens.Color.surfaceHover)
+        .borderRadius(12)
+        .margin({ right: Tokens.space.sm })
+
         Column() {
           Text(row.host.name.length > 0 ? row.host.name : row.host.host)
             .fontSize(Tokens.fontSize.title)
+            .fontWeight(FontWeight.Medium)
             .fontColor(Tokens.Color.text)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+
           Text(`${row.host.username}@${row.host.host}:${row.host.port}`)
             .fontSize(Tokens.fontSize.caption)
             .fontColor(Tokens.Color.textDim)
@@ -454,8 +640,8 @@ export struct HostListPage {
 
         Text(this.authTypeLabel(row.host))
           .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.textDim)
-          .backgroundColor(Tokens.Color.surfaceHover)
+          .fontColor(Tokens.Color.accent)
+          .backgroundColor(Tokens.Color.accentMuted)
           .borderRadius(Tokens.radius.xs)
           .padding({
             left: Tokens.space.xs,
@@ -466,9 +652,10 @@ export struct HostListPage {
           .margin({ left: Tokens.space.sm })
       }
       .width('100%')
+      .alignItems(VerticalAlign.Center)
       .backgroundColor(Tokens.Color.surface)
       .borderRadius(Tokens.radius.sm)
-      .padding(Tokens.space.sm)
+      .padding(Tokens.space.md)
       .margin({ bottom: Tokens.space.xs })
       .onClick(() => {
         if (row.host !== null) {
@@ -515,22 +702,40 @@ export struct HostListPage {
   @Builder
   EmptyState() {
     Column() {
-      Text('>_')
-        .fontSize(Tokens.fontSize.display)
-        .fontColor(Tokens.Color.textFaint)
-      Text('还没有主机')
+      // 终端图标徽标
+      Row() {
+        Text('>_')
+          .fontSize(Tokens.fontSize.display)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.Color.accent)
+          .fontFamily('monospace')
+      }
+      .width(72)
+      .height(72)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .backgroundColor(Tokens.Color.surface)
+      .borderRadius(Tokens.radius.lg)
+
+      Text('暂无主机配置')
         .fontSize(Tokens.fontSize.title)
-        .fontColor(Tokens.Color.textDim)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.Color.text)
         .margin({ top: Tokens.space.md })
-      Text('添加主机后，点按即可发起 SSH 连接')
+
+      Text('添加主机后，点按即可一键发起 SSH 终端连接')
         .fontSize(Tokens.fontSize.body)
-        .fontColor(Tokens.Color.textFaint)
+        .fontColor(Tokens.Color.textDim)
         .margin({ top: Tokens.space.xs })
+
       Button('添加第一台主机')
         .fontSize(Tokens.fontSize.body)
-        .fontColor(Color.White)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.Color.onAccent)
         .backgroundColor(Tokens.Color.accent)
         .borderRadius(Tokens.radius.sm)
+        .height(42)
+        .padding({ left: Tokens.space.lg, right: Tokens.space.lg })
         .margin({ top: Tokens.space.lg })
         .onClick(() => {
           this.onAddHost();

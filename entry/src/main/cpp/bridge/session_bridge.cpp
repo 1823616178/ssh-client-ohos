@@ -210,6 +210,10 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
         SetStrProp(env, obj, "error", evt->text1);
         SetStrProp(env, obj, "message", evt->text2);
         break;
+    case EventKind::kTerminalData:
+        SetStrProp(env, obj, "type", "terminalData");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        break;
     case EventKind::kTerminalClose:
         SetStrProp(env, obj, "type", "terminalClose");
         SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
@@ -345,6 +349,13 @@ HandleTable<SessionHandle> g_table;
 void SendStateEvent(SessionHandle *sh, BridgeEvent *evt)
 {
     EnqueueEvent(sh->stateBridge, evt);
+}
+
+void SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt)
+{
+    // 终端字节已直接 feed 到 native vterm，这里只上抛「revision 变了」。
+    // data TSFN 有界；满队列时 EnqueueEvent 会释放 evt，已有待消费事件足以唤醒 UI。
+    EnqueueEvent(sh->dataBridge, evt);
 }
 
 namespace {
@@ -953,6 +964,27 @@ napi_value SetKeepalive(napi_env env, napi_callback_info info)
     return MakeBool(env, sh->session->setKeepaliveConfig(intervalSec, maxMisses));
 }
 
+// P1：网络切换后的主动探测（受理语义，仅 established 受理；裁决经 stateChange 事件回报）
+napi_value ProbeNow(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t h = 0;
+    uint32_t timeoutSec = 0; // 0 = 用 native 默认窗口（kDefaultKeepaliveProbeTimeoutSec）
+    if (argc < 1 || !GetHandleArg(env, argv[0], h)) {
+        return MakeBool(env, false);
+    }
+    if (argc >= 2 && !GetUint32Arg(env, argv[1], timeoutSec)) {
+        return MakeBool(env, false);
+    }
+    auto sh = LookupLive(h);
+    if (!sh || !sh->session) {
+        return MakeBool(env, false);
+    }
+    return MakeBool(env, sh->session->probeNow(timeoutSec));
+}
+
 // 读取退避序列数组（number[]，秒，0 表示立即重试档，86400 上限作 sanity 截断）；
 // 空数组 = 恢复默认序列（BackoffSchedule 构造约定）
 bool GetDelaysArg(napi_env env, napi_value v, std::vector<uint32_t> &out)
@@ -1051,6 +1083,7 @@ void RegisterSessionBridge(napi_env env, napi_value exports)
         {"closeChannel", nullptr, CloseChannel, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"closeSession", nullptr, CloseSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setKeepalive", nullptr, SetKeepalive, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"probeNow", nullptr, ProbeNow, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setReconnectPolicy", nullptr, SetReconnectPolicy, nullptr, nullptr, nullptr,
          napi_default, nullptr},
         {"nextReconnectDelaySec", nullptr, NextReconnectDelaySec, nullptr, nullptr, nullptr,

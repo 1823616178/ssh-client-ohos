@@ -26,7 +26,16 @@ const EXPECTED_DEFS: ExpectedDef[] = [
   { key: 'lastSessionId', type: 'string', defaultValue: '' },
   { key: 'syncPollIntervalMinutes', type: 'number', defaultValue: 15 },
   { key: 'hostGroupCollapsed', type: 'string', defaultValue: '{}' },
-  { key: 'keyboardShortcuts', type: 'string', defaultValue: '' }
+  { key: 'hostLastUsed', type: 'string', defaultValue: '{}' },
+  { key: 'keyboardShortcuts', type: 'string', defaultValue: '' },
+  { key: 'syncDeviceId', type: 'string', defaultValue: '' },
+  { key: 'syncUserEmail', type: 'string', defaultValue: '' },
+  { key: 'syncUserId', type: 'string', defaultValue: '' },
+  { key: 'syncVaultId', type: 'string', defaultValue: '' },
+  { key: 'syncLastRevision', type: 'string', defaultValue: '' },
+  { key: 'syncPasswords', type: 'boolean', defaultValue: false },
+  { key: 'syncPrivateKeys', type: 'boolean', defaultValue: false },
+  { key: 'syncPassthrough', type: 'string', defaultValue: '{}' }
 ];
 
 function findDef(key: string): SettingDef | null {

@@ -316,6 +316,7 @@ struct HostEditPage {
     .height('100%')
     .backgroundColor(Tokens.Color.appBg)
     .padding(Tokens.space.md)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   // ---------------------------------------------------------------- 分段卡片

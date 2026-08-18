@@ -25,8 +25,12 @@ class ColorTokens {
   readonly textDim: Resource = $r('app.color.app_text_dim');
   /** 占位/提示 */
   readonly textFaint: Resource = $r('app.color.app_text_faint');
-  /** 强调 */
+  /** 强调（电青） */
   readonly accent: Resource = $r('app.color.app_accent');
+  /** 强调浅底（卡片描边/徽标底） */
+  readonly accentMuted: Resource = $r('app.color.app_accent_muted');
+  /** 强调色上的文字 */
+  readonly onAccent: Resource = $r('app.color.app_on_accent');
   /** 状态：成功 */
   readonly success: Resource = $r('app.color.app_success');
   /** 状态：警告 */

@@ -245,6 +245,11 @@ export class SshTerminal {
     return this.alive && nativeCore().resizeTerminal(this.handle, cols, rows);
   }
 
+  /** 把外观前后景写进 native 默认色，SSH 网格空白格跟页面同一底色 */
+  setDefaultColors(fgArgb: number, bgArgb: number): boolean {
+    return this.alive && nativeCore().setTerminalDefaultColors(this.handle, fgArgb, bgArgb);
+  }
+
   /** 关闭终端（幂等）：native 后台完成通道关闭与资源回收，旧帧 buffer 仍可读 */
   detach(): void {
     if (!this.alive) {

@@ -15,6 +15,7 @@ import {
   DEFAULT_KEY_BAR_LAYOUT,
   KeyBarKeySpec,
   keyBarBytesForKey,
+  keyFaceOverlayForBackground,
   parseKeyBarLayout
 } from '../main/ets/view/KeyBar';
 import { KEY_DPAD_UP, KEY_ESCAPE, KEY_TAB } from '../main/ets/view/terminal/KeyMap';
@@ -47,10 +48,10 @@ export default function keyBarTest() {
       const keys = parseKeyBarLayout('');
       expect(keys.length).assertEqual(DEFAULT_KEY_BAR_LAYOUT.length);
       expect(keys[0].id).assertEqual('esc');
-      // 默认布局含 DESIGN §4.4 版面的全部键：Esc/Tab/Ctrl/Alt/↑/↓/←/→/- / | / ~ / /
+      // 默认布局含 DESIGN §4.4 版面的全部键，外加剪贴板动作键 复制/粘贴
       const ids = keys.map((k: KeyBarKeySpec) => k.id);
       expect(ids.join(',')).assertEqual(
-        'esc,tab,ctrl,alt,up,down,left,right,char:-,char:|,char:~,char:/');
+        'esc,tab,ctrl,alt,up,down,left,right,char:-,char:|,char:~,char:/,copy,paste');
     });
 
     it('非法JSON回退默认布局', 0, () => {
@@ -126,6 +127,12 @@ export default function keyBarTest() {
       const tab = specOf(DEFAULT_KEY_BAR_LAYOUT, 'tab');
       expect(tab.keyCode).assertEqual(KEY_TAB);
       assertBytes(keyBarBytesForKey(tab, false, false, false), [0x09], 'Tab 补全');
+    });
+
+    it('键面颜色按终端背景明暗自动适配', 0, () => {
+      expect(keyFaceOverlayForBackground('#0E131D')).assertEqual('#26FFFFFF');
+      expect(keyFaceOverlayForBackground('#F5F7FA')).assertEqual('#1F000000');
+      expect(keyFaceOverlayForBackground('invalid')).assertEqual('#26FFFFFF');
     });
   });
 }

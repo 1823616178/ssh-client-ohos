@@ -6,7 +6,7 @@
  * 对齐 C1 的 InMemoryRdbGateway 与 C4 的 fake 注入惯例）验证编排与持久化回路。
  *
  * 覆盖：搜索过滤（名称/主机/用户名、大小写、空串复原、首尾空白）/
- * 分组排序（order 升序、未分组置后、组内 name 字典序、空组隐藏、脏 groupId 归未分组）/
+ * 分组排序（order 升序、未分组置后、组内最后使用近者优先、空组隐藏、脏 groupId 归未分组）/
  * 折叠切换与持久化（JSON 往返、脏数据收敛空集、非布尔脏值剔除）/
  * 状态点派生（多会话同主机取最严重：error>connecting>disconnected>established>none）/
  * 快速连接地址解析。
@@ -34,11 +34,14 @@ import {
   buildHostRows,
   decodeCollapsedGroups,
   deriveHostConnStatus,
+  decodeHostLastUsed,
   encodeCollapsedGroups,
+  encodeHostLastUsed,
   filterHosts,
   parseQuickConnectAddress,
   sessionStateToStatus,
   sortGroupsByOrder,
+  sortHostsByLastUsed,
   toggleCollapsed
 } from '../main/ets/viewmodel/HostListViewModel';
 
@@ -213,7 +216,7 @@ export default function hostListViewModelTest() {
       expect(sorted[2].id).assertEqual('g3');
     });
 
-    it('行序列_分组区按序_未分组置后_组内按name字典序', 0, () => {
+    it('行序列_分组区按序_未分组置后_组内未使用按name字典序', 0, () => {
       const hosts: HostProfile[] = [
         makeHost('h-b', 'bbb', 'x', 'u', 'g1'),
         makeHost('h-a', 'aaa', 'x', 'u', 'g1'),
@@ -223,8 +226,49 @@ export default function hostListViewModelTest() {
       const groups: HostGroup[] = [makeGroup('g2', '二组', 2), makeGroup('g1', '一组', 1)];
       const rows: HostListRow[] = buildHostRows(hosts, groups, new Set(), emptyStatusMap());
       expect(groupIdsOf(rows).join(',')).assertEqual('g1,g2,');
-      // g1 组内：h-a 排在 h-b 前（name 字典序）
+      // 从未使用时退化为 name 字典序：h-a 排在 h-b 前
       expect(hostIdsOf(rows).join(',')).assertEqual('h-a,h-b,h2,h-u');
+    });
+
+    it('行序列_组内按最后使用近者优先', 0, () => {
+      const hosts: HostProfile[] = [
+        makeHost('h-a', 'aaa', 'x', 'u', 'g1'),
+        makeHost('h-b', 'bbb', 'x', 'u', 'g1'),
+        makeHost('h-c', 'ccc', 'x', 'u', 'g1')
+      ];
+      const groups: HostGroup[] = [makeGroup('g1', '一组', 1)];
+      const lastUsed: Map<string, number> = new Map();
+      lastUsed.set('h-c', 30);
+      lastUsed.set('h-a', 10);
+      const rows: HostListRow[] = buildHostRows(hosts, groups, new Set(), emptyStatusMap(), lastUsed);
+      expect(hostIdsOf(rows).join(',')).assertEqual('h-c,h-a,h-b');
+    });
+
+    it('最后使用编解码往返_脏数据收敛', 0, () => {
+      const source: Map<string, number> = new Map();
+      source.set('h1', 100);
+      source.set('h2', 200);
+      const back: Map<string, number> = decodeHostLastUsed(encodeHostLastUsed(source));
+      expect(back.get('h1')).assertEqual(100);
+      expect(back.get('h2')).assertEqual(200);
+      expect(decodeHostLastUsed('').size).assertEqual(0);
+      expect(decodeHostLastUsed('[]').size).assertEqual(0);
+      expect(decodeHostLastUsed('not-json').size).assertEqual(0);
+    });
+
+    it('sortHostsByLastUsed_近者优先_未使用靠后_同时间按name', 0, () => {
+      const hosts: HostProfile[] = [
+        makeHost('h-b', 'bbb', 'x', 'u', null),
+        makeHost('h-a', 'aaa', 'x', 'u', null),
+        makeHost('h-c', 'ccc', 'x', 'u', null)
+      ];
+      const lastUsed: Map<string, number> = new Map();
+      lastUsed.set('h-b', 5);
+      lastUsed.set('h-c', 5);
+      const sorted: HostProfile[] = sortHostsByLastUsed(hosts, lastUsed);
+      expect(sorted[0].id).assertEqual('h-b');
+      expect(sorted[1].id).assertEqual('h-c');
+      expect(sorted[2].id).assertEqual('h-a');
     });
 
     it('折叠组只保留组头行_未分组区同样可折叠', 0, () => {

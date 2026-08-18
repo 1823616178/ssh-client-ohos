@@ -48,7 +48,16 @@ const KEY_KEY_BAR_LAYOUT: string = 'keyBarLayout';
 const KEY_LAST_SESSION_ID: string = 'lastSessionId';
 const KEY_SYNC_POLL_INTERVAL_MINUTES: string = 'syncPollIntervalMinutes';
 const KEY_HOST_GROUP_COLLAPSED: string = 'hostGroupCollapsed';
+const KEY_HOST_LAST_USED: string = 'hostLastUsed';
 const KEY_KEYBOARD_SHORTCUTS: string = 'keyboardShortcuts';
+const KEY_SYNC_DEVICE_ID: string = 'syncDeviceId';
+const KEY_SYNC_USER_EMAIL: string = 'syncUserEmail';
+const KEY_SYNC_USER_ID: string = 'syncUserId';
+const KEY_SYNC_VAULT_ID: string = 'syncVaultId';
+const KEY_SYNC_LAST_REVISION: string = 'syncLastRevision';
+const KEY_SYNC_PASSWORDS: string = 'syncPasswords';
+const KEY_SYNC_PRIVATE_KEYS: string = 'syncPrivateKeys';
+const KEY_SYNC_PASSTHROUGH: string = 'syncPassthrough';
 
 /**
  * 键定义表：所有设置键的唯一声明处。
@@ -65,7 +74,16 @@ export const SETTING_DEFS: SettingDef[] = [
   { key: KEY_LAST_SESSION_ID, type: 'string', defaultValue: '', comment: '上次会话 id（§5.1），空串 = 无' },
   { key: KEY_SYNC_POLL_INTERVAL_MINUTES, type: 'number', defaultValue: 15, comment: '同步轮询间隔（分钟，§6.4 默认 15）' },
   { key: KEY_HOST_GROUP_COLLAPSED, type: 'string', defaultValue: '{}', comment: '主机分组折叠状态（JSON 串 groupId→boolean，U1；空对象 = 全部展开）' },
-  { key: KEY_KEYBOARD_SHORTCUTS, type: 'string', defaultValue: '', comment: '终端快捷键表（JSON 数组，空串 = 内置默认：Ctrl+Shift+T 新标签等）' }
+  { key: KEY_HOST_LAST_USED, type: 'string', defaultValue: '{}', comment: '主机最后使用时间（JSON 串 hostId→epochMs，本机；首页列表近者优先）' },
+  { key: KEY_KEYBOARD_SHORTCUTS, type: 'string', defaultValue: '', comment: '终端快捷键表（JSON 数组，空串 = 内置默认：Ctrl+Shift+T 新标签等）' },
+  { key: KEY_SYNC_DEVICE_ID, type: 'string', defaultValue: '', comment: '同步设备 id（登录复用，避免挤占 10 台配额）' },
+  { key: KEY_SYNC_USER_EMAIL, type: 'string', defaultValue: '', comment: '已登录邮箱（展示用）' },
+  { key: KEY_SYNC_USER_ID, type: 'string', defaultValue: '', comment: '已登录用户 id' },
+  { key: KEY_SYNC_VAULT_ID, type: 'string', defaultValue: '', comment: '云端 vault id' },
+  { key: KEY_SYNC_LAST_REVISION, type: 'string', defaultValue: '', comment: '上次成功同步的 revision' },
+  { key: KEY_SYNC_PASSWORDS, type: 'boolean', defaultValue: false, comment: '是否同步密码（S7，默认关）' },
+  { key: KEY_SYNC_PRIVATE_KEYS, type: 'boolean', defaultValue: false, comment: '是否同步私钥（S7，默认关）' },
+  { key: KEY_SYNC_PASSTHROUGH, type: 'string', defaultValue: '{}', comment: '桌面端专有字段透传缓存（JSON；隧道名/分组色等本地库无列可存的字段，上行时原样带回）' }
 ];
 
 export class SettingsRepository {
@@ -191,6 +209,15 @@ export class SettingsRepository {
     SettingsRepository.writeValue(KEY_HOST_GROUP_COLLAPSED, collapsedJson);
   }
 
+  /** 主机最后使用时间（JSON 串 hostId→epochMs）；'{}' = 从未记录 */
+  static getHostLastUsed(): string {
+    return SettingsRepository.readString(KEY_HOST_LAST_USED);
+  }
+
+  static setHostLastUsed(json: string): void {
+    SettingsRepository.writeValue(KEY_HOST_LAST_USED, json);
+  }
+
   /** 终端快捷键表（JSON 数组）；空串表示使用内置默认表 */
   static getKeyboardShortcuts(): string {
     return SettingsRepository.readString(KEY_KEYBOARD_SHORTCUTS);
@@ -198,6 +225,79 @@ export class SettingsRepository {
 
   static setKeyboardShortcuts(shortcutsJson: string): void {
     SettingsRepository.writeValue(KEY_KEYBOARD_SHORTCUTS, shortcutsJson);
+  }
+
+  static getSyncDeviceId(): string {
+    return SettingsRepository.readString(KEY_SYNC_DEVICE_ID);
+  }
+
+  static setSyncDeviceId(value: string): void {
+    SettingsRepository.writeValue(KEY_SYNC_DEVICE_ID, value);
+  }
+
+  static getSyncUserEmail(): string {
+    return SettingsRepository.readString(KEY_SYNC_USER_EMAIL);
+  }
+
+  static setSyncUserEmail(value: string): void {
+    SettingsRepository.writeValue(KEY_SYNC_USER_EMAIL, value);
+  }
+
+  static getSyncUserId(): string {
+    return SettingsRepository.readString(KEY_SYNC_USER_ID);
+  }
+
+  static setSyncUserId(value: string): void {
+    SettingsRepository.writeValue(KEY_SYNC_USER_ID, value);
+  }
+
+  static getSyncVaultId(): string {
+    return SettingsRepository.readString(KEY_SYNC_VAULT_ID);
+  }
+
+  static setSyncVaultId(value: string): void {
+    SettingsRepository.writeValue(KEY_SYNC_VAULT_ID, value);
+  }
+
+  static getSyncLastRevision(): string {
+    return SettingsRepository.readString(KEY_SYNC_LAST_REVISION);
+  }
+
+  static setSyncLastRevision(value: string): void {
+    SettingsRepository.writeValue(KEY_SYNC_LAST_REVISION, value);
+  }
+
+  static isSyncPasswords(): boolean {
+    return SettingsRepository.readBoolean(KEY_SYNC_PASSWORDS);
+  }
+
+  static setSyncPasswords(value: boolean): void {
+    SettingsRepository.writeValue(KEY_SYNC_PASSWORDS, value);
+  }
+
+  static isSyncPrivateKeys(): boolean {
+    return SettingsRepository.readBoolean(KEY_SYNC_PRIVATE_KEYS);
+  }
+
+  static setSyncPrivateKeys(value: boolean): void {
+    SettingsRepository.writeValue(KEY_SYNC_PRIVATE_KEYS, value);
+  }
+
+  /** 桌面端专有字段透传缓存（JSON 串）；'{}' 表示空 */
+  static getSyncPassthrough(): string {
+    return SettingsRepository.readString(KEY_SYNC_PASSTHROUGH);
+  }
+
+  static setSyncPassthrough(value: string): void {
+    SettingsRepository.writeValue(KEY_SYNC_PASSTHROUGH, value);
+  }
+
+  /** accessToken / refreshToken 落 CredentialStore（asset），由 SettingsAuthStore 自行清除，不在此处 */
+  static clearSyncSession(): void {
+    SettingsRepository.setSyncUserEmail('');
+    SettingsRepository.setSyncUserId('');
+    SettingsRepository.setSyncVaultId('');
+    SettingsRepository.setSyncLastRevision('');
   }
 
   // ---- 内部读写辅助 ----

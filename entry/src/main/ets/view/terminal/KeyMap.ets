@@ -111,9 +111,30 @@ function asciiBytes(s: string): Uint8Array {
   return out;
 }
 
-/** 任意字符串 → UTF-8 字节（IME 提交的中文等非 ASCII 文本走这里） */
+/**
+ * 任意字符串 → UTF-8 字节（IME 提交的中文等非 ASCII 文本走这里）。
+ *
+ * 自己实现而不用 util.TextEncoder：真机上 `TextEncoder.create('utf-8').encodeInto(s)`
+ * 返回空数组（单测「中文整字提交」即在设备上复现），而 IME 的普通字符提交也走本函数，
+ * 于是软键盘敲什么都发不出去。手写编码没有运行时依赖，行为可在单测里完全确定。
+ * 按码点遍历，正确处理 BMP 外的代理对（emoji 等 4 字节序列）。
+ */
 export function utf8Bytes(s: string): Uint8Array {
-  return util.TextEncoder.create('utf-8').encodeInto(s);
+  const out: number[] = [];
+  for (const ch of s) {
+    const cp: number = ch.codePointAt(0) ?? 0;
+    if (cp < 0x80) {
+      out.push(cp);
+    } else if (cp < 0x800) {
+      out.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      out.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+    } else {
+      out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F),
+        0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+    }
+  }
+  return new Uint8Array(out);
 }
 
 /** ESC 前缀（Alt/Meta 组合：\x1b + 后续字节） */

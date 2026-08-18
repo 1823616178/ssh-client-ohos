@@ -4,7 +4,8 @@
  *
  * 职责：
  *  - CellPos/SelectionRange 坐标模型与 SelectionModel 状态机
- *    （begin 长按进入 → extend 拖动活动端 → cancel；selectAll 全选）；
+ *    （begin 长按进入 → extend 拖动活动端 / moveStart·moveEnd 拖两端手柄
+ *    → cancel；selectAll 全选）；
  *  - normalizeSelection：锚点/活动端任意方向 → 规范化 [start, end]（两端含）；
  *  - extractSelectionText：跨行拼接（行间补 '\n'、行尾去空格——终端惯例），
  *    宽字符边界不切半个字（起点落续格前移一格含整字；终点落首格后延一格含整字）；
@@ -196,6 +197,29 @@ export class SelectionModel {
     if (!this.selecting) {
       return;
     }
+    this.activePos = { row: pos.row, col: pos.col };
+  }
+
+  /**
+   * 拖动选区起点手柄：另一端钉在当前终点，起点跟手。
+   * 越过终点时 normalize 仍保证 range.start ≤ range.end。
+   */
+  moveStart(pos: CellPos): void {
+    const current: SelectionRange | null = this.range();
+    if (current === null) {
+      return;
+    }
+    this.anchorPos = { row: current.endRow, col: current.endCol };
+    this.activePos = { row: pos.row, col: pos.col };
+  }
+
+  /** 拖动选区终点手柄：另一端钉在当前起点，终点跟手。 */
+  moveEnd(pos: CellPos): void {
+    const current: SelectionRange | null = this.range();
+    if (current === null) {
+      return;
+    }
+    this.anchorPos = { row: current.startRow, col: current.startCol };
     this.activePos = { row: pos.row, col: pos.col };
   }
 

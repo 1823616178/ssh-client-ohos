@@ -814,10 +814,14 @@ export default function hostEditViewModelTest() {
       const request: TestConnectRequest = makeTestConnectRequest();
       const promise: Promise<TestConnectResult> = runTestConnect(fixture.deps, request);
       const session: FakeTestSession = fixture.created[0];
-      // 受理完成即弃置明文（事件等待期间 ArkTS 侧零持有）
-      expect(request.password).assertEqual('');
-      expect(session.passwordArg).assertEqual('pw-secret');
+      // 认证推迟到 authenticating：connect() 返回时握手未完成，native 不受理认证
+      expect(session.passwordArg).assertEqual('');
+      expect(request.password).assertEqual('pw-secret');
       session.emit({ type: 'hostKey', keyType: 'ssh-rsa', fingerprintSha256: 'SHA256:x', randomart: 'art' });
+      session.emit({ type: 'stateChange', from: 'handshaking', to: 'authenticating' });
+      // 受理完成即弃置明文（等 established 期间 ArkTS 侧零持有）
+      expect(session.passwordArg).assertEqual('pw-secret');
+      expect(request.password).assertEqual('');
       session.emit({ type: 'stateChange', from: 'authenticating', to: 'established' });
       const result: TestConnectResult = await promise;
       expect(result.success).assertTrue();
@@ -866,8 +870,11 @@ export default function hostEditViewModelTest() {
       expect(result1.success).assertFalse();
       expect(result1.message.indexOf('未被受理') >= 0).assertTrue();
       expect(connectRejected.created[0].closedCount).assertEqual(1);
+      // 认证不受理只有进 authenticating 后才暴露，故这里需要先推进状态
       const authRejected: ServiceFixture = makeServiceFixture(true, false);
-      const result2: TestConnectResult = await runTestConnect(authRejected.deps, makeTestConnectRequest());
+      const promise2: Promise<TestConnectResult> = runTestConnect(authRejected.deps, makeTestConnectRequest());
+      authRejected.created[0].emit({ type: 'stateChange', from: 'handshaking', to: 'authenticating' });
+      const result2: TestConnectResult = await promise2;
       expect(result2.success).assertFalse();
       expect(result2.message.indexOf('未被受理') >= 0).assertTrue();
       expect(authRejected.created[0].closedCount).assertEqual(1);

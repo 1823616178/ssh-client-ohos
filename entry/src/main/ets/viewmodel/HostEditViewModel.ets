@@ -45,6 +45,7 @@ import {
   createDefaultHostProfile
 } from '../common/model/models';
 import { AppDatabase } from '../repository/AppDatabase';
+import { notifyConfigSaved } from '../service/sync/SyncHooks';
 import { CredentialKind, CredentialStore } from '../repository/CredentialStore';
 import {
   HostKeyInfo,
@@ -731,6 +732,7 @@ export class HostEditViewModel {
         this.hostId = id;
       }
       this.saving = false;
+      notifyConfigSaved();
       return 'ok';
     } catch (err) {
       Logger.error(`主机保存失败: ${JSON.stringify(err)}`, LOG_TAG);

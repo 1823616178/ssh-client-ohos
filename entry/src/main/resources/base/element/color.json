@@ -2,51 +2,59 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#FFFFFF"
+      "value": "#E8F0F4"
     },
     {
       "name": "app_bg",
-      "value": "#F2F5FB"
+      "value": "#E8F0F4"
     },
     {
       "name": "app_surface",
-      "value": "#FFFFFF"
+      "value": "#F4FAFC"
     },
     {
       "name": "app_surface_hover",
-      "value": "#F5F8FF"
+      "value": "#D7EEF4"
     },
     {
       "name": "app_border",
-      "value": "#E0E6F2"
+      "value": "#B3D4DE"
     },
     {
       "name": "app_text",
-      "value": "#1A2233"
+      "value": "#0B1C24"
     },
     {
       "name": "app_text_dim",
-      "value": "#5D6B85"
+      "value": "#3D5A66"
     },
     {
       "name": "app_text_faint",
-      "value": "#8A97AE"
+      "value": "#6A8490"
     },
     {
       "name": "app_accent",
-      "value": "#2F6FE4"
+      "value": "#0088A3"
+    },
+    {
+      "name": "app_accent_muted",
+      "value": "#D4F4FA"
+    },
+    {
+      "name": "app_on_accent",
+      "value": "#F4FFFE"
     },
     {
       "name": "app_success",
-      "value": "#16A765"
+      "value": "#0B8F62"
     },
     {
       "name": "app_warn",
-      "value": "#C9800C"
+      "value": "#B86A00"
     },
     {
       "name": "app_danger",
-      "value": "#DC3F43"
+      "value": "#C41E4A"
     }
   ]
 }

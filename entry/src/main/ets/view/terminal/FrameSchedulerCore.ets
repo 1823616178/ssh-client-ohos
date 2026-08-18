@@ -13,12 +13,9 @@
  * 静止省电的第二层——自动休眠（CPU≈0 的保证机制）：
  * 连续 idleFramesBeforeSleep 帧（默认 90，≈1s @60–120Hz 折中）所有可见实例都
  * 无绘制后 ticker.stop()，displaySync 完全摘出 vsync 管线。
- * ⚠️ 已知风险：T3 是拉模型，native → ArkTS 没有「网格变脏」推送事件，休眠期间
- * 到达的远端输出要等一次 wakeup() 才上屏。唤醒源：register / setVisible(true) /
- * wakeup()（TerminalCanvas 的 onAreaChange、外观变更、notifyContentDirty 都会调）。
- * U4 整合时须把会话事件流（channelData/terminalBell 等）接到对应画布的
- * notifyContentDirty()；若真机验证发现输出延迟不可接受，构造时传
- * autoSleep=false 退回第一层即可。
+ * native 每次发布新网格 revision 后都会推送 terminalData，SessionManager 将其路由到
+ * wakeup()；本地输入还会在 write 前预唤醒，使远端回显可直接赶上下一个 vsync。
+ * 其他唤醒源：register / setVisible(true) / onAreaChange / 外观变更。
  *
  * 语义约定（全部有测试锚定）：
  *  - register：id 重复或空串抛 Error；注册即唤醒帧循环；

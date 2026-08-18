@@ -24,21 +24,25 @@
 
 import { describe, it, expect } from '@ohos/hypium';
 import { HostProfile, createDefaultHostProfile } from '../main/ets/common/model/models';
+import { SshErrorCode } from '../main/ets/common/SshError';
 import { SshEvent } from '../main/ets/napi/SshNative';
 import {
   NativeSessionHandleLike,
   OverlayInput,
   OverlayModel,
+  PaneRenderItem,
   TERMINAL_MAIN_PANE_ID,
   TerminalFactory,
   TerminalHostDaoLike,
   TerminalLike,
   TerminalRouteParams,
+  TerminalSecretWriterLike,
   TerminalSessionEventListener,
   TerminalSessionHostLike,
   TerminalSessionLike,
   TerminalViewModel,
   deriveOverlay,
+  isPasswordRetryError,
   parseTerminalRouteParams
 } from '../main/ets/viewmodel/TerminalViewModel';
 
@@ -280,15 +284,34 @@ class FakeHostDao implements TerminalHostDaoLike {
     const host: HostProfile | undefined = this.byId.get(id);
     return host === undefined ? null : host;
   }
+
+  listAll(): HostProfile[] {
+    const result: HostProfile[] = [];
+    this.byId.forEach((host: HostProfile) => {
+      result.push(host);
+    });
+    return result;
+  }
 }
 
 // ---------- 测试环境 ----------
 
+class FakeSecretWriter implements TerminalSecretWriterLike {
+  readonly saved: string[] = [];
+
+  savePassword(hostId: string, password: string): Promise<void> {
+    this.saved.push(`${hostId}:${password.length}`);
+    return Promise.resolve();
+  }
+}
+
 class TestEnv {
   readonly host: FakeSessionHost = new FakeSessionHost();
   readonly dao: FakeHostDao = new FakeHostDao();
+  readonly secrets: FakeSecretWriter = new FakeSecretWriter();
   vibrateCount: number = 0;
   dirtyCount: number = 0;
+  uiCount: number = 0;
   readonly vm: TerminalViewModel;
 
   constructor() {
@@ -296,11 +319,15 @@ class TestEnv {
       sessionHost: this.host,
       hostDao: this.dao,
       terminalFactory: this.host.factory.factory,
+      secretWriter: this.secrets,
       vibrate: (): void => {
         this.vibrateCount++;
       },
       onContentDirty: (): void => {
         this.dirtyCount++;
+      },
+      onUiChange: (): void => {
+        this.uiCount++;
       }
     });
   }
@@ -480,6 +507,7 @@ export default function terminalViewModelTest() {
       expect(env.vm.overlay.kind).assertEqual('connecting');
       expect(env.vm.hostName).assertEqual('主机h1');
       expect(env.vm.sessionList.length).assertEqual(1);
+      expect(env.uiCount > 0).assertTrue();
       // established → attach（初始 80x24、termType 取主机配置）+ 轻震 + 无蒙层
       env.host.emit(sessionId, stateChange('established'));
       expect(env.host.ops[1]).assertEqual(`attach:101:xterm-256color:80x24`);
@@ -751,6 +779,46 @@ export default function terminalViewModelTest() {
       expect(env.vm.currentSessionId).assertEqual(session2);
     });
 
+    it('加号新建连接标签_先显示选择页_选中后只替换新标签', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.dao.put(sampleHost('h2'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1151);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      const originalTabId: string = env.vm.activeTabId;
+
+      env.vm.openConnectionTab();
+      expect(env.vm.tabs.length).assertEqual(2);
+      expect(env.vm.activeTabId === originalTabId).assertFalse();
+      expect(env.vm.currentSessionId).assertEqual('');
+      expect(env.vm.overlay.kind).assertEqual('none');
+      expect(env.vm.visiblePanes.length).assertEqual(1);
+      expect(env.vm.visiblePanes[0].connectionPicker).assertTrue();
+
+      await env.vm.openHost('h2', 'replace');
+      expect(env.vm.tabs.length).assertEqual(2);
+      expect(env.vm.currentSessionId.length > 0).assertTrue();
+      expect(env.vm.visiblePanes[0].connectionPicker).assertFalse();
+      expect(env.vm.tabs[1].title).assertEqual('主机h2');
+
+      env.vm.activateTab(originalTabId);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+    });
+
+    it('已有会话时再打开主机_新开标签不覆盖旧连接', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.dao.put(sampleHost('h2'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1161);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      await env.vm.openHost('h2', 'replace');
+      expect(env.vm.tabs.length).assertEqual(2);
+      expect(env.vm.currentSessionId !== 's-1').assertTrue();
+      env.vm.activateTab(env.vm.tabs[0].tabId);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+      expect(env.vm.leafCount()).assertEqual(2);
+    });
+
     it('抽屉切到已寄宿会话_只聚焦不换绑', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.dao.put(sampleHost('h1'));
@@ -801,6 +869,20 @@ export default function terminalViewModelTest() {
       env.vm.setPaneAreaSize(200, 80);
       await env.vm.splitFocused('row');
       const splitId: string = env.vm.dividers[0].splitId;
+      const firstBefore: PaneRenderItem = env.vm.visiblePanes[0];
+      const uiBefore: number = env.uiCount;
+      // 可用 192；0.5001 仍 floor 为 96，不应为同一像素内的触摸采样重排 ArkUI。
+      env.vm.setDividerRatio(splitId, 0.5001);
+      expect(env.uiCount).assertEqual(uiBefore);
+      expect(env.vm.visiblePanes[0]).assertEqual(firstBefore);
+      // 跨过像素边界后只复制几何，终端与业务快照保持同一引用。
+      env.vm.setDividerRatio(splitId, 0.51);
+      expect(env.uiCount).assertEqual(uiBefore + 1);
+      expect(env.vm.visiblePanes[0].terminal).assertEqual(firstBefore.terminal);
+      // 松手强制发布最终亚像素 ratio，供下一次拖动使用。
+      env.vm.setDividerRatio(splitId, 0.5101, true);
+      expect(env.uiCount).assertEqual(uiBefore + 2);
+      expect(env.vm.dividers[0].ratio).assertEqual(0.5101);
       env.vm.setDividerRatio(splitId, 0.25);
       expect(env.vm.dividers[0].ratio).assertEqual(0.25);
       // 可用 192，A = floor(48)=48
@@ -809,7 +891,7 @@ export default function terminalViewModelTest() {
       expect(env.vm.dividers[0].ratio).assertEqual(0.1);
     });
 
-    it('断点降级_lg到sm只见聚焦叶_切回lg树与会话完好', 0, async () => {
+    it('双窗格_lg到sm仍同时显示_切回lg树与会话完好', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.dao.put(sampleHost('h1'));
       env.host.addSession('s-1', 'h1', '主机h1', 'established', 1501);
@@ -823,9 +905,9 @@ export default function terminalViewModelTest() {
       expect(env.vm.dividers.length).assertEqual(1);
       env.vm.setViewportWidth(400); // sm
       expect(env.vm.breakpoint).assertEqual('sm');
-      expect(env.vm.visiblePanes.length).assertEqual(1);
-      expect(env.vm.visiblePanes[0].paneId).assertEqual(pane2);
-      expect(env.vm.dividers.length).assertEqual(0);
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.visiblePanes[1].paneId).assertEqual(pane2);
+      expect(env.vm.dividers.length).assertEqual(1);
       expect(env.vm.leafCount()).assertEqual(2);
       env.vm.setViewportWidth(900);
       expect(env.vm.breakpoint).assertEqual('lg');
@@ -886,10 +968,87 @@ export default function terminalViewModelTest() {
       expect(env.vm.handleShortcut('focusRight')).assertTrue();
       expect(env.vm.focusedPaneId).assertEqual(rightPane);
       expect(env.vm.handleShortcut('closePane')).assertTrue();
-      expect(env.vm.leafCount()).assertEqual(1);
+      // 第二个标签仍有一个叶；这里关闭的只是首标签右侧窗格。
+      expect(env.vm.leafCount()).assertEqual(2);
       expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
       expect(env.vm.handleShortcut('copy')).assertFalse();
       expect(env.vm.handleShortcut('paste')).assertFalse();
+    });
+
+    it('连接选择_指定另一主机左右分屏_窗格标签与地址独立', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      const first: HostProfile = sampleHost('h1');
+      const second: HostProfile = sampleHost('h2');
+      second.name = '数据库服务器';
+      second.host = '10.0.0.28';
+      second.username = 'dba';
+      env.dao.put(first);
+      env.dao.put(second);
+      env.host.addSession('s-1', 'h1', first.name, 'established', 1901);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      await env.vm.openHost('h2', 'row');
+      expect(env.vm.hostList.length).assertEqual(2);
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.host.connectCalls[0].id).assertEqual('h2');
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      const focused: PaneRenderItem = env.vm.visiblePanes[1];
+      expect(focused.hostId).assertEqual('h2');
+      expect(focused.hostName).assertEqual('数据库服务器');
+      expect(focused.endpoint).assertEqual('dba@10.0.0.28');
+      env.vm.setActiveSplitDirection('column');
+      expect(env.vm.dividers[0].direction).assertEqual('column');
+      expect(env.host.connectCalls.length).assertEqual(1);
+    });
+
+    it('连接选择_活跃会话下方分屏_复用会话不重复拨号', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.dao.put(sampleHost('h2'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 2001);
+      env.host.addSession('s-2', 'h2', '主机h2', 'established', 2002);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      env.vm.openSession('s-2', 'column');
+      expect(env.host.connectCalls.length).assertEqual(0);
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.currentSessionId).assertEqual('s-2');
+      expect(env.vm.visiblePanes[1].hostId).assertEqual('h2');
+    });
+
+    it('同一连接分屏再拨一路_不复用已在树里的会话', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 2101);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      env.vm.openSession('s-1', 'row');
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.host.connectCalls[0].id).assertEqual('h1');
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.visiblePanes[0].sessionId).assertEqual('s-1');
+      expect(env.vm.visiblePanes[1].sessionId !== 's-1').assertTrue();
+    });
+
+    it('拖标签进当前画面成分屏_源标签消失窗格保留', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.dao.put(sampleHost('h2'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 2201);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      await env.vm.openHost('h2', 'tab');
+      expect(env.vm.tabs.length).assertEqual(2);
+      const sourceTab: string = env.vm.tabs[1].tabId;
+      env.vm.activateTab(env.vm.tabs[0].tabId);
+      env.vm.dockTabAsSplit(sourceTab, 'row');
+      expect(env.vm.tabs.length).assertEqual(1);
+      expect(env.vm.visiblePanes.length).assertEqual(2);
+      expect(env.vm.leafCount()).assertEqual(2);
     });
 
     it('四窗格_各自会话互不串扰_标题只更新聚焦叶', 0, async () => {
@@ -920,6 +1079,65 @@ export default function terminalViewModelTest() {
       const other: string = ids[1] === 's-1' ? ids[2] : ids[1];
       env.host.emit(other, { type: 'terminalTitle', title: 'htop' });
       expect(env.vm.terminalTitle).assertEqual('vim');
+    });
+
+    it('密码认证失败与认证超时重新弹出密码框', 0, async () => {
+      expect(isPasswordRetryError({
+        type: 'stateChange', to: 'error', errorCode: SshErrorCode.AUTH_PASSWORD_FAILED
+      })).assertTrue();
+      expect(isPasswordRetryError({
+        type: 'stateChange', to: 'error', errorCodeName: 'auth_timeout'
+      })).assertTrue();
+      expect(isPasswordRetryError({
+        type: 'stateChange', to: 'error', errorCode: SshErrorCode.CONNECT_TIMEOUT
+      })).assertFalse();
+
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+      const sid: string = env.vm.currentSessionId;
+      env.host.emit(sid, {
+        type: 'stateChange',
+        to: 'error',
+        errorCode: SshErrorCode.AUTH_PASSWORD_FAILED,
+        errorCodeName: 'auth_password_failed'
+      });
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      expect(env.vm.passwordPrompt.error.indexOf('密码') >= 0).assertTrue();
+      expect(env.host.cancelLog.indexOf(sid) >= 0).assertTrue();
+
+      await env.vm.submitPassword('secret');
+      expect(env.secrets.saved.length).assertEqual(1);
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+      expect(env.host.reconnectNowLog.indexOf(sid) >= 0).assertTrue();
+    });
+
+    it('认证超时同样弹密码框_公钥认证不弹', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      const keyHost: HostProfile = sampleHost('h-key');
+      keyHost.authType = 'key';
+      env.dao.put(keyHost);
+      await env.vm.start({ hostId: 'h-key', sessionId: '' });
+      env.host.emit(env.vm.currentSessionId, {
+        type: 'stateChange',
+        to: 'error',
+        errorCode: SshErrorCode.AUTH_TIMEOUT,
+        errorCodeName: 'auth_timeout'
+      });
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+
+      const env2: TestEnv = new TestEnv();
+      env2.dao.put(sampleHost('h2'));
+      await env2.vm.start({ hostId: 'h2', sessionId: '' });
+      env2.host.emit(env2.vm.currentSessionId, {
+        type: 'stateChange',
+        to: 'error',
+        errorCode: SshErrorCode.AUTH_TIMEOUT,
+        errorCodeName: 'auth_timeout'
+      });
+      expect(env2.vm.passwordPrompt.visible).assertTrue();
+      expect(env2.vm.passwordPrompt.error.indexOf('超时') >= 0).assertTrue();
     });
   });
 }

@@ -1,12 +1,14 @@
 #include "session.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -60,6 +62,12 @@ int createTcpSocket(int family, int protocol)
     if (fd < 0) {
         return -1;
     }
+    // SSH 终端输入通常是 1～数个字节的小包。关闭 Nagle，避免和对端 delayed ACK
+    // 叠加成几十到数百毫秒的逐键回显延迟；失败不影响连接，只退化为系统默认策略。
+    const int enabled = 1;
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) < 0) {
+        SSH_LOG("设置 TCP_NODELAY 失败 errno=%d", errno);
+    }
     return fd;
 }
 
@@ -86,6 +94,14 @@ bool isAlgorithmNegotiationError(int rc)
 {
     return rc == LIBSSH2_ERROR_KEX_FAILURE || rc == LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE ||
            rc == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED || rc == LIBSSH2_ERROR_ALGO_UNSUPPORTED;
+}
+
+// P1：单调时钟毫秒（只用于 keepalive 发送间隔的自估，见 doProbeNow）
+uint64_t steadyNowMs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
 }
 
 } // namespace
@@ -176,6 +192,17 @@ bool SshSession::setKeepaliveConfig(uint32_t intervalSec, uint32_t maxMisses)
     options_.keepaliveMaxMisses = maxMisses;
     // tracker 只携带阈值配置，重建即重置（idle 态尚无循环线程活动，无并发）
     keepaliveMissTracker_ = KeepaliveMissTracker(maxMisses);
+    return true;
+}
+
+bool SshSession::probeNow(uint32_t timeoutSec)
+{
+    // 仅 established 受理：其余状态要么还没有连接可探测，要么断线重连链已在跑
+    if (state() != SshSessionState::kEstablished) {
+        return false;
+    }
+    const uint32_t timeout = timeoutSec == 0 ? kDefaultKeepaliveProbeTimeoutSec : timeoutSec;
+    thread_.post([this, timeout] { doProbeNow(timeout); });
     return true;
 }
 
@@ -775,6 +802,9 @@ void SshSession::armKeepalive()
     keepaliveMissTracker_ = KeepaliveMissTracker(options_.keepaliveMaxMisses);
     keepaliveSendCount_.store(0, std::memory_order_release);
     keepaliveMissCount_.store(0, std::memory_order_release);
+    keepaliveProbeCount_.store(0, std::memory_order_release);
+    keepaliveProbe_.disarm();
+    keepaliveLastSentMs_ = 0;
     // 首周期宽限：能到达 established 本身（认证成功应答）就是对端存活的入站证据；
     // 同时记下 FIONREAD 基线，握手/认证残留字节不会被误判为「新入站」
     keepaliveInboundSeen_ = true;
@@ -828,6 +858,9 @@ void SshSession::onKeepaliveTick()
         return;
     }
     keepaliveSendCount_.fetch_add(1, std::memory_order_acq_rel);
+    // 本拍的发送时刻（近似：libssh2 若因 last_sent + interval > now 跳过本次发送，
+    // 这里会记早一点。只用于 doProbeNow 判断「强发是否会被门控跳过」，偏保守无害）
+    keepaliveLastSentMs_ = steadyNowMs();
 
     // 按 libssh2 返回的 seconds_to_next 预约下一拍（官方推荐用法），而不是固定
     // runEvery：time() 秒粒度截断下固定周期可能让 libssh2 偶发跳过一次发送，
@@ -836,6 +869,102 @@ void SshSession::onKeepaliveTick()
                                                                : options_.keepaliveIntervalSec) *
                        1000;
     keepaliveTimer_ = thread_.loop().runAfter(delayMs, [this] { onKeepaliveTick(); });
+}
+
+// ------------------------------------------------------------------ P1 主动探测（循环线程）
+
+void SshSession::doProbeNow(uint32_t timeoutSec)
+{
+    if (state() != SshSessionState::kEstablished || session_ == nullptr || fd_ < 0) {
+        return; // 受理与执行之间已离开 established：断线重连链自会接手，探测作废
+    }
+    if (keepaliveProbe_.active()) {
+        return; // 已有窗口在跑（网络事件连着来时的去重），不重复开窗、不重置基线
+    }
+
+    // libssh2_keepalive_send 按 last_sent + interval <= now 门控是否真发包
+    // （1.11.1 keepalive.c 已核对）：常规 30 s 周期下刚发过就会被静默跳过，
+    // 探测会退化成「什么都没问却等应答」。故先把 interval 压到 libssh2 的下限
+    // 逼它发，随后立刻恢复原配置（原值为 0 时恢复成 0 = 仍然关闭周期 keepalive）。
+    const uint64_t now = steadyNowMs();
+    const bool willSend =
+        keepaliveLastSentMs_ == 0 ||
+        now - keepaliveLastSentMs_ >=
+            static_cast<uint64_t>(kLibssh2MinKeepaliveIntervalSec) * 1000;
+
+    int pending = 0;
+    if (::ioctl(fd_, FIONREAD, &pending) != 0) {
+        pending = static_cast<int>(keepalivePendingBaseline_);
+    }
+    if (willSend) {
+        // 真发得出去：以此刻为窗口起点，之前的入站证据与本次探测无关
+        keepaliveInboundSeen_ = false;
+        keepalivePendingBaseline_ = pending;
+        keepaliveProbe_.arm(pending);
+    } else {
+        // 发不出去（刚发过）：上一拍的应答很可能正在路上或刚落地，沿用旧基线并
+        // 保留已观测到的入站标志，否则会把这份存活证据抹掉造成误判（见 KeepaliveProbe::arm）
+        keepaliveProbe_.arm(keepalivePendingBaseline_);
+    }
+
+    ::libssh2_keepalive_config(session_, 1, kLibssh2MinKeepaliveIntervalSec);
+    int secondsToNext = 0;
+    const int rc = ::libssh2_keepalive_send(session_, &secondsToNext);
+    ::libssh2_keepalive_config(session_, 1, options_.keepaliveIntervalSec);
+    if (rc != 0) {
+        keepaliveProbe_.disarm();
+        peerLost(SshSessionError::kKeepaliveTimeout,
+                 "网络切换探测发送失败（socket 写错误，libssh2 rc=" + std::to_string(rc) + "）");
+        return;
+    }
+    if (willSend) {
+        keepaliveLastSentMs_ = now;
+        keepaliveSendCount_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    keepaliveProbeCount_.fetch_add(1, std::memory_order_acq_rel);
+
+    // 收窗定时复用 keepaliveTimer_ 槽位：周期链在窗口期间让位，由 onProbeDeadline 续回
+    // （断线/关闭时 cancelTimers 一并覆盖这只定时器，不会漏摘）
+    if (keepaliveTimer_ != 0) {
+        thread_.loop().cancelTimer(keepaliveTimer_);
+        keepaliveTimer_ = 0;
+    }
+    SSH_LOG("主动探测已发出（%u s 判定窗口）", timeoutSec);
+    keepaliveTimer_ = thread_.loop().runAfter(static_cast<uint64_t>(timeoutSec) * 1000,
+                                              [this, timeoutSec] { onProbeDeadline(timeoutSec); });
+}
+
+void SshSession::onProbeDeadline(uint32_t timeoutSec)
+{
+    keepaliveTimer_ = 0; // 本窗口定时器已到期消费
+    if (state() != SshSessionState::kEstablished || session_ == nullptr || fd_ < 0) {
+        keepaliveProbe_.disarm();
+        return; // 窗口期内已断线/关闭：裁决与续链都无意义
+    }
+
+    int pending = 0;
+    if (::ioctl(fd_, FIONREAD, &pending) != 0) {
+        pending = static_cast<int>(keepaliveProbe_.baseline()); // 查询失败按「无增长」处理
+    }
+    const bool alive = keepaliveProbe_.verdictAlive(keepaliveInboundSeen_, pending);
+    keepaliveProbe_.disarm();
+
+    if (!alive) {
+        peerLost(SshSessionError::kKeepaliveTimeout,
+                 "网络切换探测无应答：" + std::to_string(timeoutSec) + " s 窗口内无入站数据");
+        return;
+    }
+
+    // 存活：本次探测的应答就是一次成功的入站观测，miss 计数清零；周期链按原间隔续上
+    keepaliveMissTracker_.reset();
+    keepaliveMissCount_.store(0, std::memory_order_release);
+    keepaliveInboundSeen_ = false;
+    keepalivePendingBaseline_ = pending;
+    if (options_.keepaliveIntervalSec == 0) {
+        return; // 周期 keepalive 本就关闭：只做这一次探测，不凭空建立周期链
+    }
+    keepaliveTimer_ = thread_.loop().runAfter(
+        static_cast<uint64_t>(options_.keepaliveIntervalSec) * 1000, [this] { onKeepaliveTick(); });
 }
 
 // ------------------------------------------------------------------ 字符串化

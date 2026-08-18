@@ -12,7 +12,8 @@
  * 覆盖：connect→established 全流程迁移 / 8 会话并存事件互不串扰 /
  * bindPane-unbindPane（closeSession 级联释放、幂等）/ closeAll 幂等 /
  * 重连退避（建议秒数、倒计时、换句柄保 sessionId、超限终态、手动 close 取消）/
- * 认证失败错误码映射 / 凭据缺失与 agent 未实现 / hostKey 透传与 dirty 唤醒。
+ * 认证失败错误码映射 / 凭据缺失与 agent 未实现 / hostKey 透传与 dirty 唤醒 /
+ * P1 后台保活支撑（活跃计数口径、静默模式、切网收敛两条分支、策略挂起与恢复、会话数通知）。
  */
 
 import { describe, it, expect } from '@ohos/hypium';
@@ -22,6 +23,7 @@ import { SshEvent, SshEventListener } from '../main/ets/napi/SshNative';
 import { CredentialKind } from '../main/ets/repository/CredentialStore';
 import {
   DEFAULT_RECONNECT_MAX_ATTEMPTS,
+  NETWORK_PROBE_TIMEOUT_SEC,
   NativeSessionFactory,
   NativeSessionLike,
   ReconnectScheduler,
@@ -51,9 +53,12 @@ class FakeNativeSession implements NativeSessionLike {
   reconnectPolicyDelays: number[] = [];
   reconnectPolicyMaxAttempts: number = -1;
   closeCount: number = 0;
+  /** P1：probeNow 的入参记录（每次探测的判定窗口秒数） */
+  readonly probeCalls: number[] = [];
   /** 受理开关：false = 对应方法受理失败（返回 false） */
   acceptConnect: boolean = true;
   acceptAuth: boolean = true;
+  acceptProbe: boolean = true;
   /** 重连建议秒数脚本（null = 恒 -1）；测试按场景安装 */
   nextDelay: ((attempt: number) => number) | null = null;
 
@@ -85,6 +90,11 @@ class FakeNativeSession implements NativeSessionLike {
     this.keepaliveIntervalSec = intervalSec;
     this.keepaliveMaxMisses = maxMisses;
     return true;
+  }
+
+  probeNow(timeoutSec: number): boolean {
+    this.probeCalls.push(timeoutSec);
+    return this.acceptProbe;
   }
 
   setReconnectPolicy(delaysSec: number[], maxAttempts: number): boolean {
@@ -277,8 +287,8 @@ export default function sessionManagerTest() {
       expect(fake.keepaliveMaxMisses).assertEqual(3);
       expect(fake.reconnectPolicyDelays.length).assertEqual(0);
       expect(fake.reconnectPolicyMaxAttempts).assertEqual(DEFAULT_RECONNECT_MAX_ATTEMPTS);
-      expect(fake.passwordAuthCalls.length).assertEqual(1);
-      expect(fake.passwordAuthCalls[0]).assertEqual('pw-1');
+      // 认证此刻还不能发起：native 只在 authenticating 态受理（见 dialNative 头注）
+      expect(fake.passwordAuthCalls.length).assertEqual(0);
       // 受理即 connecting，后续状态由事件推进
       expect(info.state).assertEqual('connecting');
       expect(info.hostId).assertEqual('h1');
@@ -289,6 +299,11 @@ export default function sessionManagerTest() {
       expect(info.state).assertEqual('handshaking');
       fake.emit(stateChange('authenticating'));
       expect(info.state).assertEqual('authenticating');
+      // 进入 authenticating 才提交密码，且只提交一次
+      expect(fake.passwordAuthCalls.length).assertEqual(1);
+      expect(fake.passwordAuthCalls[0]).assertEqual('pw-1');
+      fake.emit(stateChange('authenticating'));
+      expect(fake.passwordAuthCalls.length).assertEqual(1);
       fake.emit(stateChange('established'));
       expect(info.state).assertEqual('established');
       const open: SshEvent = { type: 'channelOpen', channelId: 7 };
@@ -313,6 +328,9 @@ export default function sessionManagerTest() {
       env.setSecret('hk', 'passphrase', 'pp-1');
       const info: SessionInfo = await env.manager.connect(sampleHost('hk', 'key'));
       const fake: FakeNativeSession = env.factory.latest();
+      // 同密码认证：材料暂存，进入 authenticating 才提交
+      expect(fake.keyAuthCalls.length).assertEqual(0);
+      fake.emit(stateChange('authenticating'));
       expect(fake.keyAuthCalls.length).assertEqual(1);
       expect(fake.keyAuthCalls[0].privateKey).assertEqual('PEM-DATA');
       expect(fake.keyAuthCalls[0].passphrase).assertEqual('pp-1');
@@ -335,7 +353,8 @@ export default function sessionManagerTest() {
         }
       }
       expect(threw).assertTrue();
-      expect(code).assertEqual(SshErrorCode.AUTH_PASSWORD_FAILED);
+      // CREDENTIAL_MISSING 而非 AUTH_PASSWORD_FAILED：上层据此弹密码补录框
+      expect(code).assertEqual(SshErrorCode.CREDENTIAL_MISSING);
       expect(env.factory.created.length).assertEqual(0);
       expect(env.manager.listSessions().length).assertEqual(0);
     });
@@ -497,8 +516,11 @@ export default function sessionManagerTest() {
       expect(env.factory.created.length).assertEqual(2);
       const fake2: FakeNativeSession = env.factory.latest();
       expect(fake2.connectCount).assertEqual(1);
+      // 重连同样推迟认证：新句柄进入 authenticating 才提交
+      expect(fake2.passwordAuthCalls.length).assertEqual(0);
+      fake2.emit(stateChange('authenticating'));
       expect(fake2.passwordAuthCalls.length).assertEqual(1);
-      expect(info.state).assertEqual('connecting');
+      expect(info.state).assertEqual('authenticating');
       expect(info.reconnectCountdownSec).assertEqual(0);
       expect(env.manager.getNativeHandle(info.sessionId)).assertEqual(fake2.nativeHandle);
       expect(fake2.nativeHandle !== fake1.nativeHandle).assertTrue();
@@ -571,6 +593,161 @@ export default function sessionManagerTest() {
       // hostKey 不触发 dirty 唤醒、不改变状态
       expect(env.dirtyLog.length).assertEqual(0);
       expect(info.state).assertEqual('connecting');
+    });
+
+    it('terminalData只触发dirty唤醒且按会话路由', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      const received: SshEvent[] = [];
+      env.manager.addEventListener((_session: SessionInfo, event: SshEvent) => {
+        received.push(event);
+      });
+      env.factory.latest().emit({ type: 'terminalData', terminal: 7 });
+      expect(received.length).assertEqual(1);
+      expect(received[0].type).assertEqual('terminalData');
+      expect(env.dirtyLog.length).assertEqual(1);
+      expect(env.dirtyLog[0]).assertEqual(info.sessionId);
+      expect(info.state).assertEqual('connecting');
+    });
+  });
+
+  // ================================================================ P1 后台保活支撑
+
+  describe('SessionManagerBackgroundTest', () => {
+    it('活跃会话计数含退避中不含策略挂起', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      expect(env.manager.activeSessionCount()).assertEqual(1); // connecting 也算活
+
+      env.factory.latest().nextDelay = (_attempt: number): number => 5;
+      env.factory.latest().emit(stateChange('established'));
+      env.factory.latest().emit(disconnectHint());
+      // 断线但已排上退避倒计时：仍算活（长时任务不该在这时还电）
+      expect(info.reconnectCountdownSec).assertEqual(5);
+      expect(env.manager.activeSessionCount()).assertEqual(1);
+
+      env.manager.suspendAllForPolicy('测试挂起');
+      expect(env.manager.activeSessionCount()).assertEqual(0);
+      expect(env.manager.suspendedCount()).assertEqual(1);
+    });
+
+    it('静默模式抑制dirty唤醒但事件照常透传', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      await env.manager.connect(sampleHost('h1', 'password'));
+      const received: SshEvent[] = [];
+      env.manager.addEventListener((_session: SessionInfo, event: SshEvent) => {
+        received.push(event);
+      });
+
+      env.manager.setQuiet(true);
+      env.factory.latest().emit({ type: 'terminalData', terminal: 7 });
+      expect(received.length).assertEqual(1); // 事件仍到达：数据一个字节都不能丢
+      expect(env.dirtyLog.length).assertEqual(0); // 但不唤醒重绘
+
+      env.manager.setQuiet(false);
+      env.factory.latest().emit({ type: 'terminalData', terminal: 7 });
+      expect(received.length).assertEqual(2);
+      expect(env.dirtyLog.length).assertEqual(1);
+    });
+
+    it('切网时established会话走native探测', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      await env.manager.connect(sampleHost('h1', 'password'));
+      env.factory.latest().emit(stateChange('established'));
+
+      const affected: number = env.manager.notifyNetworkChanged();
+      expect(affected).assertEqual(1);
+      expect(env.factory.latest().probeCalls.length).assertEqual(1);
+      expect(env.factory.latest().probeCalls[0]).assertEqual(NETWORK_PROBE_TIMEOUT_SEC);
+    });
+
+    it('切网时退避中的会话立刻重连不等倒计时', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      env.factory.latest().nextDelay = (_attempt: number): number => 30;
+      env.factory.latest().emit(stateChange('established'));
+      env.factory.latest().emit(disconnectHint());
+      expect(info.reconnectCountdownSec).assertEqual(30);
+      const createdBefore: number = env.factory.created.length;
+
+      env.manager.notifyNetworkChanged();
+      await flushAsync();
+      // 倒计时清零、直接换新句柄重拨，而不是干等 30 s
+      expect(info.reconnectCountdownSec).assertEqual(0);
+      expect(env.factory.created.length).assertEqual(createdBefore + 1);
+      expect(env.factory.latest().connectCount).assertEqual(1);
+      expect(env.factory.latest().probeCalls.length).assertEqual(0);
+    });
+
+    it('策略挂起保留会话面孔与窗格绑定回前台原地重连', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      env.manager.bindPane(info.sessionId, 'pane-1');
+      env.factory.latest().emit(stateChange('established'));
+      const firstHandle: number = env.factory.latest().nativeHandle;
+
+      const suspended: number = env.manager.suspendAllForPolicy('已按设置在后台断开');
+      expect(suspended).assertEqual(1);
+      expect(info.state).assertEqual('disconnected');
+      expect(info.errorMessage).assertEqual('已按设置在后台断开');
+      // 会话面孔与窗格绑定都还在（不是 close：用户回来还要看到这个终端）
+      expect(env.manager.getSession(info.sessionId) !== null).assertTrue();
+      expect(env.manager.sessionIdOfPane('pane-1')).assertEqual(info.sessionId);
+      expect(env.manager.getNativeHandle(info.sessionId)).assertEqual(null);
+      // 幂等：重复挂起不再计数
+      expect(env.manager.suspendAllForPolicy('again')).assertEqual(0);
+
+      const resumed: number = env.manager.resumeAllSuspended();
+      await flushAsync();
+      expect(resumed).assertEqual(1);
+      expect(env.manager.suspendedCount()).assertEqual(0);
+      // sessionId 不变、native 句柄换新，重连计数从零起算（策略断开不算失败）
+      expect(env.manager.getSession(info.sessionId) !== null).assertTrue();
+      expect(env.factory.latest().nativeHandle !== firstHandle).assertTrue();
+      expect(info.reconnectAttempt).assertEqual(0);
+      expect(info.errorMessage).assertEqual('');
+    });
+
+    it('会话数变化通知监听器', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const counts: number[] = [];
+      env.manager.addSessionCountListener((): void => {
+        counts.push(env.manager.activeSessionCount());
+      });
+
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      expect(counts.length).assertEqual(1);
+      expect(counts[0]).assertEqual(1);
+
+      env.factory.latest().emit(stateChange('established'));
+      // established 仍是「活」，活跃与否没翻转 → 不重复通知
+      expect(counts.length).assertEqual(1);
+
+      env.manager.close(info.sessionId);
+      expect(counts.length).assertEqual(2);
+      expect(counts[1]).assertEqual(0);
+    });
+
+    it('手动重连解除策略挂起', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      env.factory.latest().emit(stateChange('established'));
+      env.manager.suspendAllForPolicy('后台断开');
+      expect(env.manager.suspendedCount()).assertEqual(1);
+
+      expect(env.manager.reconnectNow(info.sessionId)).assertTrue();
+      await flushAsync();
+      expect(env.manager.suspendedCount()).assertEqual(0);
+      // 已由用户手动接管，回前台的批量恢复不该再动它
+      expect(env.manager.resumeAllSuspended()).assertEqual(0);
     });
   });
 }

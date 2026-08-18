@@ -48,7 +48,7 @@
 ### 1.2 非功能需求
 
 - **性能**：`cat` 一个 5 MB 文本时终端不掉帧（≥ 50 fps），输入到回显延迟 < 一帧（16.7 ms）+ 网络 RTT。
-- **续航与后台**：息屏/切后台时会话保活由 `backgroundTaskManager` 长时任务（`dataTransfer`）承担，用户可关；关闭后按策略优雅断开而不是静默失联。
+- **续航与后台**：息屏/切后台时会话保活由 `backgroundTaskManager` 长时任务（`dataTransfer`）承担，用户可关；长时任务被系统因低速挂起/取消时走宽限降级链（§7.5），一律优雅断开并可回前台原地重连，而不是静默失联。
 - **安全**：私钥与密码永不落明文盘；仅在需要时解密进入 native，用完清零；主机指纹 TOFU；同步密文服务端不可解。
 - **离线可用**：不登录账号时全部本地功能可用（与桌面端一致）。
 - **可测试**：SSH 协议层与终端解析层可在 x86_64 上跑单元测试，不依赖真机。
@@ -591,11 +591,11 @@ interface KnownHostEntry { id: string; host: string; port: number; keyType: stri
 |---|---|
 | KDF | Argon2id（libargon2，RFC 9106），默认 `memory=65536 KiB, iterations=3, parallelism=1, hashLength=32` |
 | 文档加密 | AES-256-GCM，nonce 12B，tag 16B 拼在密文尾部 |
-| 文档 AAD | `"ssh-client-ohos/sync-document/v1" + "|" + len:vaultId + "|" + len:schemaVersion + "|" + len:keyVersion` |
-| 密码包裹 AAD | `"ssh-client-ohos/vault-key/password/v1" + "|" + len:keyVersion` |
-| 恢复包裹 AAD | `"ssh-client-ohos/vault-key/recovery/v1" + "|" + len:keyVersion` |
-| 恢复 KEK 派生 | HKDF-SHA256，salt 空，info `"ssh-client-ohos/recovery-kek/v1"`，32B |
-| 恢复密钥格式 | `SCO1-<base64url 43 字符>-<sha256("SCO1"+raw) 前 12 位十六进制大写>` |
+| 文档 AAD | `"ssh-port-mapper/sync-document/v1" + "|" + len:vaultId + "|" + len:schemaVersion + "|" + len:keyVersion` |
+| 密码包裹 AAD | `"ssh-port-mapper/vault-key/password/v1" + "|" + len:keyVersion` |
+| 恢复包裹 AAD | `"ssh-port-mapper/vault-key/recovery/v1" + "|" + len:keyVersion` |
+| 恢复 KEK 派生 | HKDF-SHA256，salt 空，info `"ssh-port-mapper/recovery-kek/v1"`，32B |
+| 恢复密钥格式 | `SPM1-<base64url 43 字符>-<sha256("SPM1"+raw) 前 12 位十六进制大写>` |
 | `ciphertextHash` | 密文（含 tag）原始字节的 sha256 小写十六进制 |
 
 > AAD 字段编码规则（沿用 `crypto-vault.ts` 的 `aad()` 思路）：每个字段编码为 `<utf8字节长度>:<值>`，
@@ -780,7 +780,8 @@ HarmonyOS 的等价机制是 hvigor 的 `buildProfileFields`——在 `entry/bui
 - 主机指纹 TOFU：首连展示 `SHA256:xxx` 与指纹随机艺术图（randomart），用户确认后入库；不匹配时**拒绝连接**并给出对比视图
 - 连接超时、认证失败、算法协商失败等错误全部映射成中文可读提示（照搬桌面端的错误文案思路）
 - 自动重连：退避 1→2→5→10→20→30 s（上限可配），界面显示倒计时与尝试次数
-- Keepalive：`libssh2_keepalive_config`，默认 30 s
+- Keepalive：`libssh2_keepalive_config`，默认 30 s；连续 3 个周期无入站活动判静默黑洞。
+  另有主动探测 `probeNow()`：网络切换时强发一拍并只开 5 s 判定窗口（§7.5），不必干等 90 s
 
 ### 7.2 终端会话
 
@@ -805,10 +806,31 @@ HarmonyOS 的等价机制是 hvigor 的 `buildProfileFields`——在 `entry/bui
 
 ### 7.5 后台保活
 
-- 会话活跃时申请 `backgroundTaskManager` 长时任务，类型 `dataTransfer`（需在 `module.json5` 声明 `ohos.permission.KEEP_BACKGROUND_RUNNING`）
-- 设置项：「后台保持连接」（默认开）/「息屏 N 分钟后断开」（默认关）
-- 系统回收前收到通知则优雅关闭会话并保存状态
-- 网络切换（WiFi ⇄ 蜂窝）监听 `@ohos.net.connection`，主动触发重连而不是干等超时
+实现落在 `service/background/`（策略机 `BackgroundPolicy` 纯逻辑 + 外壳 `BackgroundKeepAlive`
+接系统 API），会话侧口子在 `SessionManager`（`activeSessionCount` / `setQuiet` /
+`notifyNetworkChanged` / `suspendAllForPolicy` / `resumeAllSuspended`）。
+
+**长时任务不是「申请到就一劳永逸」**：SDK 明确有
+`ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED` 与
+`ContinuousTaskSuspendReason.SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED`——`dataTransfer`
+长时任务在低速时会被系统挂起甚至取消，而空闲 SSH 会话恰恰就是低速。因此保活是一条**降级链**：
+
+| 阶段 | 行为 |
+|---|---|
+| 切后台且有活跃会话 | 申请 `dataTransfer` 长时任务（`ohos.permission.KEEP_BACKGROUND_RUNNING` + ability 的 `backgroundModes`），同时进入静默模式（抑制 dirty 唤醒，事件照收、数据不丢） |
+| 被系统挂起（低速） | **不断连接**，等 `continuousTaskActive` 回来 |
+| 被取消 / 申请失败 | 用短时任务 `requestSuspendDelay` 换一个宽限窗口（≤ 8 s） |
+| 宽限到期 | **优雅断开**：只断连接，保留会话面孔与窗格绑定，`SessionInfo.errorMessage` 写明原因与出路 |
+| 回前台 | 释放长时任务、解除静默、原地重连被挂起的会话（sessionId 不变、句柄换新）；没挂起过则做一次切网收敛 |
+| 后台会话数归零 | 立刻释放长时任务（不白占资源） |
+
+- 设置项：「后台保持连接」（默认开）/「息屏 N 分钟后断开」（默认关）。前者关掉即走上表的宽限窗口；
+  后者到期同样是策略性断开而非静默失联
+- 系统回收前：模块级 `AbilityStage.onMemoryLevel` 收到 `CRITICAL` 即优雅断开（UIAbility 没有这个回调）
+- 网络切换（WiFi ⇄ 蜂窝）：`NetworkWatcher` 监听默认网，以 **netId 或承载类型变化**为判据
+  （同一张网的 capability 抖动不算）。切网后**主动收敛**而不是干等超时——退避倒计时中的会话
+  立刻重连；`established` 的会话调 native `probeNow()` 强发一拍 keepalive 并开 5 s 短判定窗口，
+  窗口内无入站即判黑洞进 `disconnected`，走既有重连链（周期 keepalive 是 30 s × 3 = 90 s，切网场景太慢）
 
 ### 7.6 权限清单（`module.json5`）
 

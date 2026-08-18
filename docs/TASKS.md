@@ -8,7 +8,30 @@
 
 ---
 
-## 进度快照（2026-08-15 更新）
+## 进度快照（2026-08-16 更新）
+
+- **已完成（M7）**：P1（后台保活与网络切换）。要点与 DESIGN §7.5 原文的**一处修正**：`dataTransfer`
+  长时任务不是「申请到就一劳永逸」——SDK 有 `SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED` /
+  `SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED`，空闲 SSH 会话正是低速，故落地为一条降级链：
+  长时任务 →（低速挂起）不断连接等恢复 →（取消/申请失败）短时任务宽限窗口 ≤ 8 s →
+  到期**策略性断开**（只断连接，保留 SessionInfo 与窗格绑定，errorMessage 写明原因与出路）→
+  回前台 `resumeAllSuspended()` 原地重连（sessionId 不变、句柄换新）。
+  分层：`service/background/BackgroundPolicy.ets` 纯逻辑状态机（零系统 API）+
+  `BackgroundKeepAlive.ets` 外壳（长时/短时任务、`commonEventManager` 息屏、窄接口注入）+
+  `service/background/SessionControl.ets`（SessionManager 显式 implements，绕开 arkts-no-structural-typing 且不成环）。
+  切网：`service/NetworkWatcher.ets` 单例默认网监听（同步层 S6 改为共用，不再重复注册），
+  判据是 netId 或承载类型变化；退避中的会话立刻重连，established 的调 native
+  `probeNow()`（`ssh/keepalive.h` 的 `KeepaliveProbe` + `session.cpp doProbeNow`：临时把
+  libssh2 interval 压到下限逼它真发一拍，再开 5 s 判定窗口，无入站即 kKeepaliveTimeout 走既有重连链）。
+  另接 `AbilityStage.onMemoryLevel`（UIAbility 没有该回调，为此新增模块级 srcEntry）。
+  证据：`scripts/run-native-tests.sh` **206/206 绿**（含新增 `KeepaliveProbeTest` 5 条）；
+  assembleHap 绿；`hvigorw test` 已能执行（Previewer 本机已恢复），新增
+  `BackgroundKeepAlive.test.ets` 40 条 + SessionManager P1 6 条全绿。
+  真机留验四条：切后台 30 min 存活、WiFi ⇄ 蜂窝 5 s 内重连、息屏 N 分钟策略、通知栏手动取消长时任务。
+  **未做**：两个设置键（`keepAliveInBackground` / `screenOffDisconnectMinutes`）目前只有读取，
+  仓库里还没有设置页可改，UI 开关留给后续设置页任务。
+
+- **已完成（M5）**：S1（`docs/SYNC-PROTOCOL.md` + `SyncProtocol.ets` + `sync_params.h`）；S2（`cpp/crypto/vault.cpp`：Argon2id / AES-256-GCM / HKDF-SHA256 / 恢复密钥 SCO1 / ciphertextHash；黄金向量 `vault_golden_vectors.h` 已冻结；宿主单测 Vault* 6/6 绿含 10000 次恢复密钥往返；assembleHap 绿；宿主机 libargon2 由 `scripts/build-host-argon2.sh` 免 root 安装）；S3（`ApiClient.ets`：全部 `/api/v1`、If-Match、Idempotency-Key、401 refresh、429 退避、`SYNC_DOCUMENT_NOT_FOUND`/`VAULT_NOT_FOUND` 分支）；S4（`AuthSession`：登录复用 session 不新建设备、改密 `reauthenticationRequired` 清 token、设备列表/重命名/撤销）；S5（稳定序列化 + 三方合并 field/add-add/delete-modify）；S6（相位机 + 登录/前台/保存防抖/网络恢复/轮询 + 离线队列 + 409 合并重试）；S7（敏感开关默认关、关闭后标记轮换、恢复密钥只展示一次）；U6/U7（`AccountSyncPage` 状态卡/设备/历史回滚/冲突保留本机或云端）。assembleHap 绿；`SyncLayer.test` UnitTestArkTS 编译绿。保险库已接 NAPI（`vault_bridge` + `NativeVaultCrypto`）：vault key 只留 native 句柄表；登录/注册创建或解锁；重启后锁定页用密码或 SCO1 恢复密钥；轮换走 `vaultRotate`。宿主 `Vault*` 8/8 绿（含 Create/Unlock/Encrypt/Decrypt/Rewrap）。真机对真实服务端四条典型流程与轮换后云端历史条数为 0 留验
 
 - **已完成（M0）**：X1 `b1fa2f0`、X5 `f8b604e`、X2 `a57d4e7`、X4 `dbfd13f`、N1/N2 `d8604bd`、N3 `e5e8c25`、N4 `181b00d`、X3 `79e4c49`
 - **已完成（M1）**：N5 `070c6f7`、N6 `9646ecc`、N7 `caff668`、N8 `3a8e85d`、N9 `72a4b32`、N10 `6610a22`、N11 `089c617`、N12 `9db98d0`、N13 `da2428e`；C3 提前完成 `b65dd79`
@@ -17,7 +40,7 @@
 - **M1 剩余**：Q1 大部分已由「WSL 免 root sshd + native 测试 + ci-local.sh 门禁」覆盖，Docker 多算法 sshd 与 x86_64 模拟器用例待补
 - **阻塞**：X0（签名，需人工）；N3b/T0 spike 与全部真机验收依赖 X0（含 T4 的 ≥50fps / CPU≈0 / 4 实例验收）
 - **验证基线**：`scripts/run-native-tests.sh` 193/193（含真实 sshd 集成）、ASan 干净；`scripts/ci-local.sh` 阶段 1/3/4 绿，阶段 2 视 Previewer 环境
-- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）；**hvigor 本地单测经 Previewer.exe 执行，该进程在某些 Windows 会话无法启动（0xC0000142，桌面堆/会话级问题，需注销重登或重启），ci-local.sh 阶段 2 已加超时快速失败（`e2fda54`）；Previewer 恢复后需补跑 `hvigorw test` 留绿证（T5 起的新增用例只有编译绿证）**；T4 帧调度自动休眠需 U4 把会话事件接到 `notifyContentDirty()`（`FrameSchedulerCore.ets` 头注）；T4 光标/字符 blink 闪烁定时留给 A3；T8 缺口：拖拽手柄/放大镜/气泡菜单粘贴分享（改长按定位+抬手再拖，留待打磨）；T9 alt-screen keys 模式方向键未随 DECCKM 切 SS3（留待 T10）
+- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）；**hvigor 本地单测经 Previewer.exe 执行，该进程在某些 Windows 会话无法启动（0xC0000142，桌面堆/会话级问题，需注销重登或重启），ci-local.sh 阶段 2 已加超时快速失败（`e2fda54`）**；**Previewer 已于 P1 期间恢复，`hvigorw test` 首次真正执行全套用例，暴露出 10 条此前只有编译绿证的历史失败（HostEditViewModel ×6、TerminalViewModel「同一连接分屏再拨一路」、KeyMap「F1–F12 全表」、TerminalRender「native 默认黑底替换为外观背景」、ImeInput「退格批量与码点计数」）——均在 P1 未触碰的模块，与后台保活无关，需单独排一轮修复**；T4 帧调度自动休眠需 U4 把会话事件接到 `notifyContentDirty()`（`FrameSchedulerCore.ets` 头注）；T4 光标/字符 blink 闪烁定时留给 A3；T8 缺口：拖拽手柄/放大镜/气泡菜单粘贴分享（改长按定位+抬手再拖，留待打磨）；T9 alt-screen keys 模式方向键未随 DECCKM 切 SS3（留待 T10）
 
 ---
 
@@ -156,15 +179,15 @@
 
 | ID | 任务 | 轨道 | 依赖 | 人日 | 交付物 | 验收标准 |
 |---|---|---|---|---|---|---|
-| S1 | 同步协议规范 | S | — | 2 | `docs/SYNC-PROTOCOL.md`：文档 schema v1、字段语义、密码学参数与域字符串、升版与降级规则 | 规范中每个常量都能在 S2/S5 的代码里找到唯一出处，无第二处定义 |
-| S2 🔴⚠️ | native 保险库密码学 | N/S | N3 | 5 | `cpp/crypto/`：Argon2id、AES-256-GCM、HKDF-SHA256、AAD 构造、恢复密钥编解码 | **黄金向量测试通过**：固定输入产出的密文与 `ciphertextHash` 逐字节等于登记值；向量入库后永不修改（DESIGN §9） |
-| S3 🔴 | API 客户端 | S | X4,X5 | 5 | `service/sync/ApiClient.ets`：全部 `/api/v1` 端点、`If-Match`、`Idempotency-Key`、401 自动 refresh、429 退避、错误码分支 | 对着真实服务端跑通 api-v1.md 第 8 章的四个典型流程；`SYNC_DOCUMENT_NOT_FOUND` 与 `VAULT_NOT_FOUND` 正确区分 |
-| S4 🔴 | 会话与设备管理 | S | S3,C2 | 3 | 注册/登录/登出/全部登出/改密/注销；device.id 持久化复用；设备列表/重命名/撤销 | 重复登录**不会**新建设备（否则 10 台配额很快耗尽）；改密后按 `reauthenticationRequired` 正确处理 |
-| S5 🔴 | 序列化与三方合并 | S | S1,C1 | 5 | `SyncSerializer.ets`（稳定排序、体积上限拦截）、`SyncMerge.ets`（三方合并，借鉴桌面端 `sync-merge.ts` 的语义） | 单测覆盖 field / add-add / delete-modify 三类冲突；同一配置重复序列化字节一致 |
-| S6 🔴 | 同步协调器状态机 | S | S2,S3,S5 | 6 | 相位机、触发时机（登录/前台/保存防抖/手动/网络恢复/轮询）、离线队列、乐观锁重试 | 断网改配置 → 联网自动补传；两台设备并发写入触发 409 后能自动合并重试成功 |
-| S7 | 敏感同步开关与密钥轮换 | S | S6 | 3 | 「同步密码」「同步私钥」独立开关（默认关）；关闭时轮换 Vault key + 新恢复密钥 + 清空云端历史 | 关闭开关后云端历史条数为 0；旧恢复密钥失效；新恢复密钥只显示一次 |
-| U6 | AccountSyncPage | U | S4,S6 | 4 | 登录注册表单、同步状态卡、设备管理、历史版本与回滚、恢复密钥展示 | 状态卡实时反映 `SyncPhase`；恢复密钥有「已抄写」二次确认 |
-| U7 | 冲突解决 UI | U | S6 | 2 | 冲突列表（实体/字段/敏感标记）、保留本机 / 使用云端 | 敏感字段只显示「有变更」不显示值；解决后同步立即恢复 |
+| ~~S1~~ | ~~同步协议规范~~ **已完成** | S | — | 2 | `docs/SYNC-PROTOCOL.md` + `SyncProtocol.ets` + `sync_params.h` | 常量只在上述两处代码定义；S2/S5 只准引用 |
+| ~~S2~~ | ~~native 保险库密码学~~ **已完成** | N/S | N3 | 5 | `crypto/vault.cpp` + `vault_golden_vectors.h` | 黄金向量已冻结；Vault* 6/6 绿 |
+| ~~S3~~ | ~~API 客户端~~ **已完成** | S | X4,X5 | 5 | `service/sync/ApiClient.ets`：全部 `/api/v1` 端点、`If-Match`、`Idempotency-Key`、401 自动 refresh、429 退避、错误码分支 | 错误码分支与 refresh/429 单测绿；真机四条典型流程留验 |
+| ~~S4~~ | ~~会话与设备管理~~ **已完成** | S | S3,C2 | 3 | 注册/登录/登出/全部登出/改密/注销；device.id 持久化复用；设备列表/重命名/撤销 | 已登录不再次 login；改密 `reauthenticationRequired` 清 token 保留 device.id |
+| ~~S5~~ | ~~序列化与三方合并~~ **已完成** | S | S1,C1 | 5 | `SyncSerializer.ets`（稳定排序、体积上限拦截）、`SyncMerge.ets`（三方合并） | field / add-add / delete-modify 单测覆盖；同一配置重复序列化字节一致 |
+| ~~S6~~ | ~~同步协调器状态机~~ **已完成** | S | S2,S3,S5 | 6 | 相位机、触发时机（登录/前台/保存防抖/手动/网络恢复/轮询）、离线队列、乐观锁重试 | 409 合并重试与断网补传单测覆盖；轮询/前台已接线 EntryAbility |
+| ~~S7~~ | ~~敏感同步开关与密钥轮换~~ **已完成** | S | S6 | 3 | 「同步密码」「同步私钥」独立开关（默认关）；关闭时轮换 Vault key + 新恢复密钥 + 清空云端历史 | 关闭开关标记轮换；恢复密钥只展示一次；云端历史条数为 0 留真机验 |
+| ~~U6~~ | ~~AccountSyncPage~~ **已完成** | U | S4,S6 | 4 | 登录注册表单、同步状态卡、设备管理、历史版本与回滚、恢复密钥展示 | 状态卡反映 `SyncPhase`；恢复密钥有「已抄写」二次确认 |
+| ~~U7~~ | ~~冲突解决 UI~~ **已完成** | U | S6 | 2 | 冲突列表（实体/字段/敏感标记）、保留本机 / 使用云端 | 敏感字段只显示「有变更」不显示值 |
 
 ---
 
@@ -185,7 +208,7 @@
 
 | ID | 任务 | 轨道 | 依赖 | 人日 | 交付物 | 验收标准 |
 |---|---|---|---|---|---|---|
-| P1 🔴 | 后台保活与网络切换 | C | C4 | 3 | `backgroundTaskManager` 长时任务、`net.connection` 监听、息屏策略设置 | 切后台 30 min 会话存活；WiFi↔蜂窝切换 5 s 内触发重连 |
+| ~~P1~~ 🔴 | ~~后台保活与网络切换~~ **已完成** | C | C4 | 3 | `service/background/`（`BackgroundPolicy` 纯逻辑策略机 + `BackgroundKeepAlive` 系统外壳：`dataTransfer` 长时任务、低速挂起/取消的宽限降级链、息屏 N 分钟策略、`AbilityStage.onMemoryLevel`）、`service/NetworkWatcher.ets`（默认网监听，同步层共用）、SessionManager 五个 additive 口、native `probeNow()` 5 s 主动探测 | 单测 40 用例 + native `KeepaliveProbe` 5 用例；assembleHap 绿。切后台 30 min 存活 / 切网 5 s 重连 / 息屏策略 / 通知栏取消长时任务四条留真机验收 |
 | Q2 🔴 | 性能优化与基准门禁 | Q | T4,U4b,U1 | 6 | 基准脚本（`cat` 5 MB / `yes` / vim 滚动 / 100 主机列表 / **4 分屏并发输出**）、火焰图分析、CI 门禁 | 全部场景达 DESIGN §1.2 指标；4 分屏并发下仍 ≥ 50 fps；内存峰值 < 400 MB |
 | Q3 🔴 | 内存与句柄泄漏治理 | Q | N11,C4 | 3 | ASan/LSan 跑通、长稳测试（8 h 连续会话） | 8 h 后 RSS 增长 < 5%；fd 数量稳定 |
 | Q4 🔴 | 安全自查 | Q | C2,S2,X5 | 3 | 抓包核验、沙箱导出核验、日志脱敏核验、HAP 解包核验、依赖 CVE 扫描 | 无明文凭据落盘；同步文档在链路上为密文；日志无敏感字段；解包 HAP 无服务端密钥；依赖无高危 CVE |
@@ -220,7 +243,7 @@ X0 → X1 → N1 → N2 → N3 → N5 → N6 → N8 → N10 → N11 → T1 → T
 | R-10 ⚠️ | 多窗格并发渲染掉帧 | 分屏在 2in1 上卡顿，首日需求达不成 | 中 | 架构上先定死「全应用单一帧调度器」（D14）；**T0 spike 直接测 4 实例**；兜底：非聚焦窗格降到 30 fps 刷新、失焦窗格只在 `revision` 变化时重绘 | T0 的 4 实例场景 < 50 fps |
 | R-3 | 用户用同一账号同时登录桌面端与本应用 | 两份格式不同的文档互相覆盖，配置丢失 | 低 | 注册/登录页文案提示；本应用读到无法解析的文档时**只报错不覆盖**，绝不静默上传本地版本 | 用户反馈配置消失 |
 | R-4 ⚠️ | 保险库互解不通（S2） | 同步功能整体不可用 | 中 | S2 第一天先做黄金测试向量，用最小 demo 验证，不要等整个模块写完 | 黄金测试任一向量失败 |
-| R-5 | 后台保活被系统回收（P1） | 会话频繁掉线 | 中 | 优雅降级：保存会话状态，回前台自动重连并提示 | 真机实测后台 < 10 min 被杀 |
+| R-5 | 后台保活被系统回收（P1） | 会话频繁掉线 | 中 | **P1 已落地降级链**：`dataTransfer` 被低速挂起时不断连接、被取消时用短时任务宽限窗口优雅断开（保留会话面孔与窗格绑定），回前台原地重连并在蒙层写明原因。风险从「静默失联」降为「后台时长不确定」 | 真机实测后台 < 10 min 被杀 |
 | R-6 | AppGallery 审核对 SSH 类应用的额外要求 | 上架延期 | 低 | P3 提前准备隐私政策与数据出境说明；P5 预留 2 周审核缓冲 | 提审被拒 |
 | R-7 | libssh2 不支持 chacha20-poly1305 | 少数加固服务器连不上 | 低 | 保留 libssh（LGPL）作为备选后端，接口层已抽象 | 用户实际反馈连不上 |
 | R-8 ⚠️ | 同步 API 走公网**明文 HTTP + 裸 IP** | 登录密码、token、key envelope 可被窃听；AppGallery 审核高概率被问 | **高** | 给服务端挂域名 + Let's Encrypt，客户端切 `https://` 并删除 `network` 节点（约半天运维）。在此之前：登录页提示、token 短时效、不做「记住密码」自动登录 | 提审前未切 HTTPS |

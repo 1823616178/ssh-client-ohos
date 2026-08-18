@@ -13,8 +13,8 @@
  * 关键语义（§4.3.1 逐字落地）：
  *   - 分屏二叉树任意嵌套；拖分隔条 = setRatio 改 ratio（钳制 [0.1, 0.9]）；
  *   - 关闭 Leaf 时兄弟节点上提替换父 Split（保持树紧凑）；根 Leaf 关闭 = 关标签；
- *   - 断点降级只改「可见性」不动树：sm 只看得见聚焦 Leaf，md/lg 全量——
- *     lg→sm→lg 往返模型零变化，会话不因转屏断开（渲染切换归 VM/UI）；
+ *   - 两窗格在 sm 也完整显示，满足手机上的左右/上下双服务器对照；只有 3+ 窗格
+ *     才在 sm 降级为聚焦 Leaf，且降级只改可见性不动树；
  *   - 布局（layoutPaneTree）：ratio 递归求矩形 + 分隔条占位；
  *     1px 舍入策略：childA 取 floor、childB 吃全部余量（总和严格等于可用
  *     尺寸，无累计缝隙，奇偶差恒落 B 侧）；零/负尺寸全部钳制收敛，不除零。
@@ -323,6 +323,11 @@ function layoutNode(node: PaneNode, w: number, h: number, x: number, y: number,
 
 /** 窗格区宽度 → 断点（DESIGN §4.3：<600 sm；600–840 md；>840 lg） */
 export function breakpointOfWidth(widthVp: number): PaneBreakpoint {
+  // NaN 防护：两个比较对 NaN 都为 false，会静默落到 'lg'（曾导致断点误判成大屏、
+  // 窗格矩形算成 NaN 而渲染为 0 尺寸）。非有限值一律按最保守的单窗格 'sm' 处理。
+  if (!Number.isFinite(widthVp)) {
+    return 'sm';
+  }
   if (widthVp < BREAKPOINT_SM_MAX_VP) {
     return 'sm';
   }
@@ -351,12 +356,12 @@ export function visibleLeaves(root: PaneNode, focusedPaneId: string,
 
 /**
  * 当前断点下应渲染的矩形（树本身不动）：
- *   - sm：只给可见那一叶铺满容器，无分隔条（lg→sm→lg 往返只换这套矩形）；
- *   - md/lg：完整 layoutPaneTree。
+ *   - sm 且 3+ 叶：只给聚焦叶铺满，无分隔条；
+ *   - sm 的 1–2 叶及 md/lg：完整 layoutPaneTree。
  */
 export function layoutVisibleTree(root: PaneNode, focusedPaneId: string,
   breakpoint: PaneBreakpoint, width: number, height: number, dividerSize: number): PaneLayout {
-  if (breakpoint === 'sm') {
+  if (breakpoint === 'sm' && leavesOf(root).length > 2) {
     const vis: PaneLeaf[] = visibleLeaves(root, focusedPaneId, breakpoint);
     if (vis.length === 0) {
       const empty: PaneLayout = { leaves: [], dividers: [] };
@@ -567,6 +572,27 @@ export class PaneTabSet {
   }
 
   /**
+   * 把另一棵窗格树接到目标标签根上，成为 Split 的 B 侧（原树留在 A 侧）。
+   * 用于「拖标签到当前画面分屏」：源标签先 closeTab 摘下，再把其 root 交来。
+   */
+  dockTree(targetTabId: string, incoming: PaneNode, direction: SplitDirection): PaneSplit | null {
+    const tab: PaneTab | null = this.findTab(targetTabId);
+    if (tab === null) {
+      return null;
+    }
+    const split: PaneSplit = {
+      kind: 'split',
+      splitId: this.ids.newSplitId(),
+      direction: direction,
+      ratio: 0.5,
+      childA: tab.root,
+      childB: incoming
+    };
+    tab.root = split;
+    return split;
+  }
+
+  /**
    * 关闭叶子（兄弟上提，保持树紧凑）：
    *   - 非根 Leaf：父 Split 被兄弟子树整体替换（兄弟可能是 Leaf 或 Split，
    *     嵌套场景递归成立——祖父节点直接改指向兄弟子树）；
@@ -662,6 +688,10 @@ export class PaneTabSet {
     for (const tab of this.tabs) {
       const split: PaneSplit | null = findSplitInNode(tab.root, splitId);
       if (split !== null) {
+        // 手势事件异常值不能污染树；NaN 一旦进入 layout 会把全部矩形传播成 NaN。
+        if (!Number.isFinite(ratio)) {
+          return split.ratio;
+        }
         const clamped: number = Math.min(PANE_MAX_RATIO, Math.max(PANE_MIN_RATIO, ratio));
         split.ratio = clamped;
         return clamped;

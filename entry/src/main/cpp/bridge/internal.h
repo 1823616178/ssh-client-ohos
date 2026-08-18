@@ -62,6 +62,7 @@ enum class EventKind {
     kError,
     // ---- T3 终端事件（经 stateTsfn 投递，terminal 字段携带终端句柄）----
     kTerminalOpen,      // 终端绑定的 shell 通道打开结果（attachTerminal 受理后回报）
+    kTerminalData,      // 终端网格已发布新 revision（只作 ArkTS 帧调度唤醒，不带字节）
     kTerminalClose,     // 终端通道终结（对端退出/会话丢失/closeTerminal 后收尾）
     kTerminalBell,      // vterm bell（UI 触感）
     kTerminalTitle,     // OSC 标题变更
@@ -177,6 +178,10 @@ std::shared_ptr<SessionHandle> LookupLive(uint64_t handle);
 
 // 状态类事件发送（循环线程；stateTsfn 无限队列绝不丢）
 void SendStateEvent(SessionHandle *sh, BridgeEvent *evt);
+
+// T3：终端输出的轻量 dirty 信号走有界 data TSFN。队列满时可安全丢弃：
+// 队列里已有待消费的数据/dirty 事件，任一到达 ArkTS 都会唤醒帧调度器。
+void SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt);
 
 // T3：从终端全局句柄表摘除（幂等）；Teardown 回收终端本体前同步摘掉，
 // 此后 ArkTS 侧的 terminal 句柄调用全部落空（定义在 terminal_bridge.cpp）

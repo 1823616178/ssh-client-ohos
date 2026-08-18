@@ -46,6 +46,7 @@ export const getArgon2Version: () => string;
  * - error：code / message / count（如 data_queue_full 背压丢弃通知）
  * - T3 终端事件（attachTerminal 后随本会话 onEvent 上抛，均带 terminal 句柄）：
  *   terminalOpen：terminal / success / error / message（attachTerminal 受理后回报）
+ *   terminalData：terminal（native 网格已发布新 revision，只作帧调度唤醒）
  *   terminalClose：terminal / reason / exitStatus / exitSignal / message
  *   terminalBell：terminal（vterm bell，UI 触感）
  *   terminalTitle：terminal / title（OSC 标题变更）
@@ -83,8 +84,8 @@ export interface SshNativeEvent {
   exitSignal?: string;
   code?: string;
   count?: number;
-  /** T3：终端事件携带的终端句柄（terminalOpen/terminalClose/terminalBell/
-   *  terminalTitle/terminalMouseMode） */
+  /** T3：终端事件携带的终端句柄（terminalOpen/terminalData/terminalClose/
+   *  terminalBell/terminalTitle/terminalMouseMode） */
   terminal?: number;
   /** T3：terminalTitle 事件的标题文本 */
   title?: string;
@@ -149,6 +150,15 @@ export const closeSession: (handle: number) => boolean;
  * errorCode=404（KEEPALIVE_TIMEOUT，N13 统一数值码））
  */
 export const setKeepalive: (handle: number, intervalSec: number, maxMisses: number) => boolean;
+
+/**
+ * P1：网络切换后的主动探测（受理语义，仅 established 受理，false = 未受理）。
+ * 立刻发一拍 keepalive 并开 timeoutSec 秒判定窗口：窗口内无任何入站活动即判黑洞，
+ * 会话进 disconnected（stateChange 附 reconnectHint=true、errorCode=404），
+ * 由 ArkTS 侧走既有重连链；有入站则复位 miss 计数并续回周期 keepalive。
+ * timeoutSec 省略或 0 = native 默认 5 s（与 P1「切网 5 s 内触发重连」同口径）。
+ */
+export const probeNow: (handle: number, timeoutSec?: number) => boolean;
 
 /**
  * N12：设置自动重连退避策略（任意时刻可调；重连编排在 ArkTS 侧
@@ -304,3 +314,71 @@ export const writeTerminal: (terminalHandle: number, data: ArrayBuffer | string)
  * 下一次 beginFrame 拿到新尺寸的 grid；旧 grid buffer 仍读到冻结旧内容
  */
 export const resizeTerminal: (terminalHandle: number, cols: number, rows: number) => boolean;
+
+/**
+ * 注入外观默认前后景色（ARGB 无符号 32 位）。post 进会话循环线程调用
+ * VtermBridge::setDefaultColors，空白格与 DEFAULT 色按新值重解析并发布快照。
+ */
+export const setTerminalDefaultColors: (
+  terminalHandle: number,
+  fgArgb: number,
+  bgArgb: number
+) => boolean;
+
+/** 保险库 create 结果（recoveryKey 只应展示一次） */
+export interface VaultNativeCreateResult {
+  handle: number;
+  keyVersion: number;
+  passwordWrappedKey: string;
+  passwordWrapNonce: string;
+  recoveryWrappedKey: string;
+  recoveryWrapNonce: string;
+  kdfSalt: string;
+  recoveryKey: string;
+}
+
+export interface VaultNativeSeal {
+  schemaVersion: number;
+  keyVersion: number;
+  algorithm: string;
+  nonce: string;
+  ciphertext: string;
+  ciphertextHash: string;
+}
+
+export const vaultCreate: (password: string, keyVersion: number) => VaultNativeCreateResult | null;
+export const vaultUnlockPassword: (
+  password: string,
+  keyVersion: number,
+  kdfSalt: string,
+  passwordWrappedKey: string,
+  passwordWrapNonce: string
+) => number;
+export const vaultUnlockRecovery: (
+  recoveryKey: string,
+  keyVersion: number,
+  recoveryWrappedKey: string,
+  recoveryWrapNonce: string
+) => number;
+export const vaultEncrypt: (
+  handle: number,
+  vaultId: string,
+  schemaVersion: number,
+  keyVersion: number,
+  plaintext: string
+) => VaultNativeSeal | null;
+export const vaultDecrypt: (
+  handle: number,
+  vaultId: string,
+  schemaVersion: number,
+  keyVersion: number,
+  nonce: string,
+  ciphertext: string
+) => string | null;
+export const vaultRewrap: (
+  handle: number,
+  newPassword: string,
+  keyVersion: number
+) => VaultNativeCreateResult | null;
+export const vaultRotate: (handle: number, password: string) => VaultNativeCreateResult | null;
+export const vaultClose: (handle: number) => boolean;

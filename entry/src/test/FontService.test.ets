@@ -15,6 +15,7 @@ import {
 import {
   TextMeasureContext,
   TextMeasureResult,
+  computeBaselineOffsetFromCenter,
   fontMeasureKey,
   invalidateFontMeasureCache,
   isCjkAligned,
@@ -65,15 +66,21 @@ export default function fontServiceTest() {
       const m1 = measureTerminalCells(ctx, family, 14, 400);
       expect(m1.measured).assertTrue();
       expect(m1.glyphWidthVp).assertEqual(8.4);
-      expect(ctx.calls).assertEqual(1);
-      expect(m1.fontNormal).assertEqual('normal normal 14vp "CacheHit Family"');
-      expect(m1.fontBold).assertEqual('normal bold 14vp "CacheHit Family"');
-      expect(m1.fontItalic).assertEqual('italic normal 14vp "CacheHit Family"');
-      expect(m1.fontBoldItalic).assertEqual('italic bold 14vp "CacheHit Family"');
+      expect(ctx.calls).assertEqual(2);
+      expect(m1.fontNormal).assertEqual('normal normal 14vp "CacheHit Family", monospace');
+      expect(m1.fontBold).assertEqual('normal bold 14vp "CacheHit Family", monospace');
+      expect(m1.fontItalic).assertEqual('italic normal 14vp "CacheHit Family", monospace');
+      expect(m1.fontBoldItalic).assertEqual('italic bold 14vp "CacheHit Family", monospace');
       // 同 key 再测：走缓存，measureText 不再调用
       const m2 = measureTerminalCells(ctx, family, 14, 400);
       expect(m2.glyphWidthVp).assertEqual(8.4);
-      expect(ctx.calls).assertEqual(1);
+      expect(ctx.calls).assertEqual(2);
+    });
+
+    it('字母基线_按字体包围盒居中且无度量时兜底', 0, () => {
+      expect(computeBaselineOffsetFromCenter(14, 11, 3)).assertEqual(4);
+      expect(computeBaselineOffsetFromCenter(14, 0, 0)).assertEqual(4.2);
+      expect(computeBaselineOffsetFromCenter(-1, 0, 0)).assertEqual(0);
     });
 
     it('度量_key变化重测', 0, () => {
@@ -83,17 +90,17 @@ export default function fontServiceTest() {
       measureTerminalCells(ctx, 'KeyChange Family', 15, 400); // 字号变
       measureTerminalCells(ctx, 'KeyChange Family', 14, 700); // 字重变
       measureTerminalCells(ctx, 'KeyChange Family2', 14, 400); // 字族变
-      expect(ctx.calls).assertEqual(4);
+      expect(ctx.calls).assertEqual(8);
     });
 
     it('度量_缓存失效后重测', 0, () => {
       invalidateFontMeasureCache();
       const ctx = new FakeMeasureContext({ 'W': 8.4 });
       measureTerminalCells(ctx, 'Invalidate Family', 14, 400);
-      expect(ctx.calls).assertEqual(1);
+      expect(ctx.calls).assertEqual(2);
       invalidateFontMeasureCache();
       measureTerminalCells(ctx, 'Invalidate Family', 14, 400);
-      expect(ctx.calls).assertEqual(2);
+      expect(ctx.calls).assertEqual(4);
     });
 
     it('度量_失败不写缓存且下次重试', 0, () => {
@@ -102,7 +109,7 @@ export default function fontServiceTest() {
       const m1 = measureTerminalCells(ctx, 'Fail Family', 14, 400);
       expect(m1.measured).assertFalse();
       expect(m1.glyphWidthVp).assertEqual(0);
-      expect(ctx.calls).assertEqual(1);
+      expect(ctx.calls).assertEqual(2);
       // 失败不落缓存：字体注册完成后下一次调用会真正重测
       const ctx2 = new FakeMeasureContext({ 'W': 9.0 });
       const m2 = measureTerminalCells(ctx2, 'Fail Family', 14, 400);

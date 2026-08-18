@@ -52,8 +52,9 @@
  *     detachTerminal(handle)                  → 幂等；摘句柄表 + 关通道，
  *                                               本体随终态回调/会话回收（internal.h 头注）
  *
- *   终端事件（经 N11 的 stateTsfn 随会话 onEvent 上抛，均带 terminal 句柄）：
- *     terminalOpen / terminalClose / terminalBell / terminalTitle / terminalMouseMode。
+ *   终端事件（随会话 onEvent 上抛，均带 terminal 句柄）：
+ *     terminalOpen / terminalClose / terminalBell / terminalTitle / terminalMouseMode
+ *     走 stateTsfn；terminalData（网格 revision 变更、只作帧唤醒）走有界 dataTsfn。
  *
  * 线程纪律（满足 SshChannel/VtermBridge 契约的关键）：
  *   - vterm/channel 只在会话循环线程使用与销毁（Core 销毁任务由通道终态回调
