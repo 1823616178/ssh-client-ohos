@@ -22,6 +22,7 @@ import {
   DecodedCell,
   DirtyRange,
   buildSelfTestPattern,
+  addCursorRowRange,
   collectDirtyRanges,
   decodeCellAt,
   isRowDirty,
@@ -117,6 +118,24 @@ export default function sshTerminalTest() {
       expect(ranges[2].end).assertEqual(9);
       expect(ranges[3].start).assertEqual(23);
       expect(ranges[3].end).assertEqual(24); // 尾边界：最后一行脏，end 收在 rows
+    });
+
+    it('addCursorRowRange_插入合并与越界', 0, () => {
+      const r1: DirtyRange[] = addCursorRowRange([], 5, 24);
+      expect(r1.length).assertEqual(1);
+      expect(r1[0].start).assertEqual(5);
+      expect(r1[0].end).assertEqual(6);
+      const r2: DirtyRange[] = addCursorRowRange([{ start: 0, end: 2 }, { start: 8, end: 10 }], 5, 24);
+      expect(r2.length).assertEqual(3);
+      expect(r2[1].start).assertEqual(5);
+      const r3: DirtyRange[] = addCursorRowRange([{ start: 0, end: 2 }, { start: 3, end: 5 }], 2, 24);
+      expect(r3.length).assertEqual(1);
+      expect(r3[0].end).assertEqual(5);
+      const r4: DirtyRange[] = addCursorRowRange([{ start: 4, end: 7 }], 5, 24);
+      expect(r4.length).assertEqual(1);
+      expect(r4[0].end).assertEqual(7);
+      expect(addCursorRowRange([], -1, 24).length).assertEqual(0);
+      expect(addCursorRowRange([], 24, 24).length).assertEqual(0);
     });
 
     it('collectDirtyRanges_全干净与全脏', 0, () => {

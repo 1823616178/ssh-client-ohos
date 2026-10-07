@@ -69,6 +69,7 @@ import { NativeTerminalFrame } from '../napi/SshNative';
 import {
   DirtyRange,
   SshTerminal,
+  addCursorRowRange,
   collectDirtyRanges
 } from '../napi/SshTerminal';
 import { Logger } from '../common/utils/Logger';
@@ -427,6 +428,12 @@ export struct TerminalCanvas {
   // ---- A3 光标闪烁（FrameScheduler 半周期 wakeup + cursorVisibleAt 纯函数）----
   /** 上次绘制时光标的可见相位；相位翻转时即使 content revision 不变也要重画光标格 */
   private lastCursorBlinkVisible = true;
+  /** execCommands 跨批次的 ctx 状态缓存（NaN/'' = 未知，任何外部改动后须 invalidateCtxStyleCache） */
+  private lastCtxFont = '';
+  private lastCtxFill: number = Number.NaN;
+  /** 选区宽字符边界修正缓存：键 = 原始选区 + revision + 尺寸 */
+  private selAdjustKey = '';
+  private selAdjusted: SelectionRange | null = null;
   /** 半周期唤醒定时器（闪烁开启时防 FrameScheduler 自动休眠吞掉相位翻转） */
   private blinkWakeTimer: number = -1;
 
@@ -516,6 +523,7 @@ export struct TerminalCanvas {
     const offCtx = offscreen.getContext('2d', this.settings);
     offCtx.putImageData(image, 0, 0);
     const bitmap = offscreen.transferToImageBitmap();
+    this.invalidateCtxStyleCache();
     this.context.fillStyle = this.backgroundArgb;
     this.context.fillRect(0, 0, w, h);
     this.context.drawImage(bitmap, 0, 0);
@@ -852,6 +860,7 @@ export struct TerminalCanvas {
    */
   private paintScrolledWindow(frame: NativeTerminalFrame): void {
     const ctx = this.context;
+    this.invalidateCtxStyleCache();
     ctx.fillStyle = this.backgroundArgb;
     ctx.fillRect(0, 0, this.areaWidthVp, this.areaHeightVp);
     const terminal = this.terminal;
@@ -887,43 +896,85 @@ export struct TerminalCanvas {
     if (raw === null || terminal === null) {
       return;
     }
-    const view = terminal.readRows(frame, 0, frame.rows);
-    if (view === null) {
-      return;
-    }
-    const range = adjustWideCharBoundary(dataViewGridReader(view, frame.rows, frame.cols), raw);
-    const ctx = this.context;
-    ctx.fillStyle = withOpacity(this.selectionArgb, SELECTION_OVERLAY_OPACITY);
-    const lastRow = Math.min(range.endRow, frame.rows - 1);
-    for (let r = range.startRow; r <= lastRow; r++) {
-      if (r < 0) {
-        continue;
+    // 宽字符边界修正只依赖选区端点与网格内容：选区/revision/尺寸不变时复用上次结果
+    const key = `${raw.startRow},${raw.startCol},${raw.endRow},${raw.endCol}|${frame.revision}|` +
+      `${frame.rows}x${frame.cols}`;
+    let range = this.selAdjusted;
+    if (key !== this.selAdjustKey || range === null) {
+      const view = terminal.readRows(frame, 0, frame.rows);
+      if (view === null) {
+        return;
       }
+      range = adjustWideCharBoundary(dataViewGridReader(view, frame.rows, frame.cols), raw);
+      this.selAdjustKey = key;
+      this.selAdjusted = range;
+    }
+    const ctx = this.context;
+    const ox = this.layout.originX;
+    const oy = this.layout.originY;
+    const cw = this.cellWidthVp;
+    const ch = this.cellHeightVp;
+    const firstRow = Math.max(0, range.startRow);
+    const lastRow = Math.min(range.endRow, frame.rows - 1);
+    // 一次遍历：填充各行，同时收集每行 [lo, hi] 供外轮廓描边
+    const los: number[] = [];
+    const his: number[] = [];
+    this.invalidateCtxStyleCache();
+    ctx.fillStyle = withOpacity(this.selectionArgb, SELECTION_OVERLAY_OPACITY);
+    for (let r = firstRow; r <= lastRow; r++) {
       const lo = r === range.startRow ? range.startCol : 0;
       const hi = Math.min(r === range.endRow ? range.endCol : frame.cols - 1, frame.cols - 1);
-      if (hi < lo) {
-        continue;
+      los.push(lo);
+      his.push(hi);
+      if (hi >= lo) {
+        ctx.fillRect(ox + lo * cw, oy + r * ch, (hi - lo + 1) * cw, ch);
       }
-      ctx.fillRect(this.layout.originX + lo * this.cellWidthVp,
-        this.layout.originY + r * this.cellHeightVp,
-        (hi - lo + 1) * this.cellWidthVp, this.cellHeightVp);
     }
+    // 只描整体外轮廓：每行左右竖边 + 与上/下一行不重叠部分的横边
     ctx.strokeStyle = this.cursorArgb;
     ctx.lineWidth = SELECTION_BORDER_VP;
-    for (let r = range.startRow; r <= lastRow; r++) {
-      if (r < 0) {
-        continue;
-      }
-      const lo = r === range.startRow ? range.startCol : 0;
-      const hi = Math.min(r === range.endRow ? range.endCol : frame.cols - 1, frame.cols - 1);
+    ctx.beginPath();
+    const n = los.length;
+    for (let i = 0; i < n; i++) {
+      const lo = los[i];
+      const hi = his[i];
       if (hi < lo) {
         continue;
       }
-      ctx.strokeRect(this.layout.originX + lo * this.cellWidthVp,
-        this.layout.originY + r * this.cellHeightVp,
-        (hi - lo + 1) * this.cellWidthVp, this.cellHeightVp);
+      const y0 = oy + (firstRow + i) * ch;
+      const y1 = y0 + ch;
+      const x0 = ox + lo * cw;
+      const x1 = ox + (hi + 1) * cw;
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x0, y1);
+      ctx.moveTo(x1, y0);
+      ctx.lineTo(x1, y1);
+      this.strokeEdgeOutside(i > 0 ? los[i - 1] : 0, i > 0 ? his[i - 1] : -1, lo, hi, y0);
+      this.strokeEdgeOutside(i + 1 < n ? los[i + 1] : 0, i + 1 < n ? his[i + 1] : -1, lo, hi, y1);
+    }
+    ctx.stroke();
+  }
+
+  /** 横边：本行 [lo,hi] 中不被相邻行 [nlo,nhi] 覆盖的区段（nhi<nlo 表示无相邻行） */
+  private strokeEdgeOutside(nlo: number, nhi: number, lo: number, hi: number, y: number): void {
+    const ctx = this.context;
+    const ox = this.layout.originX;
+    const cw = this.cellWidthVp;
+    if (nhi < nlo || nhi < lo || nlo > hi) {
+      ctx.moveTo(ox + lo * cw, y);
+      ctx.lineTo(ox + (hi + 1) * cw, y);
+      return;
+    }
+    if (nlo > lo) {
+      ctx.moveTo(ox + lo * cw, y);
+      ctx.lineTo(ox + nlo * cw, y);
+    }
+    if (nhi < hi) {
+      ctx.moveTo(ox + (nhi + 1) * cw, y);
+      ctx.lineTo(ox + (hi + 1) * cw, y);
     }
   }
+
 
   // ---------------------------------------------------------------- T8 选择模式
 
@@ -1189,6 +1240,7 @@ export struct TerminalCanvas {
       return false; // 句柄失效
     }
     // A3 光标闪烁：content 静止时若相位翻转，仍需重画（显示/擦除）光标格
+    let blinkOnlyRedraw = false;
     const blinkVisible: boolean = cursorVisibleAt(Date.now(), this.appearance.cursorBlink,
       CURSOR_BLINK_PERIOD_MS);
     if (!this.needsFullRedraw && revision === this.lastRenderedRevision) {
@@ -1197,8 +1249,8 @@ export struct TerminalCanvas {
       if (blinkStable) {
         return false; // 无变化：整帧跳过（静止省电第一层）
       }
-      // 相位翻转：全量重绘光标所在格（block 反色需还原本体字符，脏行位图无此标记）
-      this.needsFullRedraw = true;
+      // 相位翻转：只重绘光标所在行（block 反色需还原本体字符，脏行位图无此标记）
+      blinkOnlyRedraw = true;
     }
     const frame = terminal.beginFrame();
     if (frame === null) {
@@ -1227,11 +1279,16 @@ export struct TerminalCanvas {
       return true;
     }
     let drew = false;
-    if (this.needsFullRedraw || frame.cols !== this.lastGridCols || frame.rows !== this.lastGridRows) {
+    // 选择模式下叠加层为半透明：只重画脏行会让未重画行上的旧高亮叠加变深/残留，故整屏重绘
+    if (this.needsFullRedraw || this.selection.selecting ||
+      frame.cols !== this.lastGridCols || frame.rows !== this.lastGridRows) {
       this.paintFull(frame);
       drew = true;
     } else if (frame.dirty !== undefined) {
       const ranges = collectDirtyRanges(frame.dirty, frame.rows);
+      if (blinkOnlyRedraw) {
+        addCursorRowRange(ranges, frame.cursorRow, frame.rows);
+      }
       if (ranges.length > 0) {
         this.paintRanges(frame, ranges);
         drew = true;
@@ -1261,6 +1318,7 @@ export struct TerminalCanvas {
   /** 全量重绘：整底 + 全部行内容（首帧/尺寸变化/外观变化/onReady 清屏后） */
   private paintFull(frame: NativeTerminalFrame): void {
     const ctx = this.context;
+    this.invalidateCtxStyleCache();
     ctx.fillStyle = this.backgroundArgb;
     ctx.fillRect(0, 0, this.areaWidthVp, this.areaHeightVp);
     const view = this.terminal?.readRows(frame, 0, frame.rows);
@@ -1276,7 +1334,8 @@ export struct TerminalCanvas {
     const env = this.renderEnv();
     for (const range of ranges) {
       const count = range.end - range.start;
-      ctx.fillStyle = this.backgroundArgb;
+      this.invalidateCtxStyleCache();
+    ctx.fillStyle = this.backgroundArgb;
       ctx.fillRect(0, env.originY + range.start * env.cellHeight, this.areaWidthVp,
         count * env.cellHeight);
       const view = this.terminal?.readRows(frame, range.start, count);
@@ -1308,18 +1367,24 @@ export struct TerminalCanvas {
   private execCommands(cmds: RowDrawCommands): void {
     const ctx = this.context;
     for (const bg of cmds.backgrounds) {
-      ctx.fillStyle = bg.argb;
+      if (bg.argb !== this.lastCtxFill) {
+        ctx.fillStyle = bg.argb;
+        this.lastCtxFill = bg.argb;
+      }
       ctx.fillRect(bg.x, bg.y, bg.width, bg.height);
     }
     const thickness = Math.max(1, this.appearance.fontSize * TEXT_DECO_THICKNESS_FRACTION);
-    let lastFont = ''; // font 赋值触发解析，是帧热路径上最贵的状态切换：相同则跳过
+    // font 赋值触发解析，是帧热路径上最贵的状态切换：跨批次记住上次值，相同则跳过
     for (const run of cmds.texts) {
       const font = this.fontFor(run.bold, run.italic);
-      if (font !== lastFont) {
+      if (font !== this.lastCtxFont) {
         ctx.font = font;
-        lastFont = font;
+        this.lastCtxFont = font;
       }
-      ctx.fillStyle = run.fgArgb;
+      if (run.fgArgb !== this.lastCtxFill) {
+        ctx.fillStyle = run.fgArgb;
+        this.lastCtxFill = run.fgArgb;
+      }
       // HarmonyOS Canvas 的 middle baseline 不是字形包围盒的视觉中心；统一使用
       // alphabetic baseline，并按实测 ascent/descent 把字形中心对齐到 cell 中线。
       ctx.fillText(run.text, run.x, run.y + this.textBaselineOffsetVp);
@@ -1338,6 +1403,7 @@ export struct TerminalCanvas {
   private onCanvasReady(): void {
     // onReady 在初始化完成与尺寸变化时触发，且触发时画布已被清空（官方文档语义）
     this.canvasReady = true;
+    this.invalidateCtxStyleCache();
     this.measureCells();
     this.relayout();
     this.needsFullRedraw = true;
@@ -1512,6 +1578,8 @@ export struct TerminalCanvas {
     this.fontItalic = m.fontItalic;
     this.fontBoldItalic = m.fontBoldItalic;
     this.context.font = this.fontNormal;
+    this.invalidateCtxStyleCache();
+    this.lastCtxFont = this.fontNormal;
     this.context.textAlign = 'left';
     this.context.textBaseline = 'alphabetic';
     let glyphWidth = m.glyphWidthVp;
@@ -1602,6 +1670,11 @@ export struct TerminalCanvas {
       // 字间距 ≠ 0 时合并字符串会丢间距对齐，退化为逐格一条
       perGlyphText: this.appearance.letterSpacing !== 0
     };
+  }
+
+  private invalidateCtxStyleCache(): void {
+    this.lastCtxFont = '';
+    this.lastCtxFill = Number.NaN;
   }
 
   private fontFor(bold: boolean, italic: boolean): string {
