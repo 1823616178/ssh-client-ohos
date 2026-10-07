@@ -19,6 +19,42 @@
     {
       "name": "reason_read_pasteboard",
       "value": "用于读取剪贴板内容以粘贴到终端"
+    },
+    {
+      "name": "settings_title",
+      "value": "设置"
+    },
+    {
+      "name": "settings_eyebrow",
+      "value": "SETTINGS"
+    },
+    {
+      "name": "settings_background_section",
+      "value": "后台与续航"
+    },
+    {
+      "name": "settings_background_keep_alive",
+      "value": "后台保持连接"
+    },
+    {
+      "name": "settings_tools_section",
+      "value": "工具"
+    },
+    {
+      "name": "settings_about_section",
+      "value": "关于与合规"
+    },
+    {
+      "name": "settings_about_open_source",
+      "value": "开源许可"
+    },
+    {
+      "name": "settings_about_open_source_sub",
+      "value": "第三方许可证摘要"
+    },
+    {
+      "name": "nav_back",
+      "value": "返回"
     }
   ]
 }

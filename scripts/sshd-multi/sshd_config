@@ -1,0 +1,23 @@
+# 多算法 sshd 配置（Q1 集成测试桩）
+# 用法：挂载到容器 /config/sshd_config，或本机 sshd -f 试跑
+
+Port 2222
+ListenAddress 0.0.0.0
+Protocol 2
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin no
+UsePAM no
+
+# 主机密钥算法（多算法矩阵）
+HostKeyAlgorithms ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256
+
+# 公钥认证算法
+PubkeyAcceptedAlgorithms +ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256
+
+# 会话加密 / MAC（覆盖 libssh2 支持面；chacha20 留给 libssh 备选路径）
+Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr
+MACs hmac-sha2-256,hmac-sha2-512,hmac-sha1
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256
+
+Subsystem sftp internal-sftp

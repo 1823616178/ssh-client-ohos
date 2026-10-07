@@ -27,6 +27,23 @@ const STORE_NAME: string = 'app_settings';
 /** 主题模式 */
 export type ThemeMode = 'system' | 'dark' | 'light';
 
+/**
+ * 终端页屏幕常亮档位：
+ *   never   —— 从不常亮，交给系统息屏（省电优先）
+ *   session —— 终端页在前台**且有活跃会话**时常亮（默认；看日志/等编译时不会被息屏打断，
+ *              也就不会因为锁屏走上 §7.5 那条后台降级链）
+ *   always  —— 只要终端页在前台就常亮
+ */
+export type KeepScreenOnMode = 'never' | 'session' | 'always';
+
+/** 字符串归一到合法档位（读到老值/脏值时兜底为默认档） */
+export function toKeepScreenOnMode(value: string): KeepScreenOnMode {
+  if (value === 'never' || value === 'always') {
+    return value;
+  }
+  return 'session';
+}
+
 /** 设置值类型标签（preferences 支持的三种标量） */
 export type SettingValueType = 'string' | 'number' | 'boolean';
 
@@ -43,6 +60,7 @@ const KEY_THEME_MODE: string = 'themeMode';
 const KEY_DEFAULT_FONT_SIZE: string = 'defaultFontSize';
 const KEY_KEEP_ALIVE_IN_BACKGROUND: string = 'keepAliveInBackground';
 const KEY_SCREEN_OFF_DISCONNECT_MINUTES: string = 'screenOffDisconnectMinutes';
+const KEY_KEEP_SCREEN_ON_MODE: string = 'keepScreenOnMode';
 const KEY_HAPTIC_ENABLED: string = 'hapticEnabled';
 const KEY_KEY_BAR_LAYOUT: string = 'keyBarLayout';
 const KEY_LAST_SESSION_ID: string = 'lastSessionId';
@@ -58,6 +76,8 @@ const KEY_SYNC_LAST_REVISION: string = 'syncLastRevision';
 const KEY_SYNC_PASSWORDS: string = 'syncPasswords';
 const KEY_SYNC_PRIVATE_KEYS: string = 'syncPrivateKeys';
 const KEY_SYNC_PASSTHROUGH: string = 'syncPassthrough';
+/** U3：私钥管理元数据列表（JSON；私钥本体在 CredentialStore，见 KeyManagerViewModel） */
+const KEY_SSH_KEY_ENTRIES: string = 'sshKeyEntries';
 
 /**
  * 键定义表：所有设置键的唯一声明处。
@@ -69,6 +89,7 @@ export const SETTING_DEFS: SettingDef[] = [
   { key: KEY_DEFAULT_FONT_SIZE, type: 'number', defaultValue: 14, comment: '默认终端字号（§4.4 常用值，可选 8–32）' },
   { key: KEY_KEEP_ALIVE_IN_BACKGROUND, type: 'boolean', defaultValue: true, comment: '后台保持连接（§7.5 默认开）' },
   { key: KEY_SCREEN_OFF_DISCONNECT_MINUTES, type: 'number', defaultValue: 0, comment: '息屏 N 分钟后断开，0 = 关（§7.5 默认关）' },
+  { key: KEY_KEEP_SCREEN_ON_MODE, type: 'string', defaultValue: 'session', comment: '终端页屏幕常亮：never / session / always（默认 session）' },
   { key: KEY_HAPTIC_ENABLED, type: 'boolean', defaultValue: true, comment: '触感反馈开关（§4.4）' },
   { key: KEY_KEY_BAR_LAYOUT, type: 'string', defaultValue: '', comment: '功能键条布局（JSON 串，空串 = 内置默认布局）' },
   { key: KEY_LAST_SESSION_ID, type: 'string', defaultValue: '', comment: '上次会话 id（§5.1），空串 = 无' },
@@ -83,7 +104,8 @@ export const SETTING_DEFS: SettingDef[] = [
   { key: KEY_SYNC_LAST_REVISION, type: 'string', defaultValue: '', comment: '上次成功同步的 revision' },
   { key: KEY_SYNC_PASSWORDS, type: 'boolean', defaultValue: false, comment: '是否同步密码（S7，默认关）' },
   { key: KEY_SYNC_PRIVATE_KEYS, type: 'boolean', defaultValue: false, comment: '是否同步私钥（S7，默认关）' },
-  { key: KEY_SYNC_PASSTHROUGH, type: 'string', defaultValue: '{}', comment: '桌面端专有字段透传缓存（JSON；隧道名/分组色等本地库无列可存的字段，上行时原样带回）' }
+  { key: KEY_SYNC_PASSTHROUGH, type: 'string', defaultValue: '{}', comment: '桌面端专有字段透传缓存（JSON；隧道名/分组色等本地库无列可存的字段，上行时原样带回）' },
+  { key: KEY_SSH_KEY_ENTRIES, type: 'string', defaultValue: '[]', comment: '私钥管理元数据（JSON 数组，U3）；私钥/短语在 CredentialStore' }
 ];
 
 export class SettingsRepository {
@@ -165,6 +187,14 @@ export class SettingsRepository {
 
   static setScreenOffDisconnectMinutes(value: number): void {
     SettingsRepository.writeValue(KEY_SCREEN_OFF_DISCONNECT_MINUTES, value);
+  }
+
+  static getKeepScreenOnMode(): KeepScreenOnMode {
+    return toKeepScreenOnMode(SettingsRepository.readString(KEY_KEEP_SCREEN_ON_MODE));
+  }
+
+  static setKeepScreenOnMode(mode: KeepScreenOnMode): void {
+    SettingsRepository.writeValue(KEY_KEEP_SCREEN_ON_MODE, mode);
   }
 
   static isHapticEnabled(): boolean {
@@ -290,6 +320,15 @@ export class SettingsRepository {
 
   static setSyncPassthrough(value: string): void {
     SettingsRepository.writeValue(KEY_SYNC_PASSTHROUGH, value);
+  }
+
+  /** U3：私钥管理元数据 JSON；'[]' = 空列表 */
+  static getSshKeyEntries(): string {
+    return SettingsRepository.readString(KEY_SSH_KEY_ENTRIES);
+  }
+
+  static setSshKeyEntries(json: string): void {
+    SettingsRepository.writeValue(KEY_SSH_KEY_ENTRIES, json.length === 0 ? '[]' : json);
   }
 
   /** accessToken / refreshToken 落 CredentialStore（asset），由 SettingsAuthStore 自行清除，不在此处 */

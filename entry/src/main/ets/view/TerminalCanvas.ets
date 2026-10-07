@@ -51,9 +51,12 @@
  *    → 拖动手柄改起点/终点，或在画布上拖更新活动端
  *    → 气泡菜单「复制/全选」（粘贴/分享归 U4）；选区高亮为 selectionColor
  *    半透明叠加层，随帧重绘；跨行拼接/宽字符边界等纯逻辑在
- *    terminal/SelectionModel.ets；**首版只支持主屏选择**——回滚区
+ *    terminal/SelectionModel.ets；**手柄 hit 区几何为纯函数**（
+ *    terminal/TerminalGestures.ets：selectionHandleHitRects/AtPoint/Anchor，
+ *    hypium 可测）；**首版只支持主屏选择**——回滚区
  *    （scrollOffset>0）下长按不进入选择，回滚区选择登记后续；
- *    放大镜省略（T8 任务书允许）；
+ *    **残留缺口（见 docs/QUALITY-GATES.md §3b）**：放大镜 loupe 未做
+ *    （任务书允许省略）；气泡菜单仅复制/全选，粘贴/分享归 U4；
  *  - T9：单指竖滑——主屏 = 视图滚动回滚缓冲（scrollOffsetLines；滚动时
  *    整窗重绘「回滚+主屏」拼接窗口，**首版简化：不做增量，性能待 T0/Q2 实测**；
  *    滚动中不 endFrame、不画光标，回到底部后下帧全量自愈）；alt-screen
@@ -75,8 +78,10 @@ import {
   createDefaultTerminalAppearance
 } from './terminal/TerminalAppearance';
 import {
+  CURSOR_BLINK_PERIOD_MS,
   RowDrawCommands,
   RowRenderEnv,
+  cursorVisibleAt,
   generateCursorCommands,
   generateRowsCommands
 } from './terminal/TerminalDrawCommands';
@@ -127,11 +132,35 @@ import {
 } from './terminal/ShortcutMap';
 import {
   AltScrollMode,
+  ClickSelectCell,
+  ClickSelectGrid,
+  ClickSelectTracker,
+  ClickSelectionMode,
+  SELECTION_HANDLE_HIT_WIDTH_VP,
+  SELECTION_HANDLE_KNOB_VP,
+  SelectionHandleGeometry,
+  SelectionHandleId,
+  SGR_BUTTON_NONE,
   ScrollLineAccumulator,
   buildAltScrollSequences,
   clampFontSize,
-  clampScrollOffset
+  clampScrollOffset,
+  encodeSgrMouseEvent,
+  lineSelectAt,
+  selectionHandleAnchor,
+  selectionHandleAtPoint,
+  selectionHandleHitRects,
+  sgrButtonFromOhosButton,
+  shouldForwardMouseEvent,
+  wordSelectAt
 } from './terminal/TerminalGestures';
+import {
+  isPhysicalKeyboardTypeName,
+  keyboardTypeToString,
+  shouldShowSoftKeyboardOnTouch,
+  shouldSuppressSoftKeyboard,
+  shouldSuppressSoftKeyboardOnKeyEvent
+} from './terminal/PhysicalKeyboard';
 import { vibrateLight } from '../common/utils/Haptics';
 import { Tokens } from '../theme/Tokens';
 
@@ -155,12 +184,12 @@ const MENU_HEIGHT_VP = 36;
 const MENU_WIDTH_VP = 152;
 /** 气泡菜单与选区起点行的垂直间距（vp） */
 const MENU_GAP_VP = 4;
-/** 选区两端手柄圆钮直径（Token 表无「手柄」项） */
-const HANDLE_KNOB_VP = 22;
+/** 选区两端手柄圆钮直径（Token 表无「手柄」项；默认值与 TerminalGestures 纯函数常量对齐） */
+const HANDLE_KNOB_VP = SELECTION_HANDLE_KNOB_VP;
 /** 手柄竖条宽度 */
 const HANDLE_BAR_WIDTH_VP = 4;
-/** 手柄整体触摸宽度：圆钮 + 竖条 + 两侧热区 */
-const HANDLE_HIT_WIDTH_VP = 36;
+/** 手柄整体触摸宽度：圆钮 + 竖条 + 两侧热区（纯函数 SELECTION_HANDLE_HIT_WIDTH_VP） */
+const HANDLE_HIT_WIDTH_VP = SELECTION_HANDLE_HIT_WIDTH_VP;
 /** 选区边框线宽 */
 const SELECTION_BORDER_VP = 2;
 
@@ -207,6 +236,26 @@ class CanvasClipboardExecutor implements TerminalActionExecutor {
 
   executeClipboardAction(action: TerminalClipboardAction): void {
     this.handler(action);
+  }
+}
+
+/** ClickSelectGrid 的帧快照实现（arkts 对象字面量不承载方法，须显式类） */
+class SnapshotClickGrid implements ClickSelectGrid {
+  readonly rows: number;
+  readonly cols: number;
+  private readonly cells: ClickSelectCell[];
+
+  constructor(cells: ClickSelectCell[], rows: number, cols: number) {
+    this.cells = cells;
+    this.rows = rows;
+    this.cols = cols;
+  }
+
+  cellAt(row: number, col: number): ClickSelectCell | null {
+    if (row < 0 || row >= this.rows || col < 0 || col >= this.cols) {
+      return null;
+    }
+    return this.cells[row * this.cols + col];
   }
 }
 
@@ -336,6 +385,8 @@ export struct TerminalCanvas {
   private draggingHandle: string = '';
   private handleDragOriginX: number = 0;
   private handleDragOriginY: number = 0;
+  /** 最近一次手柄命中几何（纯函数产出，供 hit-test / 拖动 origin） */
+  private lastHandleGeo: SelectionHandleGeometry | null = null;
   // ---- T9 滚动/缩放 ----
   /** 回滚视图偏移（行；0 = 紧贴最新主屏） */
   private scrollOffsetLines = 0;
@@ -349,6 +400,35 @@ export struct TerminalCanvas {
   private lastScrollbackCount = 0;
   /** 捏合起点字号（scale 是相对手势起点的倍率） */
   private pinchBaseFontSize = 14;
+  // ---- T10 物理键盘 / T11 鼠标·连点 ----
+  /**
+   * 外接键盘活跃标记：物理键事件到达后置 true，点击窗格不再拉起软键盘
+   * （策略见 PhysicalKeyboard.ets；键盘类型名由设备侧 keyboard.getKeyboardType
+   * 回填 externalKeyboardTypeName，缺省走宽松策略）。@State 驱动 ImeInputSink。
+   */
+  @State private externalKeyboardActive: boolean = false;
+  /**
+   * keyboard.getKeyboardType() 名称（设备侧回填；空串 = 尚未探测）。
+   * @State：变化时驱动 ImeInputSink 的 enableSoftKeyboardOnFocus 跟随。
+   */
+  @State private externalKeyboardTypeName: string = '';
+  /** 连点（双击选词/三击选行）状态机 */
+  private readonly clickTracker: ClickSelectTracker = new ClickSelectTracker();
+  /** 最近一次鼠标事件网格坐标（1 起，SGR 用）与按住的 SGR 按钮码 */
+  private lastMouseCol1 = 1;
+  private lastMouseRow1 = 1;
+  private lastSgrButton = SGR_BUTTON_NONE;
+  /**
+   * 鼠标上报期间是否禁用触摸选择/滚动手势语义（mode≠0 时 vim/tmux 要接管鼠标）。
+   * true 时 TapGesture/长按仍可退出本地选择，但 pan 不发方向键除非 altScrollMode
+   * 明确要求——上报路径优先走 onMouse 的 SGR 转发。
+   */
+  private mouseReportingActive = false;
+  // ---- A3 光标闪烁（FrameScheduler 半周期 wakeup + cursorVisibleAt 纯函数）----
+  /** 上次绘制时光标的可见相位；相位翻转时即使 content revision 不变也要重画光标格 */
+  private lastCursorBlinkVisible = true;
+  /** 半周期唤醒定时器（闪烁开启时防 FrameScheduler 自动休眠吞掉相位翻转） */
+  private blinkWakeTimer: number = -1;
 
   aboutToAppear(): void {
     this.shortcutBindings = parseShortcutLayout(this.shortcutBindingsJson);
@@ -357,6 +437,7 @@ export struct TerminalCanvas {
     FrameScheduler.get().setVisible(this.schedulerId, this.visible);
     // 键条「复制/粘贴」按 paneId 路由到本实例（页面拿不到画布引用，见 Hub 头注）
     TerminalActionHub.get().register(this.focusId, this.clipboardExecutor);
+    this.syncBlinkWakeTimer();
   }
 
   /** TerminalActionHub 执行器：键条剪贴板动作复用与快捷键完全相同的实现 */
@@ -379,6 +460,7 @@ export struct TerminalCanvas {
       clearTimeout(this.inputFocusTimer);
       this.inputFocusTimer = -1;
     }
+    this.clearBlinkWakeTimer();
     FrameScheduler.get().unregister(this.schedulerId);
   }
 
@@ -451,6 +533,13 @@ export struct TerminalCanvas {
    * 点击窗格（build 中由 TapGesture 驱动）：选择模式下点击 = 退出选择
    * （不弹软键盘，避免打断复制后查看）；否则聚焦本窗格（U4b 边框高亮经
    * FocusManager 监听器）+ 弹软键盘承接 IME。
+   *
+   * T10：外接键盘活跃时**不** requestFocus 拉起软键盘（PhysicalKeyboard
+   * 策略；触摸仍可聚焦窗格路由物理键）。显式要软键盘时功能键条应先
+   * clearExternalKeyboardActive() 再 requestFocus。
+   *
+   * T11：双击/三击连点在同一网格邻域内递增——word=选词、line=选行
+   * （纯逻辑 wordSelectAt/lineSelectAt）；单击保持原聚焦语义。
    */
   private onPaneClick(): void {
     if (this.selection.selecting) {
@@ -463,9 +552,170 @@ export struct TerminalCanvas {
     if (this.focusId.length > 0) {
       FocusManager.get().focus(this.focusId);
     }
-    if (this.isInputTarget()) {
-      focusControl.requestFocus(this.imeSinkId);
+    // 连点选词/选行（坐标缺省取最近鼠标格；纯触控无鼠标时 tracker 不误触发双击）
+    const mode = this.clickTracker.tap(this.lastMouseRow1 - 1, this.lastMouseCol1 - 1, Date.now());
+    if (mode !== 'none' && this.applyClickSelect(mode)) {
+      return;
     }
+    if (!this.isInputTarget()) {
+      return;
+    }
+    if (!shouldShowSoftKeyboardOnTouch(this.externalKeyboardActive)) {
+      // T10：外接键盘在用，不弹软键盘；焦点仍在 IME 承接框上，物理键照常进
+      focusControl.requestFocus(this.imeSinkId);
+      return;
+    }
+    focusControl.requestFocus(this.imeSinkId);
+  }
+
+  /**
+   * 双击/三击 → 应用选区。成功返回 true（消费本次点击，不再走软键盘聚焦）。
+   * 网格抽象由最近一帧的 terminal.readRows 构造（见 makeClickGrid）。
+   */
+  private applyClickSelect(mode: ClickSelectionMode): boolean {
+    const grid = this.makeClickGrid();
+    if (grid === null) {
+      return false;
+    }
+    const row = this.lastMouseRow1 - 1;
+    const col = this.lastMouseCol1 - 1;
+    const range = mode === 'word' ? wordSelectAt(grid, row, col) : lineSelectAt(grid, row);
+    if (range === null) {
+      return false;
+    }
+    this.selection.begin({ row: range.startRow, col: range.startCol });
+    this.selection.extend({ row: range.endRow, col: range.endCol });
+    this.updateSelectionChrome();
+    this.forceFullRedraw();
+    vibrateLight(this.hapticEnabled);
+    return true;
+  }
+
+  /**
+   * 连点选区网格适配：从终端只读快照构造 ClickSelectGrid。
+   * beginFrame 后不 endFrame（与 copySelection 同口径：不消费脏位图）。
+   * 宽字符首格 wide=true；续格 codepoint=CLICK_WIDE_CONTINUATION。
+   */
+  private makeClickGrid(): ClickSelectGrid | null {
+    const terminal = this.terminal;
+    if (terminal === null) {
+      return null;
+    }
+    const frame = terminal.beginFrame();
+    if (frame === null) {
+      return null;
+    }
+    const view = terminal.readRows(frame, 0, frame.rows);
+    if (view === null) {
+      return null;
+    }
+    const cols = frame.cols;
+    const rows = frame.rows;
+    const decoded: ClickSelectCell[] = new Array<ClickSelectCell>(rows * cols);
+    for (let i = 0; i < rows * cols; i++) {
+      const off = i * 16; // CELL_BYTES=16，与 SshTerminal 布局一致
+      const cp = view.getUint32(off, true);
+      const attrs = view.getUint16(off + 12, true);
+      decoded[i] = {
+        codepoint: cp,
+        wide: (attrs & (1 << 7)) !== 0 // ATTR_WIDE
+      };
+    }
+    return new SnapshotClickGrid(decoded, rows, cols);
+  }
+
+  /**
+   * T10：物理键盘事件到达 → 外接键盘策略。
+   * 纯策略已单测（PhysicalKeyboard.ets）。设备侧 API 调用点（真机/SDK 可用时）：
+   *   import { keyboard } from '@kit.InputKit';
+   *   const typeName = keyboardTypeToString(await keyboard.getKeyboardType());
+   *   this.externalKeyboardType = typeName;
+   *   if (shouldSuppressSoftKeyboard(typeName, true, isModifierKeyCode(keyCode))) {
+   *     this.externalKeyboardActive = true;
+   *   }
+   * 当前实现：宽松策略（物理键非修饰 → externalKeyboardActive=true）；
+   * 若 externalKeyboardType 已回填则用严格策略。
+   */
+  private notePhysicalKeyEvent(keyCode: number): void {
+    const isMod = isModifierKeyCode(keyCode);
+    const type = this.externalKeyboardTypeName;
+    const suppress: boolean = type.length > 0
+      ? shouldSuppressSoftKeyboard(type, true, isMod)
+      : shouldSuppressSoftKeyboardOnKeyEvent(true, isMod);
+    if (suppress && !this.externalKeyboardActive) {
+      this.externalKeyboardActive = true;
+    }
+  }
+
+  /** 供功能键条/设置：用户显式要软键盘时清外接键盘抑制 */
+  clearExternalKeyboardActive(): void {
+    this.externalKeyboardActive = false;
+  }
+
+  /**
+   * 设备侧 keyboard.getKeyboardType() 回填点（T10 API）：
+   *   import { keyboard } from '@kit.InputKit';
+   *   canvas.setExternalKeyboardType(await keyboard.getKeyboardType());
+   * 类型为物理键盘时同步置 externalKeyboardActive。
+   */
+  setExternalKeyboardType(ohosKeyboardType: number): void {
+    this.externalKeyboardTypeName = keyboardTypeToString(ohosKeyboardType);
+    if (isPhysicalKeyboardTypeName(this.externalKeyboardTypeName)) {
+      this.externalKeyboardActive = true;
+    }
+  }
+
+  /** 当前是否因外接键盘抑制软键盘（UI/诊断） */
+  isExternalKeyboardActive(): boolean {
+    return this.externalKeyboardActive;
+  }
+
+  /**
+   * T11：鼠标事件 → SGR 上报（frame.mouseMode 指示时）。
+   * 纯编码 encodeSgrMouseEvent / sgrButtonFromOhosButton 已单测。
+   *
+   * ArkUI MouseEvent 接线（本组件 build 中 .onMouse）：
+   *   - action=PRESS/RELEASE/MOVE → encodeSgrMouseEvent → sendInputBytes；
+   *   - 滚轮：部分 API 版本 MouseEvent 无 wheel 字段，走触控板/触摸 pan 的
+   *     buildAltScrollSequences('mouse', ...) 已覆盖；若设备侧补上
+   *     event.wheelDelta，可在 onWheel 上调 encodeSgrWheel（TODO 调用点）。
+   *   - mouseMode=0 时完全不转发（本地选择/滚动语义不变）。
+   */
+  private onMouseEventReport(action: string, ohosButton: number, localX: number,
+    localY: number): boolean {
+    if (!this.mouseReportingActive || !this.isInputTarget()) {
+      return false;
+    }
+    const pos = this.gridPosFromPoint(localX, localY);
+    const col1 = pos.col + 1;
+    const row1 = pos.row + 1;
+    this.lastMouseCol1 = col1;
+    this.lastMouseRow1 = row1;
+    const button = sgrButtonFromOhosButton(ohosButton);
+    let kind: 'press' | 'move' | 'release' = 'move';
+    if (action === 'Down' || action === 'press' || action === 'PRESS') {
+      kind = 'press';
+      this.lastSgrButton = button;
+    } else if (action === 'Up' || action === 'release' || action === 'RELEASE') {
+      kind = 'release';
+    } else {
+      kind = 'move';
+    }
+    const effectiveButton = kind === 'move'
+      ? (this.lastSgrButton !== SGR_BUTTON_NONE ? this.lastSgrButton : button)
+      : button;
+    if (!shouldForwardMouseEvent(this.lastMouseMode, kind, effectiveButton)) {
+      return false;
+    }
+    const seq = encodeSgrMouseEvent(effectiveButton, kind, col1, row1);
+    if (kind === 'release') {
+      this.lastSgrButton = SGR_BUTTON_NONE;
+    }
+    if (seq === null) {
+      return false;
+    }
+    this.sendInputBytes(seq);
+    return true;
   }
 
   /** 写终端输入：Uint8Array → 零偏移全量 ArrayBuffer（writeTerminal 接受 ArrayBuffer | string） */
@@ -499,6 +749,8 @@ export struct TerminalCanvas {
     if (isModifierKeyCode(event.keyCode)) {
       return false; // 修饰键自身放行（组合状态由系统跟踪，不产生字节）
     }
+    // T10：物理键到达 → 外接键盘策略（抑制软键盘；见 notePhysicalKeyEvent 头注）
+    this.notePhysicalKeyEvent(event.keyCode);
     const ctrl = this.queryModifierState(event, 'ctrl');
     const alt = this.queryModifierState(event, 'alt');
     const shift = this.queryModifierState(event, 'shift');
@@ -710,6 +962,7 @@ export struct TerminalCanvas {
     this.selection.cancel();
     this.selectionMenuVisible = false;
     this.selectionHandlesVisible = false;
+    this.lastHandleGeo = null;
     this.draggingHandle = '';
     this.forceFullRedraw(); // 重绘覆盖掉高亮叠加层
   }
@@ -775,24 +1028,36 @@ export struct TerminalCanvas {
     this.selectionMenuVisible = true;
   }
 
-  /** 起点手柄贴第一格左边、终点手柄贴末格右边，竖条与行等高。 */
+  /** 起点手柄贴第一格左边、终点手柄贴末格右边，竖条与行等高。
+   *  几何由 TerminalGestures.selectionHandleHitRects 纯函数计算（T8 打磨）。 */
   private updateSelectionHandles(): void {
     const range: SelectionRange | null = this.selection.range();
     if (range === null || this.cellWidthVp <= 0 || this.cellHeightVp <= 0) {
       this.selectionHandlesVisible = false;
+      this.lastHandleGeo = null;
       return;
     }
     const barH: number = this.cellHeightVp;
     this.handleBarHeight = barH;
-    const startLeft: number = this.layout.originX + range.startCol * this.cellWidthVp;
-    const startTop: number = this.layout.originY + range.startRow * this.cellHeightVp;
-    this.startHandleX = startLeft - HANDLE_HIT_WIDTH_VP;
-    this.startHandleY = startTop;
-    const endRight: number = this.layout.originX + (range.endCol + 1) * this.cellWidthVp;
-    const endTop: number = this.layout.originY + range.endRow * this.cellHeightVp;
-    this.endHandleX = endRight;
-    this.endHandleY = endTop;
+    const geo = selectionHandleHitRects(
+      this.layout.originX, this.layout.originY,
+      this.cellWidthVp, this.cellHeightVp,
+      range.startRow, range.startCol, range.endRow, range.endCol,
+      barH, HANDLE_HIT_WIDTH_VP, HANDLE_KNOB_VP);
+    this.lastHandleGeo = geo;
+    this.startHandleX = geo.start.x;
+    this.startHandleY = geo.start.y;
+    this.endHandleX = geo.end.x;
+    this.endHandleY = geo.end.y;
     this.selectionHandlesVisible = true;
+  }
+
+  /** 画布坐标 → 命中手柄（纯函数 selectionHandleAtPoint；未在选择模式返回 none） */
+  private handleIdAtPoint(x: number, y: number): SelectionHandleId {
+    if (!this.selectionHandlesVisible || this.lastHandleGeo === null) {
+      return 'none';
+    }
+    return selectionHandleAtPoint(x, y, this.lastHandleGeo);
   }
 
   private beginHandleDrag(which: string): void {
@@ -801,17 +1066,16 @@ export struct TerminalCanvas {
       return;
     }
     this.draggingHandle = which;
-    if (which === 'start') {
-      this.handleDragOriginX = this.layout.originX + range.startCol * this.cellWidthVp +
-        this.cellWidthVp / 2;
-      this.handleDragOriginY = this.layout.originY + range.startRow * this.cellHeightVp +
-        this.cellHeightVp / 2;
-    } else {
-      this.handleDragOriginX = this.layout.originX + range.endCol * this.cellWidthVp +
-        this.cellWidthVp / 2;
-      this.handleDragOriginY = this.layout.originY + range.endRow * this.cellHeightVp +
-        this.cellHeightVp / 2;
-    }
+    // 拖动 origin = 手柄圆钮中心（纯函数 selectionHandleAnchor）
+    const anchor = selectionHandleAnchor(
+      which === 'start' ? 'start' : 'end',
+      this.layout.originX, this.layout.originY,
+      this.cellWidthVp, this.cellHeightVp,
+      which === 'start' ? range.startRow : range.endRow,
+      which === 'start' ? range.startCol : range.endCol,
+      HANDLE_HIT_WIDTH_VP);
+    this.handleDragOriginX = anchor.x;
+    this.handleDragOriginY = anchor.y;
   }
 
   private onHandleDrag(event: GestureEvent): void {
@@ -843,6 +1107,10 @@ export struct TerminalCanvas {
     if (this.selection.selecting) {
       if (event.fingerList.length > 0) {
         const finger = event.fingerList[0];
+        // T8 打磨：落点在手柄热区时不更新活动端（手柄自身 PanGesture 接管拖动）
+        if (this.handleIdAtPoint(finger.localX, finger.localY) !== 'none') {
+          return;
+        }
         this.selection.extend(this.gridPosFromPoint(finger.localX, finger.localY));
         this.updateSelectionChrome();
         this.forceFullRedraw();
@@ -877,7 +1145,8 @@ export struct TerminalCanvas {
         col1 = pos.col + 1;
         row1 = pos.row + 1;
       }
-      const seqs = buildAltScrollSequences(this.altScrollMode, this.lastMouseMode, lines, col1, row1);
+      const seqs = buildAltScrollSequences(this.altScrollMode, this.lastMouseMode, lines,
+        col1, row1, this.applicationCursorKeys);
       for (const seq of seqs) {
         this.sendInputBytes(seq);
       }
@@ -919,8 +1188,17 @@ export struct TerminalCanvas {
     if (revision < 0) {
       return false; // 句柄失效
     }
+    // A3 光标闪烁：content 静止时若相位翻转，仍需重画（显示/擦除）光标格
+    const blinkVisible: boolean = cursorVisibleAt(Date.now(), this.appearance.cursorBlink,
+      CURSOR_BLINK_PERIOD_MS);
     if (!this.needsFullRedraw && revision === this.lastRenderedRevision) {
-      return false; // 无变化：整帧跳过（静止省电第一层）
+      const blinkStable: boolean = !this.appearance.cursorBlink ||
+        blinkVisible === this.lastCursorBlinkVisible;
+      if (blinkStable) {
+        return false; // 无变化：整帧跳过（静止省电第一层）
+      }
+      // 相位翻转：全量重绘光标所在格（block 反色需还原本体字符，脏行位图无此标记）
+      this.needsFullRedraw = true;
     }
     const frame = terminal.beginFrame();
     if (frame === null) {
@@ -929,6 +1207,7 @@ export struct TerminalCanvas {
     // T9：帧元信息缓存（手势处理按最近一帧决策）；回滚量变化时同步钳制偏移
     this.lastAltScreen = frame.altScreen;
     this.lastMouseMode = frame.mouseMode;
+    this.mouseReportingActive = frame.mouseMode !== 0;
     this.lastScrollbackCount = Math.max(0, frame.scrollbackTotal - frame.scrollbackOldest);
     if (this.scrollOffsetLines > this.lastScrollbackCount) {
       this.scrollOffsetLines = this.lastScrollbackCount;
@@ -962,7 +1241,7 @@ export struct TerminalCanvas {
       this.paintFull(frame);
       drew = true;
     }
-    if (drew && frame.cursorVisible) {
+    if (drew && frame.cursorVisible && blinkVisible) {
       this.paintCursor(frame);
     }
     if (drew && this.selection.selecting) {
@@ -971,6 +1250,7 @@ export struct TerminalCanvas {
     }
     // 受理回执：native 比对 revision 一致则清脏位图（并发撕裂下帧自愈，见 SshTerminal 头注）
     terminal.endFrame(frame.revision);
+    this.lastCursorBlinkVisible = blinkVisible;
     this.lastRenderedRevision = frame.revision;
     this.lastGridCols = frame.cols;
     this.lastGridRows = frame.rows;
@@ -1091,9 +1371,12 @@ export struct TerminalCanvas {
     this.needsFullRedraw = true;
     // T8/T9：旧终端的选择会话与回滚偏移一并作废（网格语义已不属于新终端）
     this.exitSelectionMode();
+    this.clickTracker.reset();
     this.scrollOffsetLines = 0;
     this.lastAltScreen = false;
     this.lastMouseMode = 0;
+    this.mouseReportingActive = false;
+    this.lastSgrButton = SGR_BUTTON_NONE;
     this.lastScrollbackCount = 0;
     // notifiedCols/Rows 记的是「已计算并通知页面的尺寸」，换终端后必须清零：
     // 否则版面在终端 attach 之前就已算出并记账，attach 后 relayout 会因
@@ -1108,6 +1391,32 @@ export struct TerminalCanvas {
 
   private onAppearanceChanged(): void {
     this.applyAppearance();
+    this.syncBlinkWakeTimer();
+  }
+
+  /**
+   * A3 闪烁唤醒定时器：cursorBlink 开启时每半周期 FrameScheduler.wakeup()，
+   * 避免「无输出 → 自动休眠」吞掉相位翻转。关闭/卸载时清除，静止 CPU≈0。
+   */
+  private syncBlinkWakeTimer(): void {
+    if (!this.appearance.cursorBlink) {
+      this.clearBlinkWakeTimer();
+      return;
+    }
+    if (this.blinkWakeTimer >= 0) {
+      return; // 已在跑（半周期恒定，外观切换不重建）
+    }
+    const half: number = Math.max(50, Math.floor(CURSOR_BLINK_PERIOD_MS / 2));
+    this.blinkWakeTimer = setInterval((): void => {
+      FrameScheduler.get().wakeup();
+    }, half);
+  }
+
+  private clearBlinkWakeTimer(): void {
+    if (this.blinkWakeTimer >= 0) {
+      clearInterval(this.blinkWakeTimer);
+      this.blinkWakeTimer = -1;
+    }
   }
 
   private onVisibleChanged(): void {
@@ -1403,7 +1712,9 @@ export struct TerminalCanvas {
         sinkId: this.imeSinkId,
         autoFocus: this.autoFocus,
         onDelta: this.onImeDelta,
-        onInterceptKey: this.onImeInterceptKey
+        onInterceptKey: this.onImeInterceptKey,
+        // T10：外接键盘活跃时不弹软键盘（PhysicalKeyboard 策略）
+        enableSoftKeyboardOnFocus: !this.externalKeyboardActive
       })
       // T8 气泡菜单（选择模式下；「粘贴/分享」归 U4）：复制 / 全选
       if (this.selectionMenuVisible) {
@@ -1482,6 +1793,22 @@ export struct TerminalCanvas {
           })
       )
     )
+    .onMouse((event: MouseEvent): void => {
+      // T11：鼠标/触控板（2in1）。frame.mouseMode≠0 时按 SGR 1006 转发；
+      // mouseMode=0 时只更新最近格子（双击选词定位用），不改变触摸语义。
+      // TODO(T11 真机)：滚轮字段在部分 SDK 版本的 MouseEvent 上不完整——
+      //   若 event 可读 wheelDelta/scrollDown，在此调 encodeSgrWheel；
+      //   触控板两指滚动已走 pan → buildAltScrollSequences('mouse')。
+      const actionName: string = `${event.action}`;
+      this.lastMouseCol1 = this.gridPosFromPoint(event.x, event.y).col + 1;
+      this.lastMouseRow1 = this.gridPosFromPoint(event.x, event.y).row + 1;
+      if (actionName.indexOf('Hover') >= 0 || actionName.indexOf('hover') >= 0) {
+        // 悬停：仅 mode≥3（任意移动）时转发
+        this.onMouseEventReport('Move', -1, event.x, event.y);
+        return;
+      }
+      this.onMouseEventReport(actionName, event.button as number, event.x, event.y);
+    })
     .onKeyEvent((event: KeyEvent): boolean => {
       // 容器自身获焦时的物理键盘通路（API 15 起返回值可拦截冒泡）；
       // 子组件（ImeInputSink）获焦时按键先经其 onKeyPreIme，此处不再重复

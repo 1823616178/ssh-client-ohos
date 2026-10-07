@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-20T11:23:55+08:00",
+  "environment": {
+    "mode": "dry-run",
+    "device": null,
+    "build": "/mnt/c/Users/lx182/DevEcoStudioProjects/ssh_client_ohos/entry/build/default/outputs/default/entry-default-signed.hap",
+    "script": "scripts/bench/run-bench.sh"
+  },
+  "scenarios": [
+    {
+      "id": "cat_5mb",
+      "status": "dry-run",
+      "fpsAvg": null,
+      "fpsP1": null,
+      "rssPeakMb": null,
+      "durationMs": null,
+      "notes": "offline checklist only"
+    },
+    {
+      "id": "yes_burst",
+      "status": "dry-run",
+      "fpsAvg": null,
+      "fpsP1": null,
+      "rssPeakMb": null,
+      "durationMs": null,
+      "notes": "offline checklist only"
+    },
+    {
+      "id": "host_list_100",
+      "status": "dry-run",
+      "fpsAvg": null,
+      "fpsP1": null,
+      "rssPeakMb": null,
+      "durationMs": null,
+      "notes": "offline checklist only"
+    },
+    {
+      "id": "pane_4_concurrent",
+      "status": "dry-run",
+      "fpsAvg": null,
+      "fpsP1": null,
+      "rssPeakMb": null,
+      "durationMs": null,
+      "notes": "offline checklist only"
+    }
+  ],
+  "gate": {
+    "minFps": 50,
+    "maxRssMb": 400,
+    "result": "skipped",
+    "failures": []
+  }
+}

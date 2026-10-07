@@ -192,6 +192,13 @@ class SshAgent;
 // N10：shell/exec 通道（channel.h）；经 friend 访问会话内部（libssh2 句柄、
 // fd 事件分发、通道注册表），线程契约见 channel.h 头注
 class SshChannel;
+// N14：SFTP（sftp.h）；经 friend 访问 libssh2 会话句柄与事件循环 post，
+// 不注册进 channels_（独立回调通路，见 sftp.h 头注）
+class SshSftp;
+// N15：端口转发（forward.h）：direct-tcpip 数据通道 + 远程 -R 监听器。
+// 经 friend 访问会话内部；注册进独立表并在 driveChannels 一并泵送
+class SshForwardChannel;
+class SshRemoteForward;
 
 class SshSession {
 public:
@@ -292,10 +299,18 @@ private:
 
     // ---- N10 通道支撑（全部仅事件循环线程调用；SshChannel 经 friend 访问）----
     friend class SshChannel;
+    friend class SshSftp;
+    friend class SshForwardChannel;
+    friend class SshRemoteForward;
     void registerChannel(SshChannel *channel);   // established 态装配时注册
     void unregisterChannel(SshChannel *channel); // 通道收尾时注销（幂等）
     void driveChannels();      // established 态 fd 事件分发：泵送全部注册通道
     void notifyChannelsSessionLost(); // releaseResources 前置：全部通道 kError 清理
+    // N15：转发通道/监听器注册（与 channels_ 同一循环线程纪律）
+    void registerForwardChannel(SshForwardChannel *channel);
+    void unregisterForwardChannel(SshForwardChannel *channel);
+    void registerForwardChannel(SshRemoteForward *listener);
+    void unregisterForwardChannel(SshRemoteForward *listener);
 
     // ---- N12 keepalive（全部仅事件循环线程执行）----
     void armKeepalive();    // 进入 established 时装配：libssh2_keepalive_config + 首拍定时
@@ -355,6 +370,11 @@ private:
     uint16_t port_ = 0;
     std::string username_;
 
+    // Q3：析构闩。true 后循环线程入口（doConnect/onSocketEvent/doClose/
+    // keepalive/probe…）立即返回，~SshSession 与在途回调不再碰 session_/fd_。
+    // 正常路径由 SessionThread::stop() 保证；本闩兜底「未 stop 即析构」的违约路径。
+    std::atomic<bool> disposed_{false};
+
     // ---- 以下成员仅事件循环线程访问 ----
     int fd_ = -1;
     bool fdRegistered_ = false; // fd_ 已 addFd 进事件循环（releaseResources 据此决定是否 removeFd）
@@ -366,6 +386,9 @@ private:
     // N7 主机密钥被拒时改写为 9（host key not verifiable）再进 closing。
     int disconnectReason_ = 11;
     std::string disconnectDesc_ = "client closing";
+
+    // Q3：~SshSession 本地兜底回收（循环线程已停或 post 超时后调用；不碰 EventLoop 的 fd 表）
+    void forceReleaseLocal();
 
     // ---- N8 认证状态 ----
     // authOp_ / authMethodsCallback_ 仅事件循环线程访问；
@@ -384,6 +407,9 @@ private:
     // established 态的 fd 事件经 driveChannels 泵送到每个通道；会话断开/关闭时
     // 经 notifyChannelsSessionLost 全部清理。通道完成收尾（finishClose）后自行注销。
     std::vector<SshChannel *> channels_;
+    // N15：端口转发数据通道与远程监听器（同一泵送/清理纪律）
+    std::vector<SshForwardChannel *> forwardChannels_;
+    std::vector<SshRemoteForward *> remoteForwards_;
 
     // ---- N12 keepalive 状态（除两个 atomic 计数器外仅事件循环线程访问）----
     io::EventLoop::TimerId keepaliveTimer_ = 0; // 下一拍定时（逐拍 runAfter 预约，见 onKeepaliveTick）

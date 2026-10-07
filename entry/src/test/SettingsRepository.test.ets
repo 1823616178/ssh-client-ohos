@@ -21,6 +21,7 @@ const EXPECTED_DEFS: ExpectedDef[] = [
   { key: 'defaultFontSize', type: 'number', defaultValue: 14 },
   { key: 'keepAliveInBackground', type: 'boolean', defaultValue: true },
   { key: 'screenOffDisconnectMinutes', type: 'number', defaultValue: 0 },
+  { key: 'keepScreenOnMode', type: 'string', defaultValue: 'session' },
   { key: 'hapticEnabled', type: 'boolean', defaultValue: true },
   { key: 'keyBarLayout', type: 'string', defaultValue: '' },
   { key: 'lastSessionId', type: 'string', defaultValue: '' },
@@ -35,7 +36,8 @@ const EXPECTED_DEFS: ExpectedDef[] = [
   { key: 'syncLastRevision', type: 'string', defaultValue: '' },
   { key: 'syncPasswords', type: 'boolean', defaultValue: false },
   { key: 'syncPrivateKeys', type: 'boolean', defaultValue: false },
-  { key: 'syncPassthrough', type: 'string', defaultValue: '{}' }
+  { key: 'syncPassthrough', type: 'string', defaultValue: '{}' },
+  { key: 'sshKeyEntries', type: 'string', defaultValue: '[]' }
 ];
 
 function findDef(key: string): SettingDef | null {

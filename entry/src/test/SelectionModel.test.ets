@@ -193,5 +193,26 @@ export default function selectionModelTest() {
       m.cancel();
       expect(m.extractText(reader)).assertEqual('');
     });
+
+    it('T8手柄拖动后range与hit区坐标一致', 0, () => {
+      // 纯逻辑链：SelectionModel.moveStart/End → range → selectionHandleHitRects
+      // （几何函数在 TerminalGestures；此处只锁 range 端点，hit 测试见 TerminalGestures.test）
+      const m = new SelectionModel();
+      m.begin({ row: 2, col: 4 });
+      m.extend({ row: 2, col: 8 });
+      m.moveStart({ row: 1, col: 0 });
+      const r = m.range();
+      expect(r?.startRow).assertEqual(1);
+      expect(r?.startCol).assertEqual(0);
+      expect(r?.endRow).assertEqual(2);
+      expect(r?.endCol).assertEqual(8);
+      // 终点手柄拖回起点同格：range 仍合法（start≤end）
+      m.moveEnd({ row: 1, col: 0 });
+      const degenerate = m.range();
+      expect(degenerate?.startRow).assertEqual(1);
+      expect(degenerate?.endRow).assertEqual(1);
+      expect(degenerate?.startCol).assertEqual(0);
+      expect(degenerate?.endCol).assertEqual(0);
+    });
   });
 }

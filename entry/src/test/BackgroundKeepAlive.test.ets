@@ -10,7 +10,9 @@
  *   4. SettingsViewModel —— 设置页「息屏 N 分钟」的档位换算与副标题文案。
  *
  * 重点覆盖的是「dataTransfer 长时任务会被系统因低速挂起/取消」这条现实路径：
- * 挂起不断连接、取消走宽限降级链、宽限到期优雅断开、回前台原地恢复。
+ * 挂起不断连接、低速取消先退避重申（最多 3 次）、重申耗尽才走宽限降级链、
+ * 宽限到期优雅断开、回前台原地恢复；外加「息屏兜底申请长时任务」一路
+ * （不能假定息屏一定伴随 onBackground，否则那些机型上就是零保活 + 静默失联）。
  */
 
 import { describe, it, expect } from '@ohos/hypium';
@@ -19,6 +21,8 @@ import {
   BackgroundSettings,
   BgAction,
   BgActionKind,
+  CANCEL_REASON_DATA_TRANSFER_LOW_SPEED,
+  TASK_RETRY_DELAYS_SEC,
   REASON_BACKGROUND_DISABLED,
   REASON_MEMORY_CRITICAL,
   REASON_SCREEN_OFF,
@@ -466,6 +470,58 @@ export default function backgroundKeepAliveTest() {
       expect(policy.isGraceActive).assertFalse();
     });
 
+    it('低速取消退避重申而不是立刻断开', 0, () => {
+      const policy: BackgroundPolicy = backgroundWithTask();
+      const first: BgAction[] = policy.onTaskCancelled(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+      expect(kinds(first).join(',')).assertEqual('scheduleTaskRetry');
+      expect(find(first, 'scheduleTaskRetry')?.delaySec).assertEqual(TASK_RETRY_DELAYS_SEC[0]);
+      expect(policy.isTaskRetryPending).assertTrue();
+      expect(policy.isGraceActive).assertFalse();
+      expect(policy.isSuspended).assertFalse();
+
+      const retry: BgAction[] = policy.onTaskRetryTimerExpired();
+      expect(kinds(retry).join(',')).assertEqual('startContinuousTask');
+      expect(policy.taskState).assertEqual('requested');
+      expect(policy.isTaskRetryPending).assertFalse();
+    });
+
+    it('重申次数用尽后回到宽限降级链', 0, () => {
+      const policy: BackgroundPolicy = backgroundWithTask();
+      for (let i: number = 0; i < TASK_RETRY_DELAYS_SEC.length; i++) {
+        policy.onTaskCancelled(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+        policy.onTaskRetryTimerExpired();
+        policy.onTaskGranted();
+      }
+      expect(policy.taskRetryCount).assertEqual(TASK_RETRY_DELAYS_SEC.length);
+      const actions: BgAction[] = policy.onTaskCancelled(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+      expect(kinds(actions).join(',')).assertEqual('requestGrace');
+    });
+
+    it('非低速取消不重申直接降级', 0, () => {
+      const policy: BackgroundPolicy = backgroundWithTask();
+      // 用户在通知栏手动取消（reason=1）：他表达的是「别占着」，重申等于跟用户对着干
+      expect(kinds(policy.onTaskCancelled(1)).join(',')).assertEqual('requestGrace');
+      expect(policy.isTaskRetryPending).assertFalse();
+    });
+
+    it('回前台撤销重申并清零次数', 0, () => {
+      const policy: BackgroundPolicy = backgroundWithTask();
+      policy.onTaskCancelled(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+      const actions: BgAction[] = policy.onForeground();
+      expect(has(actions, 'cancelTaskRetry')).assertTrue();
+      expect(policy.isTaskRetryPending).assertFalse();
+      expect(policy.taskRetryCount).assertEqual(0);
+      expect(policy.isSuspended).assertFalse();
+    });
+
+    it('重申期间会话清零则撤销重申并还电', 0, () => {
+      const policy: BackgroundPolicy = backgroundWithTask();
+      policy.onTaskCancelled(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+      const actions: BgAction[] = policy.onSessionCountChanged(0);
+      expect(has(actions, 'cancelTaskRetry')).assertTrue();
+      expect(policy.onTaskRetryTimerExpired().length).assertEqual(0);
+    });
+
     it('宽限到期两次只断一次', 0, () => {
       const policy: BackgroundPolicy = backgroundWithTask();
       policy.onTaskCancelled();
@@ -512,6 +568,39 @@ export default function backgroundKeepAliveTest() {
       expect(find(actions, 'suspendSessions')?.reason).assertEqual(REASON_MEMORY_CRITICAL);
       expect(has(actions, 'stopContinuousTask')).assertTrue();
       expect(policy.isSuspended).assertTrue();
+    });
+
+    it('息屏时即使还在前台也申请长时任务兜底', 0, () => {
+      const policy: BackgroundPolicy = new BackgroundPolicy(settings(true, 0));
+      policy.onSessionCountChanged(1);
+      // 没有 onBackground：模拟息屏但生命周期回调不来的机型
+      const actions: BgAction[] = policy.onScreenOff();
+      expect(kinds(actions).join(',')).assertEqual('startContinuousTask');
+      expect(policy.taskState).assertEqual('requested');
+
+      policy.onTaskGranted();
+      expect(policy.taskState).assertEqual('active'); // 前台但息屏，不该被立刻还回去
+
+      const lit: BgAction[] = policy.onScreenOn();
+      expect(kinds(lit).join(',')).assertEqual('stopContinuousTask');
+      expect(policy.taskState).assertEqual('none');
+    });
+
+    it('息屏兜底不与切后台重复申请', 0, () => {
+      const policy: BackgroundPolicy = new BackgroundPolicy(settings(true, 0));
+      policy.onSessionCountChanged(1);
+      policy.onScreenOff();
+      policy.onTaskGranted();
+      const actions: BgAction[] = policy.onBackground();
+      expect(kinds(actions).join(',')).assertEqual('quietOn');
+      expect(policy.taskState).assertEqual('active');
+    });
+
+    it('关掉后台保活时息屏不申请长时任务', 0, () => {
+      const policy: BackgroundPolicy = new BackgroundPolicy(settings(false, 0));
+      policy.onSessionCountChanged(1);
+      expect(policy.onScreenOff().length).assertEqual(0);
+      expect(policy.taskState).assertEqual('none');
     });
 
     it('切网在有会话时才收敛', 0, () => {
@@ -642,12 +731,24 @@ export default function backgroundKeepAliveTest() {
       expect(env.sessions.probeCount).assertEqual(1); // 回前台做一次切网收敛
     });
 
-    it('长时任务被低速取消后按宽限窗口断开', 0, () => {
+    it('长时任务被低速取消先退避重申再走宽限窗口断开', 0, () => {
       const env: ShellEnv = new ShellEnv(true, 0);
       env.keepAlive.notifyBackground();
-      env.task.emitCancel(4); // SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED
+      expect(env.task.startCount).assertEqual(1);
+
+      // 低速取消 xN：每次都只起重申倒计时，连接一根没断
+      for (let i: number = 0; i < TASK_RETRY_DELAYS_SEC.length; i++) {
+        env.task.emitCancel(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+        expect(env.transient.requestCount).assertEqual(0);
+        expect(env.scheduler.lastPendingDelay()).assertEqual(TASK_RETRY_DELAYS_SEC[i]);
+        env.scheduler.fireNext();
+        expect(env.task.startCount).assertEqual(i + 2); // 真的又申请了一次
+        expect(env.sessions.suspendCount).assertEqual(0);
+      }
+
+      // 再一次低速取消：重申额度用尽，回到宽限降级链
+      env.task.emitCancel(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
       expect(env.transient.requestCount).assertEqual(1);
-      expect(env.scheduler.lastPendingDelay()).assertEqual(5);
       expect(env.sessions.suspendCount).assertEqual(0); // 还没到期，先不断
 
       env.scheduler.fireNext();
@@ -656,6 +757,28 @@ export default function backgroundKeepAliveTest() {
 
       env.keepAlive.notifyForeground();
       expect(env.sessions.resumeCount).assertEqual(1);
+    });
+
+    it('重申倒计时在回前台时被撤销', 0, () => {
+      const env: ShellEnv = new ShellEnv(true, 0);
+      env.keepAlive.notifyBackground();
+      env.task.emitCancel(CANCEL_REASON_DATA_TRANSFER_LOW_SPEED);
+      expect(env.scheduler.pendingCount).assertEqual(1);
+
+      env.keepAlive.notifyForeground();
+      expect(env.scheduler.pendingCount).assertEqual(0);
+      expect(env.sessions.suspendCount).assertEqual(0);
+    });
+
+    it('息屏未走onBackground时也申请长时任务', 0, () => {
+      const env: ShellEnv = new ShellEnv(true, 0);
+      // 注意：全程没调 notifyBackground，模拟「息屏但生命周期回调没来」的机型
+      env.screen.screenOff();
+      expect(env.task.startCount).assertEqual(1);
+
+      env.screen.screenOn();
+      expect(env.task.stopCount).assertEqual(1); // 前台且亮屏，立刻还电
+      expect(env.sessions.suspendCount).assertEqual(0);
     });
 
     it('低速挂起不断连接', 0, () => {

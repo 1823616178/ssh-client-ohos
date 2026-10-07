@@ -67,6 +67,8 @@ set(TESTED_SOURCES
     ${CPP_ROOT}/ssh/auth.cpp
     ${CPP_ROOT}/ssh/agent.cpp
     ${CPP_ROOT}/ssh/channel.cpp
+    ${CPP_ROOT}/ssh/sftp.cpp
+    ${CPP_ROOT}/ssh/forward.cpp
     ${CPP_ROOT}/term/grid.cpp
     ${CPP_ROOT}/term/vterm_screen.cpp
     ${CPP_ROOT}/term/scrollback.cpp
@@ -149,6 +151,7 @@ add_executable(ssh_core_tests
     agent_test.cpp
     channel_test.cpp
     bridge_logic_test.cpp
+    teardown_guard_test.cpp
     reconnect_policy_test.cpp
     keepalive_test.cpp
     error_codes_test.cpp
@@ -158,6 +161,8 @@ add_executable(ssh_core_tests
     frame_sync_test.cpp
     vault_test.cpp
     vault_ops_test.cpp
+    sftp_test.cpp
+    forward_test.cpp
     ${TESTED_SOURCES}
 )
 target_include_directories(ssh_core_tests PRIVATE

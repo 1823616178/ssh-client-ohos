@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "kind": "q3-longrun-leak",
+  "generatedAt": "2026-09-20T11:23:56+08:00",
+  "targetHours": 8,
+  "rssGrowthLimitPct": 5.0,
+  "environment": {
+    "mode": "dry-run",
+    "device": null
+  },
+  "rssStartMb": null,
+  "rssEndMb": null,
+  "rssGrowthPct": null,
+  "fdStart": null,
+  "fdEnd": null,
+  "asanClean": null,
+  "scenarios": [
+    {
+      "id": "host_asan",
+      "status": "dry-run",
+      "notes": "RUN_ASAN=1 时填写"
+    },
+    {
+      "id": "device_longrun",
+      "status": "dry-run",
+      "notes": "真机 8h；阻塞于 X0 签名"
+    }
+  ],
+  "trackedRisks": [
+    {
+      "id": "session_bridge_teardown_race",
+      "status": "open",
+      "description": "session_bridge 在途调用 vs teardown 极窄竞态（登记给 Q3，仍未关闭）",
+      "sources": [
+        "entry/src/main/cpp/bridge/session_bridge.cpp",
+        "entry/src/main/cpp/bridge/session_bridge.h"
+      ]
+    }
+  ],
+  "notes": "骨架报告：用实测 RSS/fd/ASan 结果覆盖 null 字段后再跑 gate 相关检查"
+}

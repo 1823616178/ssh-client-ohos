@@ -30,11 +30,14 @@ import { vibrateLight } from '../common/utils/Haptics';
 import { SshTerminal } from '../napi/SshTerminal';
 import { SettingsRepository } from '../repository/SettingsRepository';
 import { AppDatabase } from '../repository/AppDatabase';
+import { ScreenAwake } from '../service/ScreenAwake';
+import { SessionManager } from '../service/SessionManager';
 import { notifyConfigSaved } from '../service/sync/SyncHooks';
 import { Tokens } from '../theme/Tokens';
 import { isHexColor, normalizeHexColor, uniqueHexColors } from '../common/utils/HexColor';
 import { ColorPickerSheet } from '../view/ColorPickerSheet';
-import { keyFaceOverlayForBackground } from '../view/KeyBar';
+import { KeyBar, keyFaceOverlayForBackground } from '../view/KeyBar';
+import { TerminalActionHub, TerminalClipboardAction } from '../view/terminal/TerminalActionHub';
 import { TerminalCanvas } from '../view/TerminalCanvas';
 import { FrameScheduler } from '../view/FrameScheduler';
 import { FocusManager } from '../view/terminal/FocusManager';
@@ -374,6 +377,8 @@ struct TerminalPage {
   @State private terminalTopInsetVp: number = 0;
   /** 触感总开关（C3 hapticEnabled；aboutToAppear 读取，读取失败保持默认 true） */
   private hapticEnabled: boolean = true;
+  /** 功能键条自定义布局 JSON（C3 keyBarLayout；空串 = 内置默认） */
+  private keyBarLayoutJson: string = '';
   /** 快捷键表 JSON（C3 keyboardShortcuts；空串 = 内置默认） */
   private shortcutBindingsJson: string = '';
   /** hostId → 终端外观；临时连接 hostId 也可拥有仅本次会话生效的缓存。 */
@@ -406,6 +411,7 @@ struct TerminalPage {
     try {
       this.hapticEnabled = SettingsRepository.isHapticEnabled();
       this.shortcutBindingsJson = SettingsRepository.getKeyboardShortcuts();
+      this.keyBarLayoutJson = SettingsRepository.getKeyBarLayout();
     } catch (err) {
       Logger.warn(`设置读取失败，使用默认值：${JSON.stringify(err)}`, LOG_TAG);
     }
@@ -424,6 +430,12 @@ struct TerminalPage {
   /** 从主机编辑页返回时刷新已保存连接；终端画布与会话本身不重建。 */
   onPageShow(): void {
     this.vm.reloadConnections();
+    // 常亮只在真正看着终端时生效：跳去主机编辑页那段时间不该压着系统不息屏
+    ScreenAwake.get().setTerminalVisible(true);
+  }
+
+  onPageHide(): void {
+    ScreenAwake.get().setTerminalVisible(false);
   }
 
   /**
@@ -513,6 +525,7 @@ struct TerminalPage {
 
   aboutToDisappear(): void {
     this.terminalPageVisible = false;
+    ScreenAwake.get().setTerminalVisible(false);
     this.colorPickerVisible = false;
     this.terminalTopInsetVp = 0;
     this.dragSplitId = '';
@@ -684,6 +697,36 @@ struct TerminalPage {
     this.connectionSearchText = '';
     this.vm.reloadConnections();
     this.showSideBar = true;
+  }
+
+  /** M6：当前会话 → SftpPage（带 sessionId；established 才能开 SFTP） */
+  private openSftpForCurrentSession(): void {
+    const sid: string = this.currentSessionId.length > 0
+      ? this.currentSessionId
+      : this.vm.currentSessionId;
+    if (sid.length === 0) {
+      return;
+    }
+    const params: Record<string, Object> = {};
+    params['sessionId'] = sid;
+    router.pushUrl({ url: 'pages/SftpPage', params: params });
+  }
+
+  /** M6：当前会话主机 → PortForwardPage */
+  private openPortForwardForCurrentSession(): void {
+    const sid: string = this.currentSessionId.length > 0
+      ? this.currentSessionId
+      : this.vm.currentSessionId;
+    const params: Record<string, Object> = {};
+    if (sid.length > 0) {
+      params['sessionId'] = sid;
+      const host: HostProfile | null = SessionManager.get().hostOf(sid);
+      if (host !== null) {
+        params['hostId'] = host.id;
+        params['hostName'] = host.name.length > 0 ? host.name : host.host;
+      }
+    }
+    router.pushUrl({ url: 'pages/PortForwardPage', params: params });
   }
 
   /** 已保存连接：复用主机列表的名称 / 地址 / 用户名过滤。 */
@@ -1200,6 +1243,11 @@ struct TerminalPage {
           this.vm.setPaneAreaSize(
             areaLengthToVp(newArea.width), areaLengthToVp(newArea.height));
         })
+
+        // T7 功能键条：有聚焦会话时挂在终端区下方；字节经 VM.sendInput 写聚焦叶
+        if (this.panes.length > 0 && this.currentSessionId.length > 0) {
+          this.KeyBarSlot()
+        }
       }
       .width('100%')
       .height('100%')
@@ -1307,6 +1355,37 @@ struct TerminalPage {
         .margin({ left: 2 })
     }
     .alignItems(VerticalAlign.Center)
+  }
+
+  /**
+   * T7 功能键条：挂在终端区下方。
+   * stickyModifiers 与 TerminalCanvas 共用同一实例；字节经 VM.sendInput 写聚焦叶；
+   * 剪贴板动作经 TerminalActionHub 按 focusedPaneId 路由到对应画布。
+   */
+  @Builder
+  KeyBarSlot() {
+    // 扩进底部安全区：PTY 区 expandSafeArea 后，键条自身也要占到手势条上方
+    Column() {
+      KeyBar({
+        stickyModifiers: this.stickyModifiers,
+        layoutJson: this.keyBarLayoutJson,
+        applicationCursorKeys: this.vm.applicationCursorKeys,
+        hapticEnabled: this.hapticEnabled,
+        appearance: this.focusedAppearance(),
+        onSendBytes: (bytes: Uint8Array): void => {
+          this.vm.sendInput(bytes);
+        },
+        onClipboardAction: (action: TerminalClipboardAction): void => {
+          const paneId: string = this.vm.focusedPaneId;
+          if (paneId.length > 0) {
+            TerminalActionHub.get().execute(paneId, action);
+          }
+        }
+      })
+        .width('100%')
+    }
+    .width('100%')
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
   }
 
   /** 沉浸式顶栏：返回 + 终端标题/主机名 + 状态点/文案 + 抽屉开关 */
@@ -1767,6 +1846,8 @@ struct TerminalPage {
         visible: true,
         autoResizeTerminal: !this.dividerDragging,
         shortcutBindingsJson: this.shortcutBindingsJson,
+        // T10 DECCKM：会话级应用光标键标志（native 未暴露前恒 false）
+        applicationCursorKeys: this.vm.applicationCursorKeys,
         onFontSizeCommit: (fontSize: number): void => {
           this.onPaneFontSizeCommit($$.item.hostId, fontSize);
         },
@@ -1990,7 +2071,7 @@ struct TerminalPage {
         if ($$.model.showReconnectNow) {
           Button('立即重连')
             .fontSize(Tokens.fontSize.body)
-            .fontColor(Color.White)
+            .fontColor(Tokens.Color.onAccent)
             .backgroundColor(Tokens.Color.accent)
             .borderRadius(Tokens.radius.sm)
             .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
@@ -2073,6 +2154,38 @@ struct TerminalPage {
       }
       .width('100%')
       .margin({ top: Tokens.space.md, bottom: Tokens.space.sm })
+
+      // 会话工具：从顶栏收拢的次级入口，仍一键可达
+      Row({ space: Tokens.space.xs }) {
+        Button('文件传输')
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.text)
+          .backgroundColor(Tokens.Color.surfaceHover)
+          .borderRadius(Tokens.radius.sm)
+          .height(32)
+          .layoutWeight(1)
+          .enabled(this.currentSessionId.length > 0)
+          .opacity(this.currentSessionId.length > 0 ? 1 : 0.45)
+          .onClick(() => {
+            this.showSideBar = false;
+            this.openSftpForCurrentSession();
+          })
+        Button('端口转发')
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.text)
+          .backgroundColor(Tokens.Color.surfaceHover)
+          .borderRadius(Tokens.radius.sm)
+          .height(32)
+          .layoutWeight(1)
+          .enabled(this.currentSessionId.length > 0)
+          .opacity(this.currentSessionId.length > 0 ? 1 : 0.45)
+          .onClick(() => {
+            this.showSideBar = false;
+            this.openPortForwardForCurrentSession();
+          })
+      }
+      .width('100%')
+      .margin({ bottom: Tokens.space.sm })
 
       TextInput({ text: this.connectionSearchText, placeholder: '搜索名称 / IP / 用户名...' })
         .fontSize(Tokens.fontSize.body)

@@ -1,0 +1,19 @@
+# Q1：多算法 sshd 集成测试环境（可选）
+# 镜像名可按 CI 环境替换；默认仅作本地/私有 CI 桩，不强制公网拉取。
+# 启动入口：scripts/sshd-multi/up.sh（无 docker SKIP）
+services:
+  sshd-multi:
+    image: linuxserver/openssh-server:latest
+    container_name: ssh-ohos-test
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - USER_NAME=test
+      - USER_PASSWORD=testpass
+      # linuxserver 镜像默认监听 2222（与 sshd_config Port 一致）
+      - TZ=Etc/UTC
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./sshd_config:/config/sshd_config:ro
+      - ./keys:/config/ssh_host_keys

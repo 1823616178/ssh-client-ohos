@@ -374,7 +374,7 @@ export struct KeyBar {
             .constraintSize({ minWidth: KEY_MIN_WIDTH_VP })
             .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
             .fontSize(Tokens.fontSize.body)
-            .fontColor(this.isModifierActive(spec) ? '#08131A' : this.appearance.foreground)
+            .fontColor(this.isModifierActive(spec) ? Tokens.Color.onAccent : this.appearance.foreground)
             .textAlign(TextAlign.Center)
             .backgroundColor(this.isModifierActive(spec) ? Tokens.Color.accent : this.keyFaceColor())
             .borderRadius(Tokens.radius.sm)

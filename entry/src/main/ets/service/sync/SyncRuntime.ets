@@ -279,7 +279,9 @@ function upsertAll(doc: SyncDocument): void {
         jumpHostId: old.jumpHostId,
         initCommands: old.initCommands,
         envVars: old.envVars,
-        termType: old.termType
+        termType: old.termType,
+        tmuxAutoAttach: old.tmuxAutoAttach,
+        tmuxSessionName: old.tmuxSessionName
       });
       Logger.info(`[SyncDB] 更新主机: id=${old.id}, name=${p.name}, addr=${p.username}@${p.host}:${p.port}`, LOG_TAG);
     } else {
@@ -297,7 +299,9 @@ function upsertAll(doc: SyncDocument): void {
         jumpHostId: null,
         initCommands: [],
         envVars: {},
-        termType: 'xterm-256color'
+        termType: 'xterm-256color',
+        tmuxAutoAttach: false,
+        tmuxSessionName: ''
       });
       Logger.info(`[SyncDB] 新增入库主机: id=${p.id}, name=${p.name}, addr=${p.username}@${p.host}:${p.port}`, LOG_TAG);
     }

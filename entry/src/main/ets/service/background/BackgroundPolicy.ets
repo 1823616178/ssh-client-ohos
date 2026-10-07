@@ -11,8 +11,14 @@
  * （`@ohos.resourceschedule.backgroundTaskManager`）——低速会被系统挂起甚至取消，
  * 而空闲的 SSH 会话正是「低速」。所以保活不能只有「申请长时任务」一条路，必须有降级链：
  *
- *   长时任务 →（被挂起）等它自己回来 →（被取消/申请失败）短时任务宽限窗口
+ *   长时任务 →（被挂起）等它自己回来 →（因低速被取消）退避重申，最多 3 次
+ *          →（重申耗尽/申请失败/非低速取消）短时任务宽限窗口
  *          → 宽限到期前**优雅断开并写明原因** → 回前台原地重连
+ *
+ * 「低速取消后退避重申」是实测补上的一环：系统按瞬时速率判低速，空闲 SSH 必然中枪，
+ * 但过一会儿重新申请常常还能拿到，一取消就断等于把后台存活时长白白砍到几分钟。
+ * 重申期间连接不断（这是有意的取舍：换来后台存活时长，代价是这段窗口内若进程被冻结
+ * 就退化为静默失联），重申次数用完仍然回到「宽限窗口 + 优雅断开」的老路。
  *
  * 这条链保证了 DESIGN 的承诺：「关闭后按策略优雅断开而不是静默失联」。
  * 断开一律走 SessionManager.suspendAllForPolicy()（只断连接、不销毁会话面孔与窗格绑定），
@@ -28,6 +34,8 @@
 export type BgActionKind =
   'startContinuousTask' |   // 申请 dataTransfer 长时任务
   'stopContinuousTask' |    // 释放长时任务（还电）
+  'scheduleTaskRetry' |     // 起长时任务重申倒计时（delaySec 秒，低速取消后的退避）
+  'cancelTaskRetry' |       // 撤销重申倒计时
   'requestGrace' |          // 申请短时任务宽限窗口（降级链入口）
   'cancelGrace' |           // 撤销宽限窗口
   'armScreenOffTimer' |     // 起息屏断开倒计时（delaySec 秒）
@@ -57,6 +65,19 @@ export interface BackgroundSettings {
 }
 
 // 断开原因文案（会写进 SessionInfo.errorMessage 给用户看，故都带「回到应用后自动重连」的出路）
+/**
+ * `backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED`。
+ * 这里写字面量而不是 import 枚举：策略机是纯逻辑件，不许碰系统 API（外壳把 reason 原样喂进来）。
+ */
+export const CANCEL_REASON_DATA_TRANSFER_LOW_SPEED: number = 4;
+
+/**
+ * 低速取消后的重申退避（秒）。长度即重申次数上限，每个「后台/息屏回合」独立计数
+ * （回前台或会话清零即清零）。5 s 兜住系统刚判完低速的抖动，30 s / 120 s 覆盖
+ * 「过一阵子再要就给了」的常见情形；再往后重申多半也是徒劳，不如优雅断开。
+ */
+export const TASK_RETRY_DELAYS_SEC: number[] = [5, 30, 120];
+
 export const REASON_BACKGROUND_DISABLED: string = '已按「后台保持连接」设置断开，回到应用后自动重连';
 export const REASON_TASK_LOST: string = '系统已回收后台保活，会话已断开，回到应用后自动重连';
 export const REASON_SCREEN_OFF: string = '已按息屏断开策略断开，回到应用后自动重连';
@@ -85,6 +106,10 @@ export class BackgroundPolicy {
   /** 宽限到期时要写给用户的原因（宽限是「为什么要断」的延迟执行） */
   private graceReason: string = REASON_TASK_LOST;
   private screenOffTimerArmed: boolean = false;
+  /** 低速取消后的重申倒计时是否在跑 */
+  private retryPending: boolean = false;
+  /** 本回合已用掉的重申次数（上限 TASK_RETRY_DELAYS_SEC.length） */
+  private retryCount: number = 0;
   /** 会话是否已被本策略挂起（挂起期间不再申请长时任务，也不重复断开） */
   private suspended: boolean = false;
 
@@ -114,6 +139,14 @@ export class BackgroundPolicy {
     return this.screenOffTimerArmed;
   }
 
+  get isTaskRetryPending(): boolean {
+    return this.retryPending;
+  }
+
+  get taskRetryCount(): number {
+    return this.retryCount;
+  }
+
   // ---------------------------------------------------------------- 前后台
 
   /**
@@ -123,12 +156,17 @@ export class BackgroundPolicy {
    */
   onForeground(): BgAction[] {
     this.foreground = true;
+    // 回到前台必然意味着亮屏。显式归位而不是等 SCREEN_ON：万一那条公共事件丢了，
+    // needsTask() 会一直以为还在息屏，长时任务就白占着不放了
+    this.screenOn = true;
     const actions: BgAction[] = [];
     if (this.graceActive) {
       this.graceActive = false;
       actions.push(action('cancelGrace'));
     }
-    if (this.task !== 'none') {
+    this.cancelRetry(actions);
+    this.retryCount = 0; // 新回合：重申次数重新开始算
+    if (this.task !== 'none' && !this.needsTask()) {
       this.task = 'none';
       actions.push(action('stopContinuousTask'));
     }
@@ -161,7 +199,9 @@ export class BackgroundPolicy {
       actions.push(this.beginGrace(REASON_BACKGROUND_DISABLED));
       return actions;
     }
-    if (this.task === 'none') {
+    if (this.task === 'none' && !this.graceActive) {
+      // 息屏兜底可能已经起过重申倒计时，切后台就不必再等它了
+      this.cancelRetry(actions);
       this.task = 'requested';
       actions.push(action('startContinuousTask'));
     }
@@ -177,7 +217,7 @@ export class BackgroundPolicy {
   onSessionCountChanged(count: number): BgAction[] {
     const previous: number = this.sessions;
     this.sessions = count < 0 ? 0 : count;
-    if (this.foreground || this.sessions === previous) {
+    if ((this.foreground && this.screenOn) || this.sessions === previous) {
       return [];
     }
     const actions: BgAction[] = [];
@@ -186,14 +226,15 @@ export class BackgroundPolicy {
         this.graceActive = false;
         actions.push(action('cancelGrace'));
       }
+      this.cancelRetry(actions);
+      this.retryCount = 0;
       if (this.task !== 'none') {
         this.task = 'none';
         actions.push(action('stopContinuousTask'));
       }
       return actions;
     }
-    if (!this.suspended && this.settings.keepAliveInBackground && this.task === 'none' &&
-      !this.graceActive) {
+    if (this.needsTask() && this.task === 'none' && !this.graceActive && !this.retryPending) {
       this.task = 'requested';
       actions.push(action('startContinuousTask'));
     }
@@ -214,7 +255,7 @@ export class BackgroundPolicy {
       this.graceActive = false;
       actions.push(action('cancelGrace'));
     }
-    if (this.foreground || this.sessions === 0 || this.suspended) {
+    if (!this.needsTask()) {
       this.task = 'none';
       actions.push(action('stopContinuousTask'));
     }
@@ -226,9 +267,10 @@ export class BackgroundPolicy {
    */
   onTaskFailed(): BgAction[] {
     this.task = 'none';
-    if (this.foreground || this.sessions === 0 || this.suspended || this.graceActive) {
+    if (!this.needsTask() || this.graceActive) {
       return [];
     }
+    // 申请被拒和「拿到又被低速取消」不是一回事：前者再要多半还是被拒，直接降级
     return [this.beginGrace(REASON_TASK_LOST)];
   }
 
@@ -257,12 +299,35 @@ export class BackgroundPolicy {
    * 被取消（低速取消 / 用户在通知栏取消 / 系统回收）：长时任务没了，
    * 进程随时会被冻结 → 用短时任务换一个宽限窗口，在窗口内优雅断开并写明原因。
    */
-  onTaskCancelled(): BgAction[] {
+  onTaskCancelled(reason: number = 0): BgAction[] {
     this.task = 'none';
-    if (this.foreground || this.sessions === 0 || this.suspended || this.graceActive) {
+    if (!this.needsTask() || this.graceActive || this.retryPending) {
       return [];
     }
+    if (reason === CANCEL_REASON_DATA_TRANSFER_LOW_SPEED &&
+      this.retryCount < TASK_RETRY_DELAYS_SEC.length) {
+      const delaySec: number = TASK_RETRY_DELAYS_SEC[this.retryCount];
+      this.retryCount++;
+      this.retryPending = true;
+      return [timerAction('scheduleTaskRetry', delaySec)];
+    }
     return [this.beginGrace(REASON_TASK_LOST)];
+  }
+
+  /**
+   * 重申倒计时到期：条件还在就再要一次长时任务；期间用户回了前台、会话清零、
+   * 已被挂起或已经在宽限中，则本次重申作废（后续由那条路收场）。
+   */
+  onTaskRetryTimerExpired(): BgAction[] {
+    if (!this.retryPending) {
+      return [];
+    }
+    this.retryPending = false;
+    if (!this.needsTask() || this.graceActive || this.task !== 'none') {
+      return [];
+    }
+    this.task = 'requested';
+    return [action('startContinuousTask')];
   }
 
   /** 宽限窗口到期：这是降级链的终点，优雅断开并还电 */
@@ -277,27 +342,50 @@ export class BackgroundPolicy {
   // ---------------------------------------------------------------- 息屏策略
 
   /**
-   * 息屏：只有用户开了「息屏 N 分钟后断开」才起倒计时（默认 0 = 关）。
-   * 前后台都计——用户息屏时会话在不在前台并无区别，他要的是「别整夜挂着」。
+   * 息屏：两件事。
+   *
+   * 其一是**保活兜底**：不能假定「息屏一定伴随 onBackground」——机型/场景不一（息屏未锁、
+   * 锁屏但窗口仍被判可见等），一旦没走到 onBackground 就等于零保活，进程被冻结后
+   * 会话静默失联，正是 §7.5 明令不许出现的形态。所以息屏本身就按「等同后台」申请长时任务，
+   * 已经申请过/在宽限/在重申的情形自然幂等跳过。
+   *
+   * 其二是原有的「息屏 N 分钟后断开」倒计时（默认 0 = 关）。前后台都计——
+   * 用户息屏时会话在不在前台并无区别，他要的是「别整夜挂着」。
    */
   onScreenOff(): BgAction[] {
     this.screenOn = false;
-    const minutes: number = this.settings.screenOffDisconnectMinutes;
-    if (minutes <= 0 || this.suspended || this.screenOffTimerArmed || this.sessions === 0) {
-      return [];
+    const actions: BgAction[] = [];
+    if (this.needsTask() && this.task === 'none' && !this.graceActive && !this.retryPending) {
+      this.task = 'requested';
+      actions.push(action('startContinuousTask'));
     }
-    this.screenOffTimerArmed = true;
-    return [timerAction('armScreenOffTimer', minutes * 60)];
+    const minutes: number = this.settings.screenOffDisconnectMinutes;
+    if (minutes > 0 && !this.suspended && !this.screenOffTimerArmed && this.sessions > 0) {
+      this.screenOffTimerArmed = true;
+      actions.push(timerAction('armScreenOffTimer', minutes * 60));
+    }
+    return actions;
   }
 
-  /** 亮屏：倒计时未到就作废（用户回来了，就不该断他的会话） */
+  /**
+   * 亮屏：倒计时未到就作废（用户回来了，就不该断他的会话）；
+   * 若此刻应用本来就在前台（息屏兜底申请的那把长时任务），亮屏即还电。
+   */
   onScreenOn(): BgAction[] {
     this.screenOn = true;
-    if (!this.screenOffTimerArmed) {
-      return [];
+    const actions: BgAction[] = [];
+    if (this.screenOffTimerArmed) {
+      this.screenOffTimerArmed = false;
+      actions.push(action('cancelScreenOffTimer'));
     }
-    this.screenOffTimerArmed = false;
-    return [action('cancelScreenOffTimer')];
+    if (!this.needsTask()) {
+      this.cancelRetry(actions);
+      if (this.task !== 'none') {
+        this.task = 'none';
+        actions.push(action('stopContinuousTask'));
+      }
+    }
+    return actions;
   }
 
   /** 息屏倒计时到期：优雅断开并还电 */
@@ -364,10 +452,11 @@ export class BackgroundPolicy {
       actions.push(timerAction('armScreenOffTimer', settings.screenOffDisconnectMinutes * 60));
     }
 
-    if (this.foreground || this.suspended || this.sessions === 0) {
+    if ((this.foreground && this.screenOn) || this.suspended || this.sessions === 0) {
       return actions;
     }
     if (!settings.keepAliveInBackground) {
+      this.cancelRetry(actions);
       if (this.task !== 'none') {
         this.task = 'none';
         actions.push(action('stopContinuousTask'));
@@ -377,7 +466,7 @@ export class BackgroundPolicy {
       }
       return actions;
     }
-    if (this.task === 'none' && !this.graceActive) {
+    if (this.task === 'none' && !this.graceActive && !this.retryPending) {
       this.task = 'requested';
       actions.push(action('startContinuousTask'));
     }
@@ -385,6 +474,25 @@ export class BackgroundPolicy {
   }
 
   // ---------------------------------------------------------------- 内部
+
+  /**
+   * 此刻是否该占着长时任务：有活跃会话、没被策略挂起、用户开着后台保活，
+   * 且画面确实不在用户眼前（切后台 **或** 息屏）。「前台且亮屏」是唯一不需要的组合——
+   * 前台由系统天然保证进程不被冻结，占长时任务纯属白耗电还容易被系统盯上。
+   */
+  private needsTask(): boolean {
+    return !this.suspended && this.sessions > 0 && this.settings.keepAliveInBackground &&
+      !(this.foreground && this.screenOn);
+  }
+
+  /** 撤销在跑的重申倒计时（幂等；动作追加到 actions 尾部） */
+  private cancelRetry(actions: BgAction[]): void {
+    if (!this.retryPending) {
+      return;
+    }
+    this.retryPending = false;
+    actions.push(action('cancelTaskRetry'));
+  }
 
   private beginGrace(reason: string): BgAction {
     this.graceActive = true;
@@ -399,6 +507,8 @@ export class BackgroundPolicy {
     }
     this.suspended = true;
     const actions: BgAction[] = [suspendAction(reason)];
+    this.cancelRetry(actions);
+    this.retryCount = 0;
     if (this.task !== 'none') {
       this.task = 'none';
       actions.push(action('stopContinuousTask'));

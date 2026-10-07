@@ -112,6 +112,7 @@ export class BackgroundKeepAlive {
   private started: boolean = false;
   private screenOffTimerId: number = -1;
   private graceTimerId: number = -1;
+  private taskRetryTimerId: number = -1;
   // 监听器保持同一函数对象，stop() 时才摘得掉（按引用比对）
   private readonly onNetworkChanged: (snapshot: NetSnapshot) => void =
     (_snapshot: NetSnapshot): void => this.run(this.policy.onNetworkChanged());
@@ -143,8 +144,9 @@ export class BackgroundKeepAlive {
 
     this.continuousTask?.observe(
       (reason: number): void => {
-        Logger.info(`长时任务被取消（reason=${reason}），转入宽限降级`, LOG_TAG);
-        this.run(this.policy.onTaskCancelled());
+        // reason 原样喂给策略机：低速取消（4）走退避重申，其余直接进宽限降级
+        Logger.info(`长时任务被取消（reason=${reason}）`, LOG_TAG);
+        this.run(this.policy.onTaskCancelled(reason));
       },
       (reason: number): void => {
         // 典型 reason=4：dataTransfer 低速。挂起是可恢复的，不断连接
@@ -173,6 +175,7 @@ export class BackgroundKeepAlive {
     this.started = false;
     this.cancelScreenOffTimer();
     this.cancelGraceTimer();
+    this.cancelTaskRetryTimer();
     this.continuousTask?.unobserve();
     this.continuousTask?.stop();
     this.transientTask?.cancel();
@@ -233,6 +236,12 @@ export class BackgroundKeepAlive {
         case 'stopContinuousTask':
           this.continuousTask?.stop();
           break;
+        case 'scheduleTaskRetry':
+          this.armTaskRetryTimer(item.delaySec);
+          break;
+        case 'cancelTaskRetry':
+          this.cancelTaskRetryTimer();
+          break;
         case 'requestGrace':
           this.beginGrace();
           break;
@@ -292,6 +301,23 @@ export class BackgroundKeepAlive {
     if (this.graceTimerId !== -1) {
       this.scheduler.cancel(this.graceTimerId);
       this.graceTimerId = -1;
+    }
+  }
+
+  /** 低速取消后的重申倒计时：到期由策略机决定要不要真的再申请一次 */
+  private armTaskRetryTimer(delaySec: number): void {
+    this.cancelTaskRetryTimer();
+    Logger.info(`长时任务将在 ${delaySec}s 后重申`, LOG_TAG);
+    this.taskRetryTimerId = this.scheduler.schedule(delaySec, (): void => {
+      this.taskRetryTimerId = -1;
+      this.run(this.policy.onTaskRetryTimerExpired());
+    });
+  }
+
+  private cancelTaskRetryTimer(): void {
+    if (this.taskRetryTimerId !== -1) {
+      this.scheduler.cancel(this.taskRetryTimerId);
+      this.taskRetryTimerId = -1;
     }
   }
 

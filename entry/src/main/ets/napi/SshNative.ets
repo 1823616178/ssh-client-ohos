@@ -33,6 +33,17 @@ export interface LibSshCoreModule {
   probeNow(handle: number, timeoutSec: number): boolean;
   setReconnectPolicy(handle: number, delaysSec: number[], maxAttempts: number): boolean;
   nextReconnectDelaySec(handle: number, attempt: number): number;
+  // ---- N9 应用内 agent（进程级内存密钥托管，语义见 cpp/ssh/agent.h）----
+  agentUnlock(keyId: string, privateKey: ArrayBuffer | string, passphrase: string): boolean;
+  agentLock(keyId: string): boolean;
+  agentLockAll(): boolean;
+  agentIsLocked(keyId: string): boolean;
+  agentKeyCount(): number;
+  agentSetTimeout(minutes: number): boolean;
+  agentTimeoutMinutes(): number;
+  authenticateAgent(handle: number, keyId: string): boolean;
+  /** U3：ed25519 生成；失败返回 null。私钥 PKCS#8 PEM，公钥 OpenSSH 单行 */
+  agentKeygen(comment: string, passphrase: string): NativeAgentKeygenResult | null;
   getLibssh2Version(): string;
   getOpensslVersion(): string;
   getVtermVersion(): string;
@@ -61,6 +72,29 @@ export interface LibSshCoreModule {
   vaultRewrap(handle: number, newPassword: string, keyVersion: number): NativeVaultCreateResult | null;
   vaultRotate(handle: number, password: string): NativeVaultCreateResult | null;
   vaultClose(handle: number): boolean;
+  // ---- N14 SFTP（事件随所属会话 onEvent 上抛，语义见 types/libssh_core/index.d.ts）----
+  sftpOpen(sessionHandle: number): number;
+  sftpClose(sftpHandle: number): boolean;
+  sftpList(sftpHandle: number, path: string): boolean;
+  sftpStat(sftpHandle: number, path: string): boolean;
+  sftpDownload(sftpHandle: number, transferId: number, remotePath: string,
+    localPath: string): boolean;
+  sftpUpload(sftpHandle: number, transferId: number, localPath: string,
+    remotePath: string): boolean;
+  sftpRename(sftpHandle: number, fromPath: string, toPath: string): boolean;
+  sftpMkdir(sftpHandle: number, path: string, mode: number): boolean;
+  sftpRmdir(sftpHandle: number, path: string): boolean;
+  sftpUnlink(sftpHandle: number, path: string): boolean;
+  sftpChmod(sftpHandle: number, path: string, mode: number): boolean;
+  sftpReadlink(sftpHandle: number, path: string): boolean;
+  // ---- N15 端口转发（语义见 types/libssh_core/index.d.ts）----
+  openDirectTcpip(sessionHandle: number, host: string, port: number): number;
+  forwardWrite(forwardHandle: number, data: ArrayBuffer | string): boolean;
+  forwardClose(forwardHandle: number): boolean;
+  remoteForwardListen(sessionHandle: number, bindAddress: string, port: number): number;
+  remoteForwardCancel(listenHandle: number): boolean;
+  forwardProxyJumpNotes(): string;
+  forwardParseJumpSpec(spec: string): string;
 }
 
 export interface NativeVaultCreateResult {
@@ -72,6 +106,14 @@ export interface NativeVaultCreateResult {
   recoveryWrapNonce: string;
   kdfSalt: string;
   recoveryKey: string;
+}
+
+/** U3 agentKeygen 返回载体（与 types/libssh_core/index.d.ts 一致） */
+export interface NativeAgentKeygenResult {
+  keyType: string;
+  privateKeyPem: string;
+  publicKeyLine: string;
+  comment: string;
 }
 
 export interface NativeVaultSeal {
@@ -95,6 +137,12 @@ export interface NativeTerminalFrame {
   cursorVisible: boolean;
   altScreen: boolean;
   mouseMode: number;
+  /**
+   * T10 stub：DECCKM 应用光标键模式（true=方向键 SS3）。native 尚未暴露该位
+   * （对称 mouseMode 的未来扩展）；缺省 undefined 时上层按 false 处理。
+   * native 接入后由帧组包填充，KeyMap 已接受该标志。
+   */
+  applicationCursorKeys?: boolean;
   bellCount: number;
   scrollbackOldest: number;
   scrollbackTotal: number;
@@ -162,7 +210,37 @@ export interface SshEvent {
   title?: string;
   /** T3：terminalMouseMode 事件的模式（0=关 1=点击 2=拖动 3=任意移动） */
   mouseMode?: number;
+  /**
+   * T10 stub：terminalCursorKeys 事件的应用光标键模式位（DECCKM，对称
+   * terminalMouseMode）。native 暴露后投递 type='terminalCursorKeys' +
+   * applicationCursorKeys；未暴露前上层维持默认 false。
+   */
+  applicationCursorKeys?: boolean;
+  /** N14：SFTP 句柄（sftpOpen/sftpList/sftpStat/sftpOpDone/sftp*） */
+  sftp?: number;
+  /** N14：传输任务 id（sftpProgress/sftpTransferDone） */
+  transferId?: number;
+  /** N14：sftpList 的 entriesJson 数组字符串 / sftpStat 的 entryJson 对象 */
+  entriesJson?: string;
+  entryJson?: string;
+  path?: string;
+  op?: string;
+  linkTarget?: string;
+  transferred?: number;
+  total?: number;
+  /** N15：转发数据通道 / 远程监听句柄 */
+  forward?: number;
+  /** N15：forwardAccept 所属监听句柄 */
+  listen?: number;
+  /** N15：forwardListen 成功时的实际上报端口 */
+  boundPort?: number;
+  /** N15：forwardAccept 的 originator（常为空） */
+  origin?: string;
 }
+
+/** T10 stub：DECCKM 会话级事件类型名（native 未投递前仅作文档/测试约定） */
+export const TERMINAL_CURSOR_KEYS_EVENT_TYPE: string = 'terminalCursorKeys';
+
 
 export type SshEventListener = (event: SshEvent) => void;
 
@@ -202,6 +280,14 @@ export class SshNativeSession {
     passphrase: string): boolean {
     return this.alive &&
       native.authenticatePublicKey(this.handle, privateKey, publicKey, passphrase);
+  }
+
+  /**
+   * N9：应用内 agent 认证（仅 authenticating 受理）。keyId 须已在进程级
+   * agent 中解锁；未解锁/已超时清除时返回 false 且不消耗认证重试计数。
+   */
+  authenticateAgent(keyId: string): boolean {
+    return this.alive && native.authenticateAgent(this.handle, keyId);
   }
 
   /** 开 shell 通道（带 PTY）；channelId 经 channelOpen 事件回报 */
@@ -277,12 +363,104 @@ export class SshNativeSession {
     return this.handle > 0;
   }
 
-  /**
-   * T3：native 会话句柄（attachTerminal 的入参）。
-   * 仅供同模块的 SshTerminal 装配使用，业务层不应直接触碰
-   */
+  /** native 句柄（只读；U4 装配终端、N14 打开 SFTP 用，业务层不应直接触碰） */
   get nativeHandle(): number {
     return this.handle;
+  }
+
+  /**
+   * N14：在本会话上打开 SFTP 通道（仅 established 受理）。
+   * 返回句柄（>0 = 已受理，结果经 sftpOpen 事件）；0 = 未受理。
+   * 关闭用 SshNativeSftp.close() 或 nativeCore().sftpClose(handle)
+   */
+  openSftp(): number {
+    if (!this.alive) {
+      return 0;
+    }
+    return native.sftpOpen(this.handle);
+  }
+
+  /**
+   * N15：在本会话上打开 direct-tcpip 转发通道（-L/-D 数据面）。
+   * 返回句柄（>0 = 已受理，结果经 forwardOpen 事件）；0 = 未受理。
+   * 写入用 SshNativeForward.write / nativeCore().forwardWrite
+   */
+  openDirectTcpip(host: string, port: number): number {
+    if (!this.alive || host.length === 0 || port <= 0 || port > 65535) {
+      return 0;
+    }
+    return native.openDirectTcpip(this.handle, host, port);
+  }
+
+  /**
+   * N15：开启远程转发监听（-R）。bindAddress 空串 = 服务器默认。
+   * 返回 listen 句柄（>0 = 已受理，结果经 forwardListen）；0 = 未受理。
+   * 入站连接经 forwardAccept 上抛新数据通道句柄。
+   */
+  remoteForwardListen(bindAddress: string, port: number): number {
+    if (!this.alive || port <= 0 || port > 65535) {
+      return 0;
+    }
+    return native.remoteForwardListen(this.handle, bindAddress, port);
+  }
+}
+
+/** N9：进程级应用内 agent 的类型安全封装（内存密钥托管，多会话复用） */
+export class SshAgentBridge {
+  /** 解锁并托管私钥；成功后调用方 buffer 的 native 副本被清零（ArkTS 原串无法清零） */
+  static unlock(keyId: string, privateKey: ArrayBuffer | string, passphrase: string): boolean {
+    return native.agentUnlock(keyId, privateKey, passphrase);
+  }
+
+  /** 锁定指定 keyId（清除托管材料）；不存在返回 false */
+  static lock(keyId: string): boolean {
+    return native.agentLock(keyId);
+  }
+
+  /** 锁定全部（幂等）：超时/退出/用户「立即锁定」共用入口 */
+  static lockAll(): void {
+    native.agentLockAll();
+  }
+
+  /** keyId 是否处于锁定状态（不存在/已清除/已超时 → true） */
+  static isLocked(keyId: string): boolean {
+    return native.agentIsLocked(keyId);
+  }
+
+  /** 当前托管条数（诊断用） */
+  static keyCount(): number {
+    return native.agentKeyCount();
+  }
+
+  /** 托管超时（分钟，0 = 永不超时） */
+  static setTimeout(minutes: number): boolean {
+    return native.agentSetTimeout(minutes);
+  }
+
+  static timeoutMinutes(): number {
+    return native.agentTimeoutMinutes();
+  }
+
+  /**
+   * U3：生成 ed25519 密钥对。失败 / native 未导出时返回 null。
+   * 私钥 PKCS#8 PEM（OpenSSH 完整私钥序列化过重，见 cpp/ssh/keygen.h）；
+   * 公钥 OpenSSH 单行，指纹由 KeyManagerLogic.formatOpenSshFingerprint 计算。
+   */
+  static keygen(comment: string, passphrase: string): NativeAgentKeygenResult | null {
+    try {
+      return native.agentKeygen(comment, passphrase);
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  /** native 是否导出 agentKeygen（UI 决定是否启用「生成密钥对」） */
+  static keygenSupported(): boolean {
+    try {
+      return typeof native.agentKeygen === 'function';
+    } catch (_e) {
+      return false;
+    }
   }
 }
 
@@ -302,5 +480,282 @@ export class SshNativeInfo {
 
   static argon2Version(): string {
     return native.getArgon2Version();
+  }
+}
+
+/** N14：SFTP 目录项（native entriesJson / entryJson 解析结果） */
+export interface SftpNativeEntry {
+  name: string;
+  path: string;
+  type: string;
+  size: number;
+  mtime: number;
+  mode: number;
+  permissions: string;
+  linkTarget: string;
+}
+
+/** N14：SFTP 通道句柄薄封装（事件仍随所属会话 onEvent 上抛） */
+export class SshNativeSftp {
+  private handle: number;
+
+  private constructor(handle: number) {
+    this.handle = handle;
+  }
+
+  /** 从会话 openSftp() 的受理句柄装配；0/负值返回 null */
+  static fromHandle(handle: number): SshNativeSftp | null {
+    if (handle <= 0) {
+      return null;
+    }
+    return new SshNativeSftp(handle);
+  }
+
+  get nativeHandle(): number {
+    return this.handle;
+  }
+
+  list(path: string): boolean {
+    return this.alive && native.sftpList(this.handle, path);
+  }
+
+  stat(path: string): boolean {
+    return this.alive && native.sftpStat(this.handle, path);
+  }
+
+  download(transferId: number, remotePath: string, localPath: string): boolean {
+    return this.alive && native.sftpDownload(this.handle, transferId, remotePath, localPath);
+  }
+
+  upload(transferId: number, localPath: string, remotePath: string): boolean {
+    return this.alive && native.sftpUpload(this.handle, transferId, localPath, remotePath);
+  }
+
+  rename(fromPath: string, toPath: string): boolean {
+    return this.alive && native.sftpRename(this.handle, fromPath, toPath);
+  }
+
+  mkdir(path: string, mode: number): boolean {
+    return this.alive && native.sftpMkdir(this.handle, path, mode);
+  }
+
+  rmdir(path: string): boolean {
+    return this.alive && native.sftpRmdir(this.handle, path);
+  }
+
+  unlink(path: string): boolean {
+    return this.alive && native.sftpUnlink(this.handle, path);
+  }
+
+  chmod(path: string, mode: number): boolean {
+    return this.alive && native.sftpChmod(this.handle, path, mode);
+  }
+
+  readlink(path: string): boolean {
+    return this.alive && native.sftpReadlink(this.handle, path);
+  }
+
+  close(): void {
+    if (!this.alive) {
+      return;
+    }
+    native.sftpClose(this.handle);
+    this.handle = 0;
+  }
+
+  private get alive(): boolean {
+    return this.handle > 0;
+  }
+}
+
+/**
+ * 解析 native sftpList 的 entriesJson（JSON 数组字符串）。
+ * ArkTS 严格模式不使用 any；解析失败返回空数组。
+ */
+export function parseSftpEntriesJson(entriesJson: string | undefined): SftpNativeEntry[] {
+  if (entriesJson === undefined || entriesJson.length === 0) {
+    return [];
+  }
+  try {
+    const parsed: Object | null = JSON.parse(entriesJson) as Object | null;
+    if (parsed === null || !Array.isArray(parsed)) {
+      return [];
+    }
+    const arr: Object[] = parsed as Object[];
+    const out: SftpNativeEntry[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const e: SftpNativeEntry = parseOneSftpEntry(arr[i]);
+      if (e.name.length > 0) {
+        out.push(e);
+      }
+    }
+    return out;
+  } catch (_e) {
+    return [];
+  }
+}
+
+/** 解析 sftpStat 的 entryJson；失败返回 null */
+export function parseSftpEntryJson(entryJson: string | undefined): SftpNativeEntry | null {
+  if (entryJson === undefined || entryJson.length === 0) {
+    return null;
+  }
+  try {
+    const parsed: Object | null = JSON.parse(entryJson) as Object | null;
+    if (parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    const e: SftpNativeEntry = parseOneSftpEntry(parsed);
+    return e.name.length > 0 || e.path.length > 0 ? e : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function parseOneSftpEntry(raw: Object): SftpNativeEntry {
+  const rec: Record<string, Object> = raw as Record<string, Object>;
+  return {
+    name: typeof rec['name'] === 'string' ? rec['name'] as string : '',
+    path: typeof rec['path'] === 'string' ? rec['path'] as string : '',
+    type: typeof rec['type'] === 'string' ? rec['type'] as string : 'file',
+    size: typeof rec['size'] === 'number' ? rec['size'] as number : 0,
+    mtime: typeof rec['mtime'] === 'number' ? rec['mtime'] as number : 0,
+    mode: typeof rec['mode'] === 'number' ? rec['mode'] as number : 0,
+    permissions: typeof rec['permissions'] === 'string' ? rec['permissions'] as string : '',
+    linkTarget: typeof rec['linkTarget'] === 'string' ? rec['linkTarget'] as string : ''
+  };
+}
+
+// ------------------------------------------------------------------
+// N15 端口转发：native 数据通道 / 远程监听薄封装
+// 事件仍随所属会话 onEvent 上抛（type: forwardOpen/forwardData/forwardClose/
+// forwardListen/forwardAccept）
+// ------------------------------------------------------------------
+
+/** N15：转发数据通道句柄薄封装 */
+export class SshNativeForward {
+  private handle: number;
+
+  private constructor(handle: number) {
+    this.handle = handle;
+  }
+
+  /** 从 openDirectTcpip / forwardAccept 的受理句柄装配；0/负值返回 null */
+  static fromHandle(handle: number): SshNativeForward | null {
+    if (handle <= 0) {
+      return null;
+    }
+    return new SshNativeForward(handle);
+  }
+
+  get nativeHandle(): number {
+    return this.handle;
+  }
+
+  /** 写入（背压整次拒收时 false，调用方保留数据稍后重试） */
+  write(data: ArrayBuffer | string): boolean {
+    return this.alive && native.forwardWrite(this.handle, data);
+  }
+
+  close(): void {
+    if (!this.alive) {
+      return;
+    }
+    native.forwardClose(this.handle);
+    this.handle = 0;
+  }
+
+  private get alive(): boolean {
+    return this.handle > 0;
+  }
+}
+
+/** N15：远程 -R 监听句柄薄封装 */
+export class SshNativeRemoteForward {
+  private handle: number;
+
+  private constructor(handle: number) {
+    this.handle = handle;
+  }
+
+  static fromHandle(handle: number): SshNativeRemoteForward | null {
+    if (handle <= 0) {
+      return null;
+    }
+    return new SshNativeRemoteForward(handle);
+  }
+
+  get nativeHandle(): number {
+    return this.handle;
+  }
+
+  cancel(): void {
+    if (!this.alive) {
+      return;
+    }
+    native.remoteForwardCancel(this.handle);
+    this.handle = 0;
+  }
+
+  private get alive(): boolean {
+    return this.handle > 0;
+  }
+}
+
+/**
+ * N15：探测 native 端口转发桥是否可用（openDirectTcpip 已注册）。
+ * PortForwardRuntime 据此把 nativeChannelRequired 置 false。
+ */
+export function isNativeForwardAvailable(): boolean {
+  try {
+    return typeof native.openDirectTcpip === 'function';
+  } catch (_e) {
+    return false;
+  }
+}
+
+/** N16：ProxyJump 传输层设计注记（诊断用） */
+export function proxyJumpTransportNotes(): string {
+  try {
+    return native.forwardProxyJumpNotes();
+  } catch (_e) {
+    return '';
+  }
+}
+
+/** N16 hop 条目（forwardParseJumpSpec JSON 解析结果） */
+export interface ProxyJumpHopSpec {
+  username: string;
+  host: string;
+  port: number;
+}
+
+/**
+ * N16：解析 OpenSSH -J 规格。native 不可用时回落到 ArkTS 纯逻辑
+ * （service/portforward/ProxyJump.ets 的 parseProxyJumpSpec）。
+ */
+export function parseProxyJumpSpecNative(spec: string): ProxyJumpHopSpec[] {
+  try {
+    const raw: string = native.forwardParseJumpSpec(spec);
+    if (raw.length === 0 || raw === '[]') {
+      return [];
+    }
+    const parsed: Object | null = JSON.parse(raw) as Object | null;
+    if (parsed === null || !Array.isArray(parsed)) {
+      return [];
+    }
+    const arr: Object[] = parsed as Object[];
+    const out: ProxyJumpHopSpec[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const rec: Record<string, Object> = arr[i] as Record<string, Object>;
+      out.push({
+        username: typeof rec['username'] === 'string' ? rec['username'] as string : '',
+        host: typeof rec['host'] === 'string' ? rec['host'] as string : '',
+        port: typeof rec['port'] === 'number' ? rec['port'] as number : 22
+      });
+    }
+    return out;
+  } catch (_e) {
+    return [];
   }
 }

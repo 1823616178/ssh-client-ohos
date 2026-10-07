@@ -29,8 +29,13 @@
  *   - 句柄表（handle_table.h）uint64 单调递增不复用；ArkTS 持有句柄期间
  *     SessionHandle 存活（shared_ptr 引用计数语义）；
  *   - closeSession 幂等：摘表后立即返回，实际回收在独立 teardown 线程做
- *     （关 TSFN 入口 → session->close 等终态 → 停线程 → 析构通道/会话 →
+ *     （Q3：BeginTeardown 关入口 + 等 in-flight 调用排空 + generation bump →
+ *     关 TSFN 入口 → session->close 等终态 → 停线程 → 析构通道/会话 →
  *     释放 TSFN），不阻塞 ArkTS 主线程；
+ *   - Q3 竞态防护（teardown_guard.h）：napi 方法经 LookupLiveCall 取在途租约，
+ *     teardown 等待租约排空后才 session.reset()；事件打 generation 戳，
+ *     teardown 后 late 回调/事件一律丢弃（CallJs/EnqueueEvent 双层）；
+ *     宿主 storm 测试见 tests/teardown_guard_test.cpp；
  *   - napi_env 销毁（napi_add_env_cleanup_hook）：全部会话同步优雅停掉，
  *     并等待进行中的 closeSession teardown 收尾；
  *   - TSFN 上下文（TsfnBridge）由 TSFN finalize 回调释放；inFlight 集合跟踪

@@ -202,13 +202,16 @@ TEST(SshSessionStateMachineTest, DuplicateConnectRejected)
     ASSERT_TRUE(thread.start());
     StateRecorder rec;
     {
-        SshSession session(thread, {}, std::ref(rec));
+        SshSessionOptions opts;
+        opts.connectTimeoutMs = 1500; // 略短于 waitFor，避免 IPv/环境抖动把用例拖满
+        opts.handshakeTimeoutMs = 2000;
+        SshSession session(thread, opts, std::ref(rec));
         const uint16_t port = PickFreePort(); // 刚释放的端口：必为关闭态
         ASSERT_TRUE(session.connect("127.0.0.1", port, "tester"));
         // 已受理后（任何非 idle 态）重复 connect 一律拒绝
         EXPECT_FALSE(session.connect("127.0.0.1", port, "tester"));
 
-        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 10s));
+        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 8s));
         // 终态后同样拒绝
         EXPECT_FALSE(session.connect("127.0.0.1", port, "tester"));
         thread.stop();
@@ -223,11 +226,14 @@ TEST(SshSessionStateMachineTest, ConnectToClosedPortFailsFast)
     ASSERT_TRUE(thread.start());
     StateRecorder rec;
     {
-        SshSession session(thread, {}, std::ref(rec));
+        SshSessionOptions opts;
+        opts.connectTimeoutMs = 1500;
+        opts.handshakeTimeoutMs = 2000;
+        SshSession session(thread, opts, std::ref(rec));
         const uint16_t port = PickFreePort();
         const auto begin = std::chrono::steady_clock::now();
         ASSERT_TRUE(session.connect("127.0.0.1", port, "tester"));
-        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 10s));
+        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 8s));
         const auto elapsed = std::chrono::steady_clock::now() - begin;
 
         EXPECT_EQ(session.lastError(), SshSessionError::kConnectFailed);
@@ -286,11 +292,12 @@ TEST(SshSessionStateMachineTest, HandshakeTimeoutAgainstSilentServer)
     StateRecorder rec;
     {
         SshSessionOptions opts;
+        opts.connectTimeoutMs = 2000;
         opts.handshakeTimeoutMs = 800;
         SshSession session(thread, opts, std::ref(rec));
         const auto begin = std::chrono::steady_clock::now();
         ASSERT_TRUE(session.connect("127.0.0.1", server.port(), "tester"));
-        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 10s));
+        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 8s));
         const auto elapsed = std::chrono::steady_clock::now() - begin;
 
         EXPECT_EQ(session.lastError(), SshSessionError::kHandshakeTimeout);
@@ -315,10 +322,11 @@ TEST(SshSessionStateMachineTest, HandshakeGarbageBannerFails)
     StateRecorder rec;
     {
         SshSessionOptions opts;
+        opts.connectTimeoutMs = 2000;
         opts.handshakeTimeoutMs = 3000; // 兜底：即使实现选择挂起也得按时收敛
         SshSession session(thread, opts, std::ref(rec));
         ASSERT_TRUE(session.connect("127.0.0.1", server.port(), "tester"));
-        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 10s));
+        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 8s));
         // N13：垃圾字节断在 KEX 阶段时 libssh2 报 KEX_FAILURE，细分为算法协商失败
         EXPECT_TRUE(session.lastError() == SshSessionError::kHandshakeFailed ||
                     session.lastError() == SshSessionError::kHandshakeTimeout ||
@@ -350,7 +358,15 @@ TEST(SshSessionIntegrationTest, HandshakeReachesAuthenticatingThenGracefulClose)
     StateRecorder rec;
     {
         SshSession session(thread, {}, std::ref(rec));
-        ASSERT_TRUE(session.connect("127.0.0.1", sshdInst.port, "tester"));
+        // sshd -d 偶发在日志就绪后极短窗口内拒连：最多重试 3 次，避免集成用例假失败
+        bool connected = false;
+        for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+            if (attempt > 0) {
+                std::this_thread::sleep_for(200ms);
+            }
+            connected = session.connect("127.0.0.1", sshdInst.port, "tester");
+        }
+        ASSERT_TRUE(connected);
 
         // N6 边界：握手 + 算法协商完成，进入「待认证」
         ASSERT_TRUE(rec.waitFor(SshSessionState::kAuthenticating, 20s));

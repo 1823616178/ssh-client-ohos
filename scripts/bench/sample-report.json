@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-20T10:00:00+08:00",
+  "environment": {
+    "mode": "host",
+    "device": null,
+    "build": "sample-report-for-gate-selftest",
+    "script": "scripts/bench/run-bench.sh"
+  },
+  "scenarios": [
+    {
+      "id": "cat_5mb",
+      "status": "pass",
+      "fpsAvg": 58.4,
+      "fpsP1": 52.1,
+      "rssPeakMb": 210.5,
+      "durationMs": 4200,
+      "notes": "sample: cat 5MB，达 DESIGN §1.2 ≥50fps"
+    },
+    {
+      "id": "yes_burst",
+      "status": "pass",
+      "fpsAvg": 54.0,
+      "fpsP1": 50.2,
+      "rssPeakMb": 245.0,
+      "durationMs": 3000,
+      "notes": "sample: yes 突发输出"
+    },
+    {
+      "id": "host_list_100",
+      "status": "pass",
+      "fpsAvg": 60.0,
+      "fpsP1": 55.0,
+      "rssPeakMb": 180.0,
+      "durationMs": 1500,
+      "notes": "sample: 100 主机列表首屏加载"
+    },
+    {
+      "id": "pane_4_concurrent",
+      "status": "pass",
+      "fpsAvg": 51.5,
+      "fpsP1": 50.0,
+      "rssPeakMb": 320.0,
+      "durationMs": 5000,
+      "notes": "sample: 4 分屏并发输出仍 ≥50fps、RSS<400MB"
+    }
+  ],
+  "gate": {
+    "minFps": 50,
+    "maxRssMb": 400,
+    "result": "pass",
+    "failures": []
+  }
+}

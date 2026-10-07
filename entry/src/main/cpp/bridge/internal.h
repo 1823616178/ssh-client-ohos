@@ -39,16 +39,20 @@
 #include "../ssh/session.h"         // SshSessionState（IsTerminal 用）与完整会话类型
 #include "data_aggregator.h"
 #include "handle_table.h"
+#include "teardown_guard.h" // Q3：在途调用/代际 vs teardown 防护
 
 namespace sshclient {
 
 namespace ssh {
 class SshChannel;
+class SshSftp;
 } // namespace ssh
 
 namespace bridge {
 
 struct TerminalHandle; // terminal_bridge.cpp 定义（shared_ptr 持有，此处无需完整类型）
+struct SftpHandle;     // sftp_bridge.cpp 定义（shared_ptr 持有）
+struct ForwardHandle;  // forward_bridge.cpp 定义（N15 数据通道 / 远程监听）
 
 // ---------------------------------------------------------------- 事件载体
 
@@ -67,6 +71,19 @@ enum class EventKind {
     kTerminalBell,      // vterm bell（UI 触感）
     kTerminalTitle,     // OSC 标题变更
     kTerminalMouseMode, // 鼠标上报模式变更（DECSET 1000/1002/1003）
+    // ---- N14 SFTP 事件（经 stateTsfn 投递，sftp 字段携带 SFTP 句柄）----
+    kSftpOpen,          // sftpOpen 受理后回报（success/error/message）
+    kSftpList,          // 目录列表：text1=path，text2=entries JSON 数组，success/error
+    kSftpStat,          // stat：text1=path，text2=entry JSON，success/error
+    kSftpOpDone,        // rename/mkdir/rmdir/unlink/chmod/readlink：text1=op，text2=path
+    kSftpProgress,      // 传输进度：transferId + number=transferred，text1=total
+    kSftpTransferDone,  // 传输终态：transferId + success + text1=error + text2=message
+    // ---- N15 端口转发事件（经 stateTsfn / dataTsfn 投递，forward 字段携带句柄）----
+    kForwardOpen,       // direct-tcpip 数据通道打开结果：forward + success/error/message
+    kForwardData,       // 远端→本端数据：forward + bytes
+    kForwardClose,      // 数据通道终结：forward + text1=reason + text2=message
+    kForwardListen,     // 远程 -R 监听打开：forward=listenHandle + number=boundPort
+    kForwardAccept,     // 远程入站被 accept：forward=新数据通道句柄，transferId=listenHandle
 };
 
 // 各字段按 kind 取用（命名含义见 session_bridge.cpp CallJs 的组包分支）；
@@ -75,12 +92,16 @@ struct BridgeEvent {
     EventKind kind;
     uint32_t channelId = 0; // kChannelOpen / kChannelData / kChannelClose
     uint64_t terminal = 0;  // kTerminal*：终端句柄
+    uint64_t sftp = 0;      // kSftp*：SFTP 句柄
+    uint64_t transferId = 0; // kSftpProgress / kSftpTransferDone / kForwardAccept(listenHandle)
+    uint64_t forward = 0;   // kForward*：转发数据通道或远程监听句柄
     int stream = 0;         // kChannelData：0=stdout 1=stderr
-    long number = 0;        // attemptsLeft / exitStatus / droppedCount / kStateChange 终态的统一错误码（N13）/ kTerminalMouseMode 的模式值
-    bool success = false;   // kAuthResult / kChannelOpen / kTerminalOpen / kStateChange 终态的 reconnectHint 值
+    long number = 0;        // attemptsLeft / exitStatus / droppedCount / kStateChange 终态的统一错误码（N13）/ kTerminalMouseMode 的模式值 / kSftpProgress 的 transferred
+    bool success = false;   // kAuthResult / kChannelOpen / kTerminalOpen / kStateChange 终态的 reconnectHint 值 / kSftp*
     bool hasHint = false;   // kStateChange：终态（disconnected/error/closed）附重连提示（N12）
-    std::string text1;      // from / keyType / method / openError / closeReason / code / terminalTitle
-    std::string text2;      // to / sha256 / authError / openMessage / exitSignal / message
+    uint64_t generation = 0; // Q3：产生事件时的会话代际（0=未打戳，只看 tornDown）
+    std::string text1;      // from / keyType / method / openError / closeReason / code / terminalTitle / sftp path/op/error
+    std::string text2;      // to / sha256 / authError / openMessage / exitSignal / message / sftp JSON/message
     std::string text3;      // md5 / authMessage / closeMessage / kStateChange 终态的 errorCodeName
     std::string text4;      // randomart / kStateChange 终态的 errorMessage（N13）
     std::string bytes;      // kChannelData 聚合批次（原始字节，可能切断 UTF-8 序列）
@@ -92,6 +113,10 @@ struct TsfnBridge {
     napi_threadsafe_function tsfn = nullptr;
     // 生产者入口开关：teardown 首先关掉它，此后 EnqueueEvent 即弃即收
     std::atomic<bool> accepting{true};
+    // Q3：teardown 已开始——CallJs 对 late TSFN 投递直接丢弃（代际戳见 generation）
+    std::atomic<bool> tornDown{false};
+    // 会话代际（TeardownGuard 同步）：事件戳 generation，不匹配即丢
+    std::atomic<uint64_t> generation{1};
     // inFlight：已入队未消费的堆事件；TSFN abort/env 销毁导致事件不再投递时，
     // 由 finalize 统一回收，保证任何路径都不泄漏
     std::mutex mutex;
@@ -101,6 +126,9 @@ struct TsfnBridge {
 };
 
 void StopAccepting(TsfnBridge *ctx);
+
+// Q3：teardown 开始——置 tornDown 并同步代际；此后 late 投递一律丢弃
+void MarkTsfnTornDown(TsfnBridge *ctx, uint64_t generation);
 
 // non-blocking 入队（native 线程永不被 ArkTS 堵死）。
 // false = 未入队（入口已关/队列满/TSFN 关闭），事件已由本函数回收
@@ -150,6 +178,16 @@ struct SessionHandle {
     std::mutex terminalsMutex;
     std::map<uint64_t, std::shared_ptr<TerminalHandle>> terminals;
 
+    // N14：本会话打开的 SFTP 句柄（sftpHandle → SftpHandle）。
+    // Teardown 时统一 close 并清空（与 terminals 同一回收纪律）
+    std::mutex sftpMutex;
+    std::map<uint64_t, std::shared_ptr<SftpHandle>> sfpts;
+
+    // N15：本会话的转发数据通道 + 远程监听（handle → ForwardHandle）。
+    // Teardown 时统一 close；条目含 SshForwardChannel / SshRemoteForward
+    std::mutex forwardsMutex;
+    std::map<uint64_t, std::shared_ptr<ForwardHandle>> forwards;
+
     // 两条 TSFN 上下文：由各自 TSFN 的 finalize 释放，本对象不 delete
     TsfnBridge *stateBridge = nullptr;
     TsfnBridge *dataBridge = nullptr;
@@ -157,6 +195,10 @@ struct SessionHandle {
     // N12：每会话重连退避策略（ArkTS 线程经 setReconnectPolicy 写、
     // nextReconnectDelaySec 读；与既有方法同一 ArkTS 串行调用约定，无需加锁）
     ssh::BackoffSchedule reconnectPolicy;
+
+    // Q3：在途调用计数 + generation 代际（teardown_guard.h）。
+    // LookupLive 成功后必须 TryBeginCall；Teardown 先 BeginTeardown 等排空再销毁
+    TeardownGuard callGuard;
 
     std::atomic<bool> tornDown{false};
 
@@ -176,8 +218,21 @@ extern HandleTable<SessionHandle> g_table;
 // 查找存活会话（teardown 中的会话视为已关闭）
 std::shared_ptr<SessionHandle> LookupLive(uint64_t handle);
 
-// 状态类事件发送（循环线程；stateTsfn 无限队列绝不丢）
+// Q3：LookupLive + 在途调用租约。返回的 InFlightLease 析构时自动 EndCall；
+// lease.ok()==false 表示会话已 teardown/不在表中，调用方不得触碰 session/channel
+struct LiveSessionCall {
+    std::shared_ptr<SessionHandle> sh;
+    InFlightLease lease;
+    bool ok() const { return sh != nullptr && lease.ok() && !sh->tornDown.load(std::memory_order_acquire); }
+};
+LiveSessionCall LookupLiveCall(uint64_t handle);
+
+// 状态类事件发送（循环线程；stateTsfn 无限队列绝不丢；teardown 后 late 事件丢弃）
 void SendStateEvent(SessionHandle *sh, BridgeEvent *evt);
+
+// 认证结果回调工厂（ArkTS 线程 / bridge 内共用；method 为 authResult 事件的
+// method 字段：password / publickey / agent）。定义在 session_bridge.cpp
+ssh::AuthCallback MakeAuthCallback(SessionHandle *sh, const char *method);
 
 // T3：终端输出的轻量 dirty 信号走有界 data TSFN。队列满时可安全丢弃：
 // 队列里已有待消费的数据/dirty 事件，任一到达 ArkTS 都会唤醒帧调度器。
@@ -186,6 +241,12 @@ void SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt);
 // T3：从终端全局句柄表摘除（幂等）；Teardown 回收终端本体前同步摘掉，
 // 此后 ArkTS 侧的 terminal 句柄调用全部落空（定义在 terminal_bridge.cpp）
 void ForgetTerminal(uint64_t terminalHandle);
+
+// N14：从 SFTP 全局句柄表摘除（幂等）；定义在 sftp_bridge.cpp
+void ForgetSftp(uint64_t sftpHandle);
+
+// N15：从转发全局句柄表摘除（幂等）；定义在 forward_bridge.cpp
+void ForgetForward(uint64_t forwardHandle);
 
 } // namespace bridge
 } // namespace sshclient

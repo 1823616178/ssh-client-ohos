@@ -8,7 +8,43 @@
 
 ---
 
-## 进度快照（2026-08-16 更新）
+## 进度快照（2026-09-20 第二轮更新）
+
+- **代码侧收口（本轮）**：
+  - **U3 native keygen**：`cpp/ssh/keygen.*` EVP ed25519 → PKCS#8 PEM + OpenSSH 公钥行；
+    NAPI `agentKeygen`；KeyManager 生成按钮可用。OpenSSH **私钥**二进制格式仍未做（libssh2/PEM 可用）。
+  - **U5**：Index md/lg 三区（主机列表 | 终端嵌入 | 可折叠右栏 stub → Config/SFTP/Forward）。
+  - **A5/A6**：appearance schema v3 背景图/透明度/模糊 + 预览卡；`themeMode`→`colorMode`。
+  - **M6 编排**：`DynamicForwardSession`（SOCKS5→openDirectTcpip）；SessionManager
+    `orchestrateProxyJump`（hop 规划 + 缺口时目标 **error 态**，不挂起）；`-R`/`forward_bridge`
+    NAPI 面已在；PortForwardPage 状态投影。
+  - **Q3**：`session_bridge` generation + inFlight 租约，teardown 排空后再销毁；late TSFN 丢弃。
+  - **Q1**：`scripts/sshd-multi` + `ci-local` 可选 Docker 阶段（无 Docker 跳过）。
+  - **T8**：选区手柄命中几何纯函数 + TerminalGestures 测试口径修正。
+  门禁：`hvigorw test` 无 Error in；`assembleHap` 绿；native **193 非集成全绿**。
+  **Q3 回归修复**：`onSocketEvent` 在 `kConnecting` 不得因 `session_==nullptr` 早退
+  （libssh2 句柄到 `beginHandshake` 才创建）；数值 IP `inet_pton` 钉死地址族，
+  避免 AF_UNSPEC 先探 IPv6 把「本机立即拒绝」拖成 connect 超时。
+
+- **已完成（P1b，续航优化）**：针对实测「长时间不动 → 自动锁屏 → 连接断开」补的四项，
+  与 DESIGN §7.5 同步更新：
+  1. **屏幕常亮**（`service/ScreenAwake.ets` + 设置项 `keepScreenOnMode`，三档默认 `session`）——
+     掐掉「自动息屏」这个真正的起点。判断是纯函数 `shouldKeepScreenOn`，窗口 API 只在生产网关一处；
+     状态源三处：终端页可见（`TerminalPage.onPageShow/onPageHide/aboutToDisappear`）、
+     应用前后台（`EntryAbility`）、活跃会话数（`SessionManager` 会话数监听）。
+  2. **低速取消后退避重申**（`BackgroundPolicy`：`scheduleTaskRetry` / `cancelTaskRetry` 两个动作 +
+     `onTaskCancelled(reason)` / `onTaskRetryTimerExpired()`）——5 s / 30 s / 120 s 最多 3 次，
+     耗尽才回到宽限降级链。原先一次低速取消就断，把后台存活白砍到几分钟。
+     取舍：重申窗口内若进程被冻结会退化为静默失联，已在代码与设计文档里如实写明。
+  3. **息屏兜底申请长时任务**——不再假定「息屏一定伴随 `onBackground`」；
+     「该不该占长时任务」的判据统一收进 `needsTask()`（唯一不需要的组合是「前台且亮屏」）。
+  4. **主机级 tmux 自动附着**（`tmuxAutoAttach` / `tmuxSessionName`，本机专有不上云；
+     schema v1→v2 两列 `ALTER TABLE`，v0→v1 步骤改引用冻结的 `HOSTS_TABLE_SQL_V1`，
+     否则全新安装会撞 duplicate column）——断了也不心疼的真解。执行点在 `TerminalViewModel`
+     的 `terminalOpen`，顺带把此前**只存不发**的 `initCommands` 接上（tmux 在前，命令跑在 tmux 里）。
+  证据：`hvigorw test` 新增 `ScreenAwake.test.ets` 24 条 + `BackgroundKeepAlive.test.ets` 增补 10 条（另改写 1 条低速取消用例）全绿，
+  失败集合与本次改动前完全一致（仍是那 10 条历史欠账）；assembleHap 绿。
+  真机留验：锁屏不再自动断、后台存活时长较改前的提升幅度、tmux 重连回到原现场。
 
 - **已完成（M7）**：P1（后台保活与网络切换）。要点与 DESIGN §7.5 原文的**一处修正**：`dataTransfer`
   长时任务不是「申请到就一劳永逸」——SDK 有 `SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED` /
@@ -28,8 +64,8 @@
   assembleHap 绿；`hvigorw test` 已能执行（Previewer 本机已恢复），新增
   `BackgroundKeepAlive.test.ets` 40 条 + SessionManager P1 6 条全绿。
   真机留验四条：切后台 30 min 存活、WiFi ⇄ 蜂窝 5 s 内重连、息屏 N 分钟策略、通知栏手动取消长时任务。
-  **未做**：两个设置键（`keepAliveInBackground` / `screenOffDisconnectMinutes`）目前只有读取，
-  仓库里还没有设置页可改，UI 开关留给后续设置页任务。
+  **补齐情况**：两个设置键（`keepAliveInBackground` / `screenOffDisconnectMinutes`）的 UI
+  已在 `SettingsPage` 落地，P1b 又在同一段里加了「屏幕常亮」三档。
 
 - **已完成（M5）**：S1（`docs/SYNC-PROTOCOL.md` + `SyncProtocol.ets` + `sync_params.h`）；S2（`cpp/crypto/vault.cpp`：Argon2id / AES-256-GCM / HKDF-SHA256 / 恢复密钥 SCO1 / ciphertextHash；黄金向量 `vault_golden_vectors.h` 已冻结；宿主单测 Vault* 6/6 绿含 10000 次恢复密钥往返；assembleHap 绿；宿主机 libargon2 由 `scripts/build-host-argon2.sh` 免 root 安装）；S3（`ApiClient.ets`：全部 `/api/v1`、If-Match、Idempotency-Key、401 refresh、429 退避、`SYNC_DOCUMENT_NOT_FOUND`/`VAULT_NOT_FOUND` 分支）；S4（`AuthSession`：登录复用 session 不新建设备、改密 `reauthenticationRequired` 清 token、设备列表/重命名/撤销）；S5（稳定序列化 + 三方合并 field/add-add/delete-modify）；S6（相位机 + 登录/前台/保存防抖/网络恢复/轮询 + 离线队列 + 409 合并重试）；S7（敏感开关默认关、关闭后标记轮换、恢复密钥只展示一次）；U6/U7（`AccountSyncPage` 状态卡/设备/历史回滚/冲突保留本机或云端）。assembleHap 绿；`SyncLayer.test` UnitTestArkTS 编译绿。保险库已接 NAPI（`vault_bridge` + `NativeVaultCrypto`）：vault key 只留 native 句柄表；登录/注册创建或解锁；重启后锁定页用密码或 SCO1 恢复密钥；轮换走 `vaultRotate`。宿主 `Vault*` 8/8 绿（含 Create/Unlock/Encrypt/Decrypt/Rewrap）。真机对真实服务端四条典型流程与轮换后云端历史条数为 0 留验
 
@@ -40,7 +76,7 @@
 - **M1 剩余**：Q1 大部分已由「WSL 免 root sshd + native 测试 + ci-local.sh 门禁」覆盖，Docker 多算法 sshd 与 x86_64 模拟器用例待补
 - **阻塞**：X0（签名，需人工）；N3b/T0 spike 与全部真机验收依赖 X0（含 T4 的 ≥50fps / CPU≈0 / 4 实例验收）
 - **验证基线**：`scripts/run-native-tests.sh` 193/193（含真实 sshd 集成）、ASan 干净；`scripts/ci-local.sh` 阶段 1/3/4 绿，阶段 2 视 Previewer 环境
-- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）；**hvigor 本地单测经 Previewer.exe 执行，该进程在某些 Windows 会话无法启动（0xC0000142，桌面堆/会话级问题，需注销重登或重启），ci-local.sh 阶段 2 已加超时快速失败（`e2fda54`）**；**Previewer 已于 P1 期间恢复，`hvigorw test` 首次真正执行全套用例，暴露出 10 条此前只有编译绿证的历史失败（HostEditViewModel ×6、TerminalViewModel「同一连接分屏再拨一路」、KeyMap「F1–F12 全表」、TerminalRender「native 默认黑底替换为外观背景」、ImeInput「退格批量与码点计数」）——均在 P1 未触碰的模块，与后台保活无关，需单独排一轮修复**；T4 帧调度自动休眠需 U4 把会话事件接到 `notifyContentDirty()`（`FrameSchedulerCore.ets` 头注）；T4 光标/字符 blink 闪烁定时留给 A3；T8 缺口：拖拽手柄/放大镜/气泡菜单粘贴分享（改长按定位+抬手再拖，留待打磨）；T9 alt-screen keys 模式方向键未随 DECCKM 切 SS3（留待 T10）
+- **已知跟踪项**：session_bridge 在途调用 vs teardown 的极窄竞态（登记给 Q3）；OHOS musl 无 explicit_bzero（用 OPENSSL_cleanse，已落地）；**hvigor 本地单测经 Previewer.exe 执行，该进程在某些 Windows 会话无法启动（0xC0000142，桌面堆/会话级问题，需注销重登或重启），ci-local.sh 阶段 2 已加超时快速失败（`e2fda54`）**；**Previewer 已于 P1 期间恢复，`hvigorw test` 首次真正执行全套用例，暴露出 10 条此前只有编译绿证的历史失败（HostEditViewModel ×6、TerminalViewModel「同一连接分屏再拨一路」、KeyMap「F1–F12 全表」、TerminalRender「native 默认黑底替换为外观背景」、ImeInput「退格批量与码点计数」）——均在 P1 未触碰的模块，与后台保活无关，该 10 条历史失败已于 2026-09-20 清零（见文首进度快照）**；T4 帧调度自动休眠需 U4 把会话事件接到 `notifyContentDirty()`（`FrameSchedulerCore.ets` 头注）；T4 光标/字符 blink 闪烁定时留给 A3；T8 缺口：拖拽手柄/放大镜/气泡菜单粘贴分享（改长按定位+抬手再拖，留待打磨）；T9 alt-screen keys 模式方向键未随 DECCKM 切 SS3（留待 T10）
 
 ---
 
@@ -243,7 +279,7 @@ X0 → X1 → N1 → N2 → N3 → N5 → N6 → N8 → N10 → N11 → T1 → T
 | R-10 ⚠️ | 多窗格并发渲染掉帧 | 分屏在 2in1 上卡顿，首日需求达不成 | 中 | 架构上先定死「全应用单一帧调度器」（D14）；**T0 spike 直接测 4 实例**；兜底：非聚焦窗格降到 30 fps 刷新、失焦窗格只在 `revision` 变化时重绘 | T0 的 4 实例场景 < 50 fps |
 | R-3 | 用户用同一账号同时登录桌面端与本应用 | 两份格式不同的文档互相覆盖，配置丢失 | 低 | 注册/登录页文案提示；本应用读到无法解析的文档时**只报错不覆盖**，绝不静默上传本地版本 | 用户反馈配置消失 |
 | R-4 ⚠️ | 保险库互解不通（S2） | 同步功能整体不可用 | 中 | S2 第一天先做黄金测试向量，用最小 demo 验证，不要等整个模块写完 | 黄金测试任一向量失败 |
-| R-5 | 后台保活被系统回收（P1） | 会话频繁掉线 | 中 | **P1 已落地降级链**：`dataTransfer` 被低速挂起时不断连接、被取消时用短时任务宽限窗口优雅断开（保留会话面孔与窗格绑定），回前台原地重连并在蒙层写明原因。风险从「静默失联」降为「后台时长不确定」 | 真机实测后台 < 10 min 被杀 |
+| R-5 | 后台保活被系统回收（P1） | 会话频繁掉线 | 中 | **P1b 补强**：屏幕常亮掐掉自动息屏这个起点、低速取消后退避重申 3 次、息屏兜底申请长时任务、主机级 tmux 自动附着（断了也回得到原现场）。**P1 已落地降级链**：`dataTransfer` 被低速挂起时不断连接、被取消时用短时任务宽限窗口优雅断开（保留会话面孔与窗格绑定），回前台原地重连并在蒙层写明原因。风险从「静默失联」降为「后台时长不确定」 | 真机实测后台 < 10 min 被杀 |
 | R-6 | AppGallery 审核对 SSH 类应用的额外要求 | 上架延期 | 低 | P3 提前准备隐私政策与数据出境说明；P5 预留 2 周审核缓冲 | 提审被拒 |
 | R-7 | libssh2 不支持 chacha20-poly1305 | 少数加固服务器连不上 | 低 | 保留 libssh（LGPL）作为备选后端，接口层已抽象 | 用户实际反馈连不上 |
 | R-8 ⚠️ | 同步 API 走公网**明文 HTTP + 裸 IP** | 登录密码、token、key envelope 可被窃听；AppGallery 审核高概率被问 | **高** | 给服务端挂域名 + Let's Encrypt，客户端切 `https://` 并删除 `network` 节点（约半天运维）。在此之前：登录页提示、token 短时效、不做「记住密码」自动登录 | 提审前未切 HTTPS |

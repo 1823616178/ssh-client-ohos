@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ssh-client-ohos/bench/report-schema.json",
+  "title": "SSH Client OHOS Benchmark Report",
+  "description": "Q2 性能基准报告契约。gate.sh 只门禁有实测数值的场景；dry-run/skipped 仅作记录。",
+  "type": "object",
+  "required": ["schemaVersion", "generatedAt", "environment", "scenarios"],
+  "additionalProperties": true,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "报告契约版本；破坏性变更必须递增"
+    },
+    "generatedAt": {
+      "type": "string",
+      "description": "ISO-8601 时间戳"
+    },
+    "environment": {
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": true,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["device", "dry-run", "host"],
+          "description": "device=hdc 实测；dry-run=离线检查清单；host=宿主侧模拟/回放"
+        },
+        "device": {
+          "type": ["string", "null"],
+          "description": "hdc 目标序列号或 product，dry-run 时为 null"
+        },
+        "build": {
+          "type": ["string", "null"],
+          "description": "HAP / git describe 标识"
+        },
+        "script": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "status"],
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "cat_5mb",
+              "yes_burst",
+              "host_list_100",
+              "pane_4_concurrent"
+            ],
+            "description": "DESIGN §1.2 / TASKS Q2 场景 ID"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pass", "fail", "skipped", "dry-run"]
+          },
+          "fpsAvg": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "平均帧率；null=未实测"
+          },
+          "fpsP1": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "1% low 帧率（第 1 百分位）；null=未实测"
+          },
+          "rssPeakMb": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "峰值 RSS（MB）；null=未实测"
+          },
+          "durationMs": {
+            "type": ["number", "null"],
+            "minimum": 0
+          },
+          "fdPeak": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "峰值 fd 数（长稳/泄漏场景可选）"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "description": "本次 gate 输入与结果快照（gate.sh 可回写）",
+      "additionalProperties": true,
+      "properties": {
+        "minFps": { "type": "number" },
+        "maxRssMb": { "type": "number" },
+        "result": { "type": "string", "enum": ["pass", "fail", "skipped"] },
+        "failures": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

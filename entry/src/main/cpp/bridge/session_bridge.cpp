@@ -20,6 +20,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -60,11 +61,36 @@ void StopAccepting(TsfnBridge *ctx)
     ctx->accepting.store(false, std::memory_order_relaxed);
 }
 
+void MarkTsfnTornDown(TsfnBridge *ctx, uint64_t generation)
+{
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->generation.store(generation, std::memory_order_release);
+    ctx->tornDown.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    ctx->accepting.store(false, std::memory_order_relaxed);
+}
+
 // non-blocking 入队（native 线程永不被 ArkTS 堵死）。
 // false = 未入队（入口已关/队列满/TSFN 关闭），事件已由本函数回收
 bool EnqueueEvent(TsfnBridge *ctx, BridgeEvent *evt)
 {
-    if (ctx == nullptr || ctx->tsfn == nullptr) {
+    if (ctx == nullptr || evt == nullptr) {
+        delete evt;
+        return false;
+    }
+    // Q3：teardown 后 late 事件直接回收（generation 戳由发送方写入）
+    if (ctx->tornDown.load(std::memory_order_acquire)) {
+        delete evt;
+        return false;
+    }
+    const uint64_t ctxGen = ctx->generation.load(std::memory_order_acquire);
+    if (evt->generation != 0 && evt->generation != ctxGen) {
+        delete evt; // 代际不匹配：teardown 已 bump
+        return false;
+    }
+    if (ctx->tsfn == nullptr) {
         delete evt;
         return false;
     }
@@ -136,6 +162,14 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
     if (ctx != nullptr) {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         ctx->inFlight.erase(evt.get());
+        // Q3：teardown 后 late TSFN 投递丢弃（事件已由 unique_ptr 回收）
+        if (ctx->tornDown.load(std::memory_order_acquire)) {
+            return;
+        }
+        const uint64_t ctxGen = ctx->generation.load(std::memory_order_acquire);
+        if (evt->generation != 0 && evt->generation != ctxGen) {
+            return;
+        }
     }
     if (jsCb == nullptr) {
         return;
@@ -236,6 +270,94 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
         SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
         SetNumProp(env, obj, "mouseMode", static_cast<double>(evt->number));
         break;
+    // ---- N14 SFTP 事件（sftp 句柄经 double 传递，2^53 内精确）----
+    case EventKind::kSftpOpen:
+        SetStrProp(env, obj, "type", "sftpOpen");
+        SetNumProp(env, obj, "sftp", static_cast<double>(evt->sftp));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "error", evt->text1);
+        SetStrProp(env, obj, "message", evt->text2);
+        break;
+    case EventKind::kSftpList:
+        SetStrProp(env, obj, "type", "sftpList");
+        SetNumProp(env, obj, "sftp", static_cast<double>(evt->sftp));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "path", evt->text1);
+        SetStrProp(env, obj, "error", evt->text3);
+        SetStrProp(env, obj, "message", evt->text4);
+        // entries：JSON 数组字符串（text2）；空列表为 "[]"
+        SetStrProp(env, obj, "entriesJson", evt->text2);
+        break;
+    case EventKind::kSftpStat:
+        SetStrProp(env, obj, "type", "sftpStat");
+        SetNumProp(env, obj, "sftp", static_cast<double>(evt->sftp));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "path", evt->text1);
+        SetStrProp(env, obj, "error", evt->text3);
+        SetStrProp(env, obj, "message", evt->text4);
+        SetStrProp(env, obj, "entryJson", evt->text2);
+        break;
+    case EventKind::kSftpOpDone:
+        SetStrProp(env, obj, "type", "sftpOpDone");
+        SetNumProp(env, obj, "sftp", static_cast<double>(evt->sftp));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "op", evt->text1);
+        SetStrProp(env, obj, "path", evt->text2);
+        SetStrProp(env, obj, "error", evt->text3);
+        SetStrProp(env, obj, "message", evt->text4);
+        SetStrProp(env, obj, "linkTarget", evt->bytes);
+        break;
+    case EventKind::kSftpProgress:
+        SetStrProp(env, obj, "type", "sftpProgress");
+        SetNumProp(env, obj, "sftp", static_cast<double>(evt->sftp));
+        SetNumProp(env, obj, "transferId", static_cast<double>(evt->transferId));
+        SetNumProp(env, obj, "transferred", static_cast<double>(evt->number));
+        SetNumProp(env, obj, "total", std::strtod(evt->text1.c_str(), nullptr));
+        break;
+    case EventKind::kSftpTransferDone:
+        SetStrProp(env, obj, "type", "sftpTransferDone");
+        SetNumProp(env, obj, "sftp", static_cast<double>(evt->sftp));
+        SetNumProp(env, obj, "transferId", static_cast<double>(evt->transferId));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "error", evt->text1);
+        SetStrProp(env, obj, "message", evt->text2);
+        SetNumProp(env, obj, "transferred", static_cast<double>(evt->number));
+        SetNumProp(env, obj, "total", std::strtod(evt->text3.c_str(), nullptr));
+        break;
+    // ---- N15 端口转发事件 ----
+    case EventKind::kForwardOpen:
+        SetStrProp(env, obj, "type", "forwardOpen");
+        SetNumProp(env, obj, "forward", static_cast<double>(evt->forward));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "error", evt->text1);
+        SetStrProp(env, obj, "message", evt->text2);
+        break;
+    case EventKind::kForwardData:
+        SetStrProp(env, obj, "type", "forwardData");
+        SetNumProp(env, obj, "forward", static_cast<double>(evt->forward));
+        SetBytesProp(env, obj, "data", evt->bytes);
+        break;
+    case EventKind::kForwardClose:
+        SetStrProp(env, obj, "type", "forwardClose");
+        SetNumProp(env, obj, "forward", static_cast<double>(evt->forward));
+        SetStrProp(env, obj, "reason", evt->text1);
+        SetStrProp(env, obj, "message", evt->text2);
+        break;
+    case EventKind::kForwardListen:
+        SetStrProp(env, obj, "type", "forwardListen");
+        SetNumProp(env, obj, "forward", static_cast<double>(evt->forward));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetNumProp(env, obj, "boundPort", static_cast<double>(evt->number));
+        SetStrProp(env, obj, "error", evt->text1);
+        SetStrProp(env, obj, "message", evt->text2);
+        break;
+    case EventKind::kForwardAccept:
+        SetStrProp(env, obj, "type", "forwardAccept");
+        SetNumProp(env, obj, "forward", static_cast<double>(evt->forward));
+        SetNumProp(env, obj, "listen", static_cast<double>(evt->transferId));
+        SetBoolProp(env, obj, "success", evt->success);
+        SetStrProp(env, obj, "origin", evt->text1);
+        break;
     }
 
     napi_value undefined = nullptr;
@@ -275,22 +397,29 @@ SessionHandle::~SessionHandle()
 }
 
 // 幂等回收（顺序即任务约定的「先停线程再释放」）：
-//   1. 关 TSFN 入口：此后循环线程事件即弃即收；
+//   0. Q3：置 tornDown + bump generation，等待在途 napi 调用排空
+//      （LookupLiveCall 的 InFlightLease 全部 EndCall 后才动共享资源）；
+//   1. 关 TSFN 入口：此后循环线程事件即弃即收（late 回调丢弃）；
 //   2. 优雅关闭会话并等终态（close 自带冲刷上限；idle 空操作）；
 //      ——期间通道经 onSessionLost 收到终态回调（T3 终端通道同此路径）；
 //   3. 停循环线程（wakeup → join → 清遗留任务），此后不再有任何回调；
 //   4. 析构通道、终端（T3）与会话（SshChannel 析构约定：终止回调已送达；
 //      终端本体的统一回收点见 internal.h 头注）；
 //   5. 释放 TSFN：release 模式让已入队事件继续投递完；env 销毁等
-//      无法投递的场景由 finalize 兜底回收 inFlight。
+//      无法投递的场景由 finalize 兜底回收 inFlight；CallJs 侧 tornDown 已丢 late。
 void SessionHandle::Teardown()
 {
     bool expected = false;
     if (!tornDown.compare_exchange_strong(expected, true)) {
         return;
     }
+    // Q3：拒绝新在途调用并等待已进入的调用排空（超时走兜底，不永久挂死）
+    callGuard.BeginTeardown();
+    const uint64_t gen = callGuard.generation();
     StopAccepting(stateBridge);
     StopAccepting(dataBridge);
+    MarkTsfnTornDown(stateBridge, gen);
+    MarkTsfnTornDown(dataBridge, gen);
 
     if (session) {
         if (session->state() != ssh::SshSessionState::kIdle) {
@@ -324,7 +453,24 @@ void SessionHandle::Teardown()
         }
         terminals.clear();
     }
+    {
+        // N14：回收本会话 SFTP 句柄（close 幂等；此后 ArkTS 调用全部落空）
+        std::lock_guard<std::mutex> lock(sftpMutex);
+        for (const auto &kv : sfpts) {
+            ForgetSftp(kv.first);
+        }
+        sfpts.clear();
+    }
+    {
+        // N15：回收本会话端口转发（数据通道 + 远程监听）
+        std::lock_guard<std::mutex> lock(forwardsMutex);
+        for (const auto &kv : forwards) {
+            ForgetForward(kv.first);
+        }
+        forwards.clear();
+    }
     session.reset();
+    callGuard.EndTeardown();
 
     if (dataBridge != nullptr && dataBridge->tsfn != nullptr) {
         napi_release_threadsafe_function(dataBridge->tsfn, napi_tsfn_release);
@@ -348,6 +494,16 @@ HandleTable<SessionHandle> g_table;
 
 void SendStateEvent(SessionHandle *sh, BridgeEvent *evt)
 {
+    if (sh == nullptr || evt == nullptr) {
+        delete evt;
+        return;
+    }
+    // Q3：打代际戳；teardown 后 late 状态事件丢弃
+    evt->generation = sh->callGuard.generation();
+    if (!sh->callGuard.ShouldDeliver(evt->generation)) {
+        delete evt;
+        return;
+    }
     EnqueueEvent(sh->stateBridge, evt);
 }
 
@@ -355,6 +511,15 @@ void SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt)
 {
     // 终端字节已直接 feed 到 native vterm，这里只上抛「revision 变了」。
     // data TSFN 有界；满队列时 EnqueueEvent 会释放 evt，已有待消费事件足以唤醒 UI。
+    if (sh == nullptr || evt == nullptr) {
+        delete evt;
+        return;
+    }
+    evt->generation = sh->callGuard.generation();
+    if (!sh->callGuard.ShouldDeliver(evt->generation)) {
+        delete evt;
+        return;
+    }
     EnqueueEvent(sh->dataBridge, evt);
 }
 
@@ -367,6 +532,12 @@ int g_activeTeardowns = 0; // 进行中的异步 teardown 计数（g_teardownMut
 void SendDataEvent(SessionHandle *sh, BridgeEvent *evt)
 {
     TsfnBridge *d = sh->dataBridge;
+    // Q3：代际戳 + late 丢弃
+    evt->generation = sh->callGuard.generation();
+    if (!sh->callGuard.ShouldDeliver(evt->generation)) {
+        delete evt;
+        return;
+    }
     if (EnqueueEvent(d, evt)) {
         d->droppedSinceOk = 0;
         return;
@@ -378,6 +549,7 @@ void SendDataEvent(SessionHandle *sh, BridgeEvent *evt)
         auto *err = new BridgeEvent{EventKind::kError};
         err->text1 = "data_queue_full";
         err->text2 = "ArkTS 消费过慢，channelData 批次被丢弃（限量队列背压）";
+        err->generation = sh->callGuard.generation();
         EnqueueEvent(sh->stateBridge, err);
     }
 }
@@ -510,6 +682,18 @@ ssh::SshChannelCallbacks MakeChannelCallbacks(SessionHandle *sh, uint32_t channe
     return cb;
 }
 
+} // namespace
+
+// ---------------------------------------------------------------- napi 参数读取
+//（以下小工具与 LookupLive 声明在 internal.h，T3 起与 terminal_bridge 共享）
+
+napi_value MakeBool(napi_env env, bool v)
+{
+    napi_value r = nullptr;
+    napi_get_boolean(env, v, &r);
+    return r;
+}
+
 ssh::AuthCallback MakeAuthCallback(SessionHandle *sh, const char *method)
 {
     return [sh, method](const ssh::AuthResult &r) {
@@ -521,18 +705,6 @@ ssh::AuthCallback MakeAuthCallback(SessionHandle *sh, const char *method)
         evt->number = static_cast<long>(r.attemptsLeft);
         SendStateEvent(sh, evt);
     };
-}
-
-} // namespace
-
-// ---------------------------------------------------------------- napi 参数读取
-//（以下小工具与 LookupLive 声明在 internal.h，T3 起与 terminal_bridge 共享）
-
-napi_value MakeBool(napi_env env, bool v)
-{
-    napi_value r = nullptr;
-    napi_get_boolean(env, v, &r);
-    return r;
 }
 
 napi_value MakeHandleValue(napi_env env, uint64_t h)
@@ -607,6 +779,23 @@ std::shared_ptr<SessionHandle> LookupLive(uint64_t handle)
         return nullptr;
     }
     return sh;
+}
+
+// Q3：LookupLive + 在途调用租约（teardown 等 inFlight 排空后才销毁 session）
+LiveSessionCall LookupLiveCall(uint64_t handle)
+{
+    LiveSessionCall out;
+    out.sh = g_table.lookup(handle);
+    if (!out.sh || out.sh->tornDown.load(std::memory_order_acquire)) {
+        out.sh = nullptr;
+        return out;
+    }
+    out.lease = InFlightLease(&out.sh->callGuard);
+    if (!out.lease.ok()) {
+        out.sh = nullptr; // teardown 竞态窗口：入口已关
+        return out;
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------- napi 方法实现
@@ -716,13 +905,14 @@ napi_value Connect(napi_env env, napi_callback_info info)
         !GetStringArg(env, argv[3], username)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh || !sh->session) {
+    // Q3：LookupLiveCall 在途租约——teardown 排空前 session 不会被 reset
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok() || !call.sh->session) {
         return MakeBool(env, false);
     }
     // 受理语义见 ssh/session.h：非 idle 态/重复调用返回 false；结果经 stateChange 事件
-    return MakeBool(env, sh->session->connect(std::move(host), static_cast<uint16_t>(port),
-                                              std::move(username)));
+    return MakeBool(env, call.sh->session->connect(std::move(host), static_cast<uint16_t>(port),
+                                                   std::move(username)));
 }
 
 napi_value AuthenticatePassword(napi_env env, napi_callback_info info)
@@ -735,14 +925,15 @@ napi_value AuthenticatePassword(napi_env env, napi_callback_info info)
     if (argc < 2 || !GetHandleArg(env, argv[0], h) || !GetStringArg(env, argv[1], password)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh || !sh->session) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok() || !call.sh->session) {
         ssh::secureZero(password); // 会话不存在：napi 侧副本自清
         return MakeBool(env, false);
     }
     // 受理时 SshSession 复制凭据并 secureZero 本 buffer（auth.h 受理语义）；
     // 未受理（非 authenticating 态/已有认证进行中）时本层自行清零
-    bool ok = sh->session->authenticatePassword(password, MakeAuthCallback(sh.get(), "password"));
+    bool ok = call.sh->session->authenticatePassword(password,
+                                                     MakeAuthCallback(call.sh.get(), "password"));
     if (!ok) {
         ssh::secureZero(password);
     }
@@ -762,16 +953,16 @@ napi_value AuthenticatePublicKey(napi_env env, napi_callback_info info)
         ssh::secureZero(passphrase);
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh || !sh->session) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok() || !call.sh->session) {
         ssh::secureZero(privateKey);
         ssh::secureZero(passphrase);
         return MakeBool(env, false);
     }
     // 受理即复制并清零 privateKey/passphrase（公钥非敏感不清零，auth.h 注释）；
     // 未受理本层自清。边界：ArkTS 运行时持有的原始副本无法清零（头注）
-    bool ok = sh->session->authenticatePublicKey(privateKey, publicKey, passphrase,
-                                                 MakeAuthCallback(sh.get(), "publickey"));
+    bool ok = call.sh->session->authenticatePublicKey(privateKey, publicKey, passphrase,
+                                                     MakeAuthCallback(call.sh.get(), "publickey"));
     if (!ok) {
         ssh::secureZero(privateKey);
         ssh::secureZero(passphrase);
@@ -790,10 +981,11 @@ bool AdmitChannel(napi_env env, napi_callback_info info, bool withPty)
     if (argc < 2 || !GetHandleArg(env, argv[0], h)) {
         return false;
     }
-    auto sh = LookupLive(h);
-    if (!sh || !sh->session) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok() || !call.sh->session) {
         return false;
     }
+    SessionHandle *sh = call.sh.get();
 
     std::string termType, command;
     uint32_t cols = 80, rows = 24;
@@ -812,7 +1004,7 @@ bool AdmitChannel(napi_env env, napi_callback_info info, bool withPty)
     const uint32_t channelId = sh->nextChannelId.fetch_add(1, std::memory_order_relaxed);
     auto entry = std::make_shared<ChannelEntry>();
     entry->channel = std::make_unique<ssh::SshChannel>(*sh->session,
-                                                       MakeChannelCallbacks(sh.get(), channelId));
+                                                       MakeChannelCallbacks(sh, channelId));
     {
         std::lock_guard<std::mutex> lock(sh->channelsMutex);
         sh->channels.emplace(channelId, entry);
@@ -858,11 +1050,11 @@ napi_value Write(napi_env env, napi_callback_info info)
         !GetBytesArg(env, argv[2], bytes)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok()) {
         return MakeBool(env, false);
     }
-    auto entry = FindChannel(sh.get(), channelId);
+    auto entry = FindChannel(call.sh.get(), channelId);
     if (!entry) {
         return MakeBool(env, false);
     }
@@ -881,11 +1073,11 @@ napi_value Resize(napi_env env, napi_callback_info info)
         !GetUint32Arg(env, argv[2], cols) || !GetUint32Arg(env, argv[3], rows)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok()) {
         return MakeBool(env, false);
     }
-    auto entry = FindChannel(sh.get(), channelId);
+    auto entry = FindChannel(call.sh.get(), channelId);
     if (!entry) {
         return MakeBool(env, false);
     }
@@ -902,11 +1094,11 @@ napi_value CloseChannel(napi_env env, napi_callback_info info)
     if (argc < 2 || !GetHandleArg(env, argv[0], h) || !GetUint32Arg(env, argv[1], channelId)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok()) {
         return MakeBool(env, false);
     }
-    auto entry = FindChannel(sh.get(), channelId);
+    auto entry = FindChannel(call.sh.get(), channelId);
     if (!entry) {
         return MakeBool(env, false); // 幂等：不存在视为已关闭
     }
@@ -956,12 +1148,12 @@ napi_value SetKeepalive(napi_env env, napi_callback_info info)
         !GetUint32Arg(env, argv[2], maxMisses)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh || !sh->session) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok() || !call.sh->session) {
         return MakeBool(env, false);
     }
     // 仅 idle 态受理（即须在 connect 前调用）；语义见 ssh/session.h setKeepaliveConfig
-    return MakeBool(env, sh->session->setKeepaliveConfig(intervalSec, maxMisses));
+    return MakeBool(env, call.sh->session->setKeepaliveConfig(intervalSec, maxMisses));
 }
 
 // P1：网络切换后的主动探测（受理语义，仅 established 受理；裁决经 stateChange 事件回报）
@@ -978,11 +1170,11 @@ napi_value ProbeNow(napi_env env, napi_callback_info info)
     if (argc >= 2 && !GetUint32Arg(env, argv[1], timeoutSec)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh || !sh->session) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok() || !call.sh->session) {
         return MakeBool(env, false);
     }
-    return MakeBool(env, sh->session->probeNow(timeoutSec));
+    return MakeBool(env, call.sh->session->probeNow(timeoutSec));
 }
 
 // 读取退避序列数组（number[]，秒，0 表示立即重试档，86400 上限作 sanity 截断）；
@@ -1023,12 +1215,12 @@ napi_value SetReconnectPolicy(napi_env env, napi_callback_info info)
         !GetUint32Arg(env, argv[2], maxAttempts)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(h);
-    if (!sh) {
+    LiveSessionCall call = LookupLiveCall(h);
+    if (!call.ok()) {
         return MakeBool(env, false);
     }
     // 任意时刻可调（策略不参与 native 会话内部状态，仅作 ArkTS 重连编排的查询依据）
-    sh->reconnectPolicy = ssh::BackoffSchedule(std::move(delays), maxAttempts);
+    call.sh->reconnectPolicy = ssh::BackoffSchedule(std::move(delays), maxAttempts);
     return MakeBool(env, true);
 }
 
@@ -1043,9 +1235,9 @@ napi_value NextReconnectDelaySec(napi_env env, napi_callback_info info)
     // 重连前的建议等待秒数，越界档由 BackoffSchedule 钳制
     double result = -1;
     if (argc >= 2 && GetHandleArg(env, argv[0], h) && GetUint32Arg(env, argv[1], attempt)) {
-        auto sh = LookupLive(h);
-        if (sh && !sh->reconnectPolicy.shouldGiveUp(attempt)) {
-            result = static_cast<double>(sh->reconnectPolicy.delayForAttempt(attempt));
+        LiveSessionCall call = LookupLiveCall(h);
+        if (call.ok() && !call.sh->reconnectPolicy.shouldGiveUp(attempt)) {
+            result = static_cast<double>(call.sh->reconnectPolicy.delayForAttempt(attempt));
         }
     }
     napi_value r = nullptr;

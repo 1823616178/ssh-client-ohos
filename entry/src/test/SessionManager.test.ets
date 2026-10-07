@@ -1,5 +1,5 @@
 /**
- * SessionManager 单元测试（任务 C4）。
+ * SessionManager 单元测试（任务 C4 + N9 agent 接线）。
  *
  * 注入形态（对齐 C1 的 InMemoryRdbGateway 模式）：
  *   - FakeNativeSession：NativeSessionLike 的可脚本化实现（emit 手动投递事件、
@@ -7,19 +7,21 @@
  *     NativeSessionFactory 注入，替代 SshNativeSession.create；
  *   - ManualScheduler：ReconnectScheduler 手动定时器（记录 delaySec、runNext/runAll
  *     立即触发，不真等秒），验证退避调度与倒计时；
- *   - 内存凭据表：SecretProvider 注入，替代 CredentialStore.getSecret。
+ *   - 内存凭据表：SecretProvider 注入，替代 CredentialStore.getSecret；
+ *   - FakeAgentAuth：AgentAuthPort 内存实现（N9 agent 认证路径）。
  *
  * 覆盖：connect→established 全流程迁移 / 8 会话并存事件互不串扰 /
  * bindPane-unbindPane（closeSession 级联释放、幂等）/ closeAll 幂等 /
  * 重连退避（建议秒数、倒计时、换句柄保 sessionId、超限终态、手动 close 取消）/
- * 认证失败错误码映射 / 凭据缺失与 agent 未实现 / hostKey 透传与 dirty 唤醒 /
+ * 认证失败错误码映射 / 凭据缺失与 agent 已解锁/未解锁两条路径 / hostKey 透传与 dirty 唤醒 /
  * P1 后台保活支撑（活跃计数口径、静默模式、切网收敛两条分支、策略挂起与恢复、会话数通知）。
  */
 
 import { describe, it, expect } from '@ohos/hypium';
 import { HostProfile, createDefaultHostProfile } from '../main/ets/common/model/models';
 import { SshError, SshErrorCode } from '../main/ets/common/SshError';
-import { SshEvent, SshEventListener } from '../main/ets/napi/SshNative';
+import { SshEvent, SshEventListener, NativeAgentKeygenResult } from '../main/ets/napi/SshNative';
+import { AgentAuthPort } from '../main/ets/napi/AgentAuth';
 import { CredentialKind } from '../main/ets/repository/CredentialStore';
 import {
   DEFAULT_RECONNECT_MAX_ATTEMPTS,
@@ -38,6 +40,10 @@ interface KeyAuthCall {
   passphrase: string;
 }
 
+interface AgentAuthCall {
+  keyId: string;
+}
+
 /** 可脚本化发事件的 fake native 会话 */
 class FakeNativeSession implements NativeSessionLike {
   readonly nativeHandle: number;
@@ -48,6 +54,7 @@ class FakeNativeSession implements NativeSessionLike {
   connectUsername: string = '';
   readonly passwordAuthCalls: string[] = [];
   readonly keyAuthCalls: KeyAuthCall[] = [];
+  readonly agentAuthCalls: AgentAuthCall[] = [];
   keepaliveIntervalSec: number = -1;
   keepaliveMaxMisses: number = -1;
   reconnectPolicyDelays: number[] = [];
@@ -86,6 +93,11 @@ class FakeNativeSession implements NativeSessionLike {
     return this.acceptAuth;
   }
 
+  authenticateAgent(keyId: string): boolean {
+    this.agentAuthCalls.push({ keyId: keyId });
+    return this.acceptAuth;
+  }
+
   setKeepalive(intervalSec: number, maxMisses: number): boolean {
     this.keepaliveIntervalSec = intervalSec;
     this.keepaliveMaxMisses = maxMisses;
@@ -114,6 +126,52 @@ class FakeNativeSession implements NativeSessionLike {
   /** 测试脚本入口：模拟 native 投递一个事件 */
   emit(event: SshEvent): void {
     this.listener(event);
+  }
+}
+
+/** N9：可脚本化的应用内 agent fake */
+class FakeAgentAuth implements AgentAuthPort {
+  private readonly keys: Map<string, string> = new Map();
+  readonly unlockCalls: string[] = [];
+  /** unlock 受理开关（false = 粗检不通过） */
+  acceptUnlock: boolean = true;
+
+  isLocked(keyId: string): boolean {
+    return !this.keys.has(keyId);
+  }
+
+  unlock(keyId: string, privateKey: string, passphrase: string): boolean {
+    this.unlockCalls.push(keyId);
+    if (!this.acceptUnlock || keyId.length === 0 || privateKey.length === 0) {
+      return false;
+    }
+    this.keys.set(keyId, `${privateKey}|${passphrase}`);
+    return true;
+  }
+
+  lock(keyId: string): boolean {
+    return this.keys.delete(keyId);
+  }
+
+  lockAll(): void {
+    this.keys.clear();
+  }
+
+  keyCount(): number {
+    return this.keys.size;
+  }
+
+  keygenSupported(): boolean {
+    return false;
+  }
+
+  keygen(_comment: string, _passphrase: string): NativeAgentKeygenResult | null {
+    return null;
+  }
+
+  /** 测试预置：直接标记某 keyId 已解锁 */
+  preload(keyId: string): void {
+    this.keys.set(keyId, 'preloaded');
   }
 }
 
@@ -196,6 +254,7 @@ class TestEnv {
   readonly factory: FakeFactory = new FakeFactory();
   readonly scheduler: ManualScheduler = new ManualScheduler();
   readonly secrets: Map<string, string> = new Map();
+  readonly agent: FakeAgentAuth = new FakeAgentAuth();
   readonly manager: SessionManager;
   readonly dirtyLog: string[] = [];
   private idSeq: number = 0;
@@ -211,7 +270,8 @@ class TestEnv {
       newSessionId: (): string => {
         this.idSeq++;
         return `s-${this.idSeq}`;
-      }
+      },
+      agentAuth: this.agent
     });
     this.manager.addDirtyListener((sessionId: string) => {
       this.dirtyLog.push(sessionId);
@@ -359,18 +419,64 @@ export default function sessionManagerTest() {
       expect(env.manager.listSessions().length).assertEqual(0);
     });
 
-    it('agent认证_显式报未实现', 0, async () => {
+    it('agent认证_已解锁密钥_走authenticateAgent成功路径', 0, async () => {
       const env: TestEnv = new TestEnv();
+      // keyId 约定 = host.id；预置已解锁 → 不读凭据库、不 unlock
+      env.agent.preload('h-agent');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h-agent', 'agent'));
+      const fake: FakeNativeSession = env.factory.latest();
+      expect(info.state).assertEqual('connecting');
+      expect(fake.connectCount).assertEqual(1);
+      expect(fake.agentAuthCalls.length).assertEqual(0);
+      expect(env.agent.unlockCalls.length).assertEqual(0);
+      fake.emit(stateChange('authenticating'));
+      expect(fake.agentAuthCalls.length).assertEqual(1);
+      expect(fake.agentAuthCalls[0].keyId).assertEqual('h-agent');
+      // 私钥不经过 SessionInfo
+      expect(fake.passwordAuthCalls.length).assertEqual(0);
+      expect(fake.keyAuthCalls.length).assertEqual(0);
+      fake.emit(stateChange('established'));
+      expect(info.state).assertEqual('established');
+    });
+
+    it('agent认证_未解锁但从凭据库取私钥_unlock后认证', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h-agent2', 'private_key', 'OPENSSH-KEY');
+      env.setSecret('h-agent2', 'passphrase', 'pp');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h-agent2', 'agent'));
+      const fake: FakeNativeSession = env.factory.latest();
+      // prepareAuth 阶段已 unlock 进 agent
+      expect(env.agent.unlockCalls.length).assertEqual(1);
+      expect(env.agent.unlockCalls[0]).assertEqual('h-agent2');
+      expect(env.agent.isLocked('h-agent2')).assertFalse();
+      fake.emit(stateChange('authenticating'));
+      expect(fake.agentAuthCalls.length).assertEqual(1);
+      expect(fake.agentAuthCalls[0].keyId).assertEqual('h-agent2');
+      // 零残留：SessionInfo 序列化不含私钥/短语
+      const json: string = JSON.stringify(info);
+      expect(json.indexOf('OPENSSH-KEY') < 0).assertTrue();
+      expect(json.indexOf('pp') < 0).assertTrue();
+    });
+
+    it('agent认证_未解锁且无私钥_CREDENTIAL_MISSING且不建会话', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      let threw: boolean = false;
+      let code: number = 0;
       let message: string = '';
       try {
-        await env.manager.connect(sampleHost('h-agent', 'agent'));
+        await env.manager.connect(sampleHost('h-agent-missing', 'agent'));
       } catch (err) {
+        threw = true;
         if (err instanceof SshError) {
+          code = err.code;
           message = err.message;
         }
       }
-      expect(message.indexOf('暂未实现') >= 0).assertTrue();
+      expect(threw).assertTrue();
+      expect(code).assertEqual(SshErrorCode.CREDENTIAL_MISSING);
+      expect(message.indexOf('agent') >= 0).assertTrue();
       expect(env.factory.created.length).assertEqual(0);
+      expect(env.manager.listSessions().length).assertEqual(0);
     });
 
     it('认证失败_stateChange错误码映射为中文文案', 0, async () => {

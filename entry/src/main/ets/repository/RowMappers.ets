@@ -144,6 +144,8 @@ export function hostToRow(host: HostProfile): RowObject {
   row['init_commands'] = JSON.stringify(host.initCommands);
   row['env_vars'] = JSON.stringify(host.envVars);
   row['term_type'] = host.termType;
+  row['tmux_auto_attach'] = host.tmuxAutoAttach ? 1 : 0;
+  row['tmux_session_name'] = host.tmuxSessionName;
   return row;
 }
 
@@ -162,7 +164,9 @@ export function rowToHost(row: RowObject): HostProfile {
     jumpHostId: optString(row, 'jump_host_id'),
     initCommands: parseStringArray(reqString(row, 'init_commands'), 'init_commands'),
     envVars: parseStringRecord(reqString(row, 'env_vars'), 'env_vars'),
-    termType: reqString(row, 'term_type')
+    termType: reqString(row, 'term_type'),
+    tmuxAutoAttach: reqNumber(row, 'tmux_auto_attach') !== 0,
+    tmuxSessionName: reqString(row, 'tmux_session_name')
   };
 }
 
@@ -206,6 +210,10 @@ export function appearanceToRow(appearance: AppearanceProfile): RowObject {
   row['background'] = appearance.background;
   row['cursor_color'] = appearance.cursorColor;
   row['selection_color'] = appearance.selectionColor;
+  // A5 背景图（schema v3）
+  row['background_image_path'] = appearance.backgroundImagePath;
+  row['background_image_opacity'] = appearance.backgroundImageOpacity;
+  row['background_blur'] = appearance.backgroundBlur;
   return row;
 }
 
@@ -228,7 +236,14 @@ export function rowToAppearance(row: RowObject): AppearanceProfile {
     foreground: reqString(row, 'foreground'),
     background: reqString(row, 'background'),
     cursorColor: reqString(row, 'cursor_color'),
-    selectionColor: reqString(row, 'selection_color')
+    selectionColor: reqString(row, 'selection_color'),
+    // A5：迁移后列必在；历史/缺列时回退默认，不把脏数据扩散到 UI
+    backgroundImagePath: typeof row['background_image_path'] === 'string'
+      ? row['background_image_path'] as string : '',
+    backgroundImageOpacity: typeof row['background_image_opacity'] === 'number'
+      ? row['background_image_opacity'] as number : 1,
+    backgroundBlur: typeof row['background_blur'] === 'number'
+      ? row['background_blur'] as number : 0
   };
 }
 

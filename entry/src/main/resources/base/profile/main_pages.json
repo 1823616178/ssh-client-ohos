@@ -5,6 +5,11 @@
     "pages/TerminalPage",
     "pages/AccountSyncPage",
     "pages/ConfigManagerPage",
-    "pages/SettingsPage"
+    "pages/SettingsPage",
+    "pages/KeyManagerPage",
+    "pages/AppearancePage",
+    "pages/OpenSourceLicensesPage",
+    "pages/SftpPage",
+    "pages/PortForwardPage"
   ]
 }

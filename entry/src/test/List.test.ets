@@ -13,6 +13,7 @@ import imeInputTest from './ImeInput.test';
 import selectionModelTest from './SelectionModel.test';
 import keyBarTest from './KeyBar.test';
 import terminalGesturesTest from './TerminalGestures.test';
+import physicalKeyboardTest from './PhysicalKeyboard.test';
 import databaseSchemaTest from './DatabaseSchema.test';
 import daoTest from './Dao.test';
 import credentialStoreTest from './CredentialStore.test';
@@ -26,6 +27,15 @@ import syncProtocolTest from './SyncProtocol.test';
 import syncLayerTest from './SyncLayer.test';
 import hexColorTest from './HexColor.test';
 import backgroundKeepAliveTest from './BackgroundKeepAlive.test';
+import screenAwakeTest from './ScreenAwake.test';
+import appearanceAndUtilsTest from './AppearanceUtils.test';
+import appearanceViewModelTest from './AppearanceViewModel.test';
+import sftpTransferTest from './SftpTransfer.test';
+import portForwardTest from './PortForward.test';
+import i18nTest from './I18n.test';
+import benchMetricsTest from './BenchMetrics.test';
+import keyManagerLogicTest from './KeyManagerLogic.test';
+import cursorBlinkTest from './CursorBlink.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -44,6 +54,7 @@ export default function testsuite() {
   selectionModelTest();
   keyBarTest();
   terminalGesturesTest();
+  physicalKeyboardTest();
   databaseSchemaTest();
   daoTest();
   credentialStoreTest();
@@ -57,4 +68,13 @@ export default function testsuite() {
   syncLayerTest();
   hexColorTest();
   backgroundKeepAliveTest();
+  screenAwakeTest();
+  appearanceAndUtilsTest();
+  appearanceViewModelTest();
+  sftpTransferTest();
+  portForwardTest();
+  i18nTest();
+  benchMetricsTest();
+  keyManagerLogicTest();
+  cursorBlinkTest();
 }

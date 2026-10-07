@@ -7,10 +7,10 @@
  *     跳板主机下拉（HostDao.listAll，编辑态排除自身）；
  *   - 认证段：authType 三选（密码 / 密钥 / Agent）——password 显示密码框；
  *     key 显示私钥粘贴 TextArea + 密码短语框（文件选择器归 U3，占位注释）；
- *     agent 置灰「应用内 agent 暂未开放」；已保存凭据只显示「已保存」占位与
+ *     agent 提示先在密钥管理导入/解锁；已保存凭据只显示「已保存」占位与
  *     「清除已保存」入口，绝不回填明文；
- *   - 终端段：termType（默认 xterm-256color）/ keepalive 秒 / initCommands
- *     每行一条 / envVars 每行 KEY=VALUE / 外观下拉（AppearanceDao.listAll）；
+ *   - 终端段：termType（默认 xterm-256color）/ keepalive 秒 / tmux 自动附着（含会话名）/
+ *     initCommands 每行一条 / envVars 每行 KEY=VALUE / 外观下拉（AppearanceDao.listAll）；
  *   - 转发段：该主机的 PortForwardRule 列表增删改（类型三选 + 按类型显示字段 +
  *     启停开关）；新建主机未保存时整段禁用并提示先保存（规则需 hostId 外键）；
  *   - 底栏：测试连接（一次性流程，结果与主机指纹内联展示）+ 保存。
@@ -25,6 +25,7 @@ import { router } from '@kit.ArkUI';
 import { AuthType, PortForwardType } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
 import { Tokens } from '../theme/Tokens';
+import { PageHeader } from '../view/PageHeader';
 import {
   CredentialDraft,
   ForwardRuleErrors,
@@ -69,6 +70,9 @@ struct HostEditPage {
   @State keepaliveText: string = '30';
   @State initCommandsText: string = '';
   @State envVarsText: string = '';
+  /** 连接后自动附着 tmux（断线重连回到原现场） */
+  @State tmuxAutoAttach: boolean = false;
+  @State tmuxSessionName: string = '';
   /** 外观选择（'' = 默认外观） */
   @State appearanceIdSel: string = '';
 
@@ -117,6 +121,8 @@ struct HostEditPage {
     this.keepaliveText = form.keepaliveText;
     this.initCommandsText = form.initCommandsText;
     this.envVarsText = form.envVarsText;
+    this.tmuxAutoAttach = form.tmuxAutoAttach;
+    this.tmuxSessionName = form.tmuxSessionName;
     this.appearanceIdSel = form.appearanceId ?? '';
   }
 
@@ -134,6 +140,8 @@ struct HostEditPage {
     form.keepaliveText = this.keepaliveText;
     form.initCommandsText = this.initCommandsText;
     form.envVarsText = this.envVarsText;
+    form.tmuxAutoAttach = this.tmuxAutoAttach;
+    form.tmuxSessionName = this.tmuxSessionName;
     form.appearanceId = this.appearanceIdSel.length === 0 ? null : this.appearanceIdSel;
     return form;
   }
@@ -176,12 +184,12 @@ struct HostEditPage {
       } else if (outcome === 'invalid') {
         this.toast('请修正表单中标红的错误');
       } else {
-        this.toast('保存失败，详见日志');
+        this.toast('操作失败，请重试');
       }
     }).catch((err: Object) => {
       Logger.error(`保存失败: ${JSON.stringify(err)}`, LOG_TAG);
       this.clearCredentialStates();
-      this.toast('保存失败，详见日志');
+      this.toast('操作失败，请重试');
     });
   }
 
@@ -266,56 +274,47 @@ struct HostEditPage {
 
   build() {
     Column() {
-      // 顶栏：返回 + 标题
-      Row() {
-        Text('‹')
-          .fontSize(Tokens.fontSize.headline)
-          .fontColor(Tokens.Color.text)
-          .padding(Tokens.space.xs)
-          .onClick(() => {
-            router.back();
-          })
-        Text(this.vm.isEdit ? '编辑主机' : '新建主机')
-          .fontSize(Tokens.fontSize.headline)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Tokens.Color.text)
-          .margin({ left: Tokens.space.xs })
+      PageHeader({
+        title: this.vm.isEdit ? '编辑主机' : '新建主机',
+        subtitle: this.vm.isEdit && this.name.length > 0 ? this.name : '填写连接与认证信息'
+      })
+      Column() {
+        if (this.vm.loading) {
+          Text('加载中…')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.textDim)
+            .margin({ top: Tokens.space.lg })
+        } else if (this.vm.loadError.length > 0) {
+          Text(this.vm.loadError)
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.danger)
+            .margin({ top: Tokens.space.lg })
+        } else {
+          // 四段式表单（长表单滚动）
+          Scroll() {
+            Column() {
+              this.ConnectionSection()
+              this.AuthSection()
+              this.TerminalSection()
+              this.ForwardSection()
+            }
+            .width('100%')
+          }
+          .scrollBar(BarState.Off)
+          .width('100%')
+          .layoutWeight(1)
+          .margin({ top: Tokens.space.sm })
+
+          this.BottomBar()
+        }
       }
       .width('100%')
-
-      if (this.vm.loading) {
-        Text('加载中…')
-          .fontSize(Tokens.fontSize.body)
-          .fontColor(Tokens.Color.textDim)
-          .margin({ top: Tokens.space.lg })
-      } else if (this.vm.loadError.length > 0) {
-        Text(this.vm.loadError)
-          .fontSize(Tokens.fontSize.body)
-          .fontColor(Tokens.Color.danger)
-          .margin({ top: Tokens.space.lg })
-      } else {
-        // 四段式表单（长表单滚动）
-        Scroll() {
-          Column() {
-            this.ConnectionSection()
-            this.AuthSection()
-            this.TerminalSection()
-            this.ForwardSection()
-          }
-          .width('100%')
-        }
-        .scrollBar(BarState.Off)
-        .width('100%')
-        .layoutWeight(1)
-        .margin({ top: Tokens.space.sm })
-
-        this.BottomBar()
-      }
+      .layoutWeight(1)
+      .padding({ left: Tokens.space.md, right: Tokens.space.md, bottom: Tokens.space.md })
     }
     .width('100%')
     .height('100%')
     .backgroundColor(Tokens.Color.appBg)
-    .padding(Tokens.space.md)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -416,7 +415,7 @@ struct HostEditPage {
       if (this.authType === 'password') {
         this.FieldLabel('密码')
         TextInput({
-          placeholder: this.vm.hasSavedPassword ? '已保存（输入以更换）' : '登录密码',
+          placeholder: this.vm.hasSavedPassword ? '已保存' : '登录密码',
           text: this.password
         })
           .type(InputType.Password)
@@ -430,7 +429,7 @@ struct HostEditPage {
         this.FieldLabel('私钥（PEM / OpenSSH 文本）')
         // U3 接线点：私钥文件选择器（@kit.CoreFileKit picker）在此追加「从文件导入」按钮
         TextArea({
-          placeholder: this.vm.hasSavedPrivateKey ? '已保存（粘贴以更换）' : '粘贴私钥内容',
+          placeholder: this.vm.hasSavedPrivateKey ? '已保存' : '粘贴私钥内容',
           text: this.privateKey
         })
           .fontSize(Tokens.fontSize.caption)
@@ -443,7 +442,7 @@ struct HostEditPage {
 
         this.FieldLabel('密码短语（可选）')
         TextInput({
-          placeholder: this.vm.hasSavedPassphrase ? '已保存（输入以更换）' : '私钥有口令时填写',
+          placeholder: this.vm.hasSavedPassphrase ? '已保存' : '私钥有口令时填写',
           text: this.passphrase
         })
           .type(InputType.Password)
@@ -454,10 +453,19 @@ struct HostEditPage {
           })
         this.SavedCredentialHint('passphrase')
       } else {
-        Text('应用内 agent 暂未开放')
+        Text('应用内 Agent：请先在密钥管理导入并解锁私钥')
           .fontSize(Tokens.fontSize.body)
-          .fontColor(Tokens.Color.textFaint)
+          .fontColor(Tokens.Color.textDim)
           .margin({ top: Tokens.space.sm })
+        Button('打开密钥管理')
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.accent)
+          .borderRadius(Tokens.radius.sm)
+          .margin({ top: Tokens.space.xs })
+          .onClick(() => {
+            router.pushUrl({ url: 'pages/KeyManagerPage' });
+          })
       }
     }
     .alignItems(HorizontalAlign.Start)
@@ -487,7 +495,7 @@ struct HostEditPage {
         .layoutWeight(2)
 
         Column() {
-          this.FieldLabel('keepalive（秒）')
+          this.FieldLabel('心跳间隔（秒）')
           TextInput({ placeholder: '30', text: this.keepaliveText })
             .fontSize(Tokens.fontSize.body)
             .onChange((value: string) => {
@@ -501,8 +509,42 @@ struct HostEditPage {
       }
       .width('100%')
 
+      // tmux 自动附着：移动端断线不可避免，现场挂在 tmux 里才不会丢
+      Row() {
+        Column() {
+          Text('自动附着 tmux 会话')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.text)
+          Text('连接后执行 tmux new -A -s <会话名>；断线重连回到原现场')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.textDim)
+            .margin({ top: Tokens.space.xs2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.tmuxAutoAttach })
+          .selectedColor(Tokens.Color.accent)
+          .onChange((isOn: boolean) => {
+            this.tmuxAutoAttach = isOn;
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .margin({ top: Tokens.space.sm })
+
+      if (this.tmuxAutoAttach) {
+        this.FieldLabel('tmux 会话名（留空用 harmony）')
+        TextInput({ placeholder: 'harmony', text: this.tmuxSessionName })
+          .fontSize(Tokens.fontSize.body)
+          .margin({ top: Tokens.space.xs2 })
+          .onChange((value: string) => {
+            this.tmuxSessionName = value;
+          })
+      }
+
       this.FieldLabel('登录后自动执行（每行一条）')
-      TextArea({ placeholder: '如：tmux attach', text: this.initCommandsText })
+      TextArea({ placeholder: '如：cd /var/log && tail -f app.log', text: this.initCommandsText })
         .fontSize(Tokens.fontSize.body)
         .margin({ top: Tokens.space.xs2 })
         .onChange((value: string) => {
@@ -666,7 +708,7 @@ struct HostEditPage {
           .fontColor(this.vm.testSuccess ? Tokens.Color.success : Tokens.Color.danger)
           .margin({ bottom: Tokens.space.xs })
       }
-      // 主机指纹展示（TOFU 素材；真实连接中的确认/拒绝完整交互归 U4）
+      // 主机指纹展示（TOFU 素材）
       if (this.vm.testHostKey !== null) {
         Column() {
           Text('主机指纹（首次连接请核对）')
@@ -686,10 +728,6 @@ struct HostEditPage {
               .fontColor(Tokens.Color.textDim)
               .margin({ top: Tokens.space.xs2 })
           }
-          Text('确认入库的最小闭环在此提供；真实连接中的 TOFU 确认与不匹配拒绝归 U4')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.textFaint)
-            .margin({ top: Tokens.space.xs2 })
           if (!this.vm.hostKeyTrusted) {
             Text('信任该指纹并入库')
               .fontSize(Tokens.fontSize.body)
@@ -730,7 +768,7 @@ struct HostEditPage {
           })
         Button(this.vm.saving ? '保存中…' : '保存')
           .fontSize(Tokens.fontSize.body)
-          .fontColor(Color.White)
+          .fontColor(Tokens.Color.onAccent)
           .backgroundColor(Tokens.Color.accent)
           .borderRadius(Tokens.radius.sm)
           .layoutWeight(1)
@@ -781,7 +819,7 @@ struct HostEditPage {
       ForEach(labels, (label: string, index: number) => {
         Text(label)
           .fontSize(Tokens.fontSize.body)
-          .fontColor(index === selectedIndex ? Color.White : Tokens.Color.textDim)
+          .fontColor(index === selectedIndex ? Tokens.Color.onAccent : Tokens.Color.textDim)
           .backgroundColor(index === selectedIndex ? Tokens.Color.accent : Tokens.Color.surfaceHover)
           .borderRadius(Tokens.radius.xs)
           .padding({
@@ -798,20 +836,28 @@ struct HostEditPage {
     }
   }
 
-  /** 已保存凭据的占位提示与「清除已保存」入口（绝不回填明文） */
+  /** 凭据状态三态：已保存 / 未保存 / 将清除（操作「清除已保存」单独入口） */
   @Builder
   SavedCredentialHint(kind: 'password' | 'passphrase' | 'private_key') {
-    if (this.hasSaved(kind)) {
-      if (this.vm.credentialStateOf(kind) === 'cleared') {
-        Text('已标记清除，保存后生效')
+    if (this.vm.credentialStateOf(kind) === 'cleared') {
+      Row() {
+        Text('将清除已保存凭据')
           .fontSize(Tokens.fontSize.caption)
+          .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.Color.warn)
-          .margin({ top: Tokens.space.xs2 })
-      } else {
+      }
+      .margin({ top: Tokens.space.xs2 })
+    } else if (this.hasSaved(kind)) {
+      Row() {
+        Text('已保存')
+          .fontSize(Tokens.fontSize.caption)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.success)
         Text('清除已保存')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.danger)
-          .margin({ top: Tokens.space.xs2 })
+          .margin({ left: Tokens.space.sm })
+          .accessibilityText('清除已保存凭据')
           .onClick(() => {
             this.vm.markCredentialCleared(kind);
             if (kind === 'password') {
@@ -823,6 +869,12 @@ struct HostEditPage {
             }
           })
       }
+      .margin({ top: Tokens.space.xs2 })
+    } else {
+      Text('未保存')
+        .fontSize(Tokens.fontSize.caption)
+        .fontColor(Tokens.Color.textFaint)
+        .margin({ top: Tokens.space.xs2 })
     }
   }
 

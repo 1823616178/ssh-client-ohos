@@ -11,16 +11,22 @@ project(ssh_client_ohos CXX)
 set(NATIVE_SOURCES
     napi_init.cpp
     # bridge/
+    bridge/agent_bridge.cpp
     bridge/data_aggregator.cpp
     bridge/session_bridge.cpp
     bridge/terminal_bridge.cpp
     bridge/vault_bridge.cpp
+    bridge/sftp_bridge.cpp
+    bridge/forward_bridge.cpp
     # ssh/
     ssh/session.cpp
     ssh/hostkey.cpp
     ssh/auth.cpp
     ssh/agent.cpp
+    ssh/keygen.cpp
     ssh/channel.cpp
+    ssh/sftp.cpp
+    ssh/forward.cpp
     # term/
     term/grid.cpp
     term/vterm_screen.cpp

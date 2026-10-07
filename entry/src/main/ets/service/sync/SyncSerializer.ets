@@ -6,7 +6,7 @@
  * 下列字段，且不得为「本机专有数据」在文档里另开位置。
  *
  * 只同步交集：servers（主机 8 字段）/ tunnels（端口转发）/ groups（分组）。
- * 本机专有（外观、片段、known_hosts、jumpHostId、initCommands、envVars、termType、
+ * 本机专有（外观、片段、known_hosts、jumpHostId、initCommands、envVars、termType、tmux 自动附着、
  * 分组 order 等）留在本地库，由 SyncRuntime 在下行写回时保护，不随同步清空。
  *
  * 数组按 id 字典序；超限在写出前拦截。同一配置重复序列化字节一致。

@@ -7,6 +7,7 @@
 
 import { router } from '@kit.ArkUI';
 import { Tokens } from '../theme/Tokens';
+import { PageHeader } from '../view/PageHeader';
 import { DeviceItem } from '../service/sync/ApiTypes';
 import { RevisionItem } from '../service/sync/ApiTypes';
 import { SyncConflict } from '../service/sync/SyncMerge';
@@ -28,7 +29,7 @@ struct AccountSyncPage {
   /** VM 的 async 方法内部已把异常收敛为 errorText，这里只兜底防止未处理拒绝 */
   private run(task: Promise<void>): void {
     task.catch((err: Object) => {
-      this.toast(err instanceof Error ? err.message : '操作失败');
+      this.toast(err instanceof Error ? err.message : '操作失败，请重试');
     });
   }
 
@@ -53,42 +54,10 @@ struct AccountSyncPage {
 
   build() {
     Column() {
-      // 顶栏：返回按钮 + 页面标题与字标
-      Row() {
-        Row() {
-          Text('‹')
-            .fontSize(Tokens.fontSize.display)
-            .fontWeight(FontWeight.Lighter)
-            .fontColor(Tokens.Color.text)
-            .textAlign(TextAlign.Center)
-        }
-        .width(36)
-        .height(36)
-        .justifyContent(FlexAlign.Center)
-        .alignItems(VerticalAlign.Center)
-        .backgroundColor(Tokens.Color.surfaceHover)
-        .borderRadius(Tokens.radius.sm)
-        .onClick(() => {
-          router.back();
-        })
-
-        Column() {
-          Text('CLOUD SYNC')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.accent)
-            .fontWeight(FontWeight.Bold)
-            .letterSpacing(1.2)
-          Text('账号与同步')
-            .fontSize(Tokens.fontSize.headline)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(Tokens.Color.text)
-            .margin({ top: Tokens.space.xs2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .margin({ left: Tokens.space.sm })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
+      PageHeader({
+        title: '账号与同步',
+        subtitle: '登录后可与桌面端双向同步配置'
+      })
 
       Scroll() {
         Column() {
@@ -100,7 +69,7 @@ struct AccountSyncPage {
               .backgroundColor(Tokens.Color.accent)
               .borderRadius(Tokens.radius.xs)
               .margin({ right: Tokens.space.xs })
-            Text('与桌面端 ssh-tool 共用同一账号即可双向同步。仅同步主机、端口转发与分组；外观、片段、known_hosts、跳板与终端设置为本机专有，不上云。')
+            Text('与桌面端 ssh-tool 共用同一账号即可双向同步。仅同步主机、端口转发与分组；外观、片段、主机指纹、跳板与终端设置为本机专有，不上云。')
               .fontSize(Tokens.fontSize.caption)
               .fontColor(Tokens.Color.textDim)
               .layoutWeight(1)
@@ -164,7 +133,6 @@ struct AccountSyncPage {
     .width('100%')
     .height('100%')
     .padding({
-      top: Tokens.space.md,
       left: Tokens.space.md,
       right: Tokens.space.md,
       bottom: 0
@@ -178,16 +146,10 @@ struct AccountSyncPage {
     Column() {
       Row() {
         Column() {
-          Text('STATUS')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.accent)
-            .fontWeight(FontWeight.Bold)
-            .letterSpacing(1)
           Text('同步状态')
             .fontSize(Tokens.fontSize.title)
             .fontWeight(FontWeight.Bold)
             .fontColor(Tokens.Color.text)
-            .margin({ top: Tokens.space.xs2 })
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
@@ -261,16 +223,10 @@ struct AccountSyncPage {
   AuthForm() {
     Column() {
       Column() {
-        Text('ACCOUNT ACCESS')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('登录 / 注册')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
         Text('账号密码只用于身份认证。解密云端配置需要独立的同步密码。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
@@ -345,7 +301,7 @@ struct AccountSyncPage {
             this.run(this.vm.login());
           })
 
-        Button('新用户注册')
+        Button('注册')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.text)
           .backgroundColor(Tokens.Color.surfaceHover)
@@ -372,16 +328,10 @@ struct AccountSyncPage {
   CreateVaultBlock() {
     Column() {
       Column() {
-        Text('VAULT SETUP')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('创建加密保险库')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
         Text('首次同步需设置独立的同步密码（至少 10 位）。用于在本地派生端到端加密密钥，服务端无法解密。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
@@ -429,7 +379,7 @@ struct AccountSyncPage {
       .alignItems(HorizontalAlign.Start)
       .width('100%')
 
-      Button('创建保险库并开始同步')
+      Button('创建保险库')
         .fontSize(Tokens.fontSize.body)
         .fontWeight(FontWeight.Medium)
         .fontColor(Tokens.Color.onAccent)
@@ -442,10 +392,12 @@ struct AccountSyncPage {
           this.run(this.vm.createVault());
         })
 
-      Button('退出当前账号')
+      Button('退出登录')
         .fontSize(Tokens.fontSize.caption)
-        .fontColor(Tokens.Color.danger)
-        .backgroundColor(Color.Transparent)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.Color.onAccent)
+        .backgroundColor(Tokens.Color.danger)
+        .borderRadius(Tokens.radius.sm)
         .height(36)
         .width('100%')
         .margin({ top: Tokens.space.xs })
@@ -466,11 +418,10 @@ struct AccountSyncPage {
   RepairEnvelopeBlock() {
     Column() {
       Column() {
-        Text('ACTION REQUIRED')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.warn)
+        Text('需要处理')
+          .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
+          .fontColor(Tokens.Color.warn)
         Text('保险库信封需要修复')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
@@ -523,7 +474,7 @@ struct AccountSyncPage {
       .alignItems(HorizontalAlign.Start)
       .width('100%')
 
-      Button('重新包装信封')
+      Button('重新包装')
         .fontSize(Tokens.fontSize.body)
         .fontWeight(FontWeight.Medium)
         .fontColor(Tokens.Color.onAccent)
@@ -548,16 +499,10 @@ struct AccountSyncPage {
   UnlockBlock() {
     Column() {
       Column() {
-        Text('VAULT LOCKED')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.warn)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('解锁保险库')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
         Text('云端同步文档已加密。请输入同步密码或使用应急恢复密钥进行解密。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
@@ -585,7 +530,7 @@ struct AccountSyncPage {
             this.vm.unlockPassword = v;
           })
 
-        Button('使用密码解锁')
+        Button('密码解锁')
           .fontSize(Tokens.fontSize.body)
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.Color.onAccent)
@@ -623,7 +568,7 @@ struct AccountSyncPage {
             this.vm.recoveryUnlock = v;
           })
 
-        Button('使用恢复密钥解锁')
+        Button('密钥解锁')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.text)
           .backgroundColor(Tokens.Color.surfaceHover)
@@ -638,10 +583,12 @@ struct AccountSyncPage {
       .alignItems(HorizontalAlign.Start)
       .width('100%')
 
-      Button('退出当前账号')
+      Button('退出登录')
         .fontSize(Tokens.fontSize.caption)
-        .fontColor(Tokens.Color.danger)
-        .backgroundColor(Color.Transparent)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.Color.onAccent)
+        .backgroundColor(Tokens.Color.danger)
+        .borderRadius(Tokens.radius.sm)
         .height(36)
         .width('100%')
         .margin({ top: Tokens.space.sm })
@@ -661,21 +608,15 @@ struct AccountSyncPage {
   SessionBlock() {
     Column() {
       Column() {
-        Text('ACTIONS')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('同步控制')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')
 
-      Button(this.isSyncing ? '正在同步中...' : '立即同步')
+      Button(this.isSyncing ? '同步中…' : '立即同步')
         .enabled(!this.isSyncing)
         .opacity(this.isSyncing ? 0.6 : 1.0)
         .fontSize(Tokens.fontSize.body)
@@ -691,7 +632,7 @@ struct AccountSyncPage {
             return;
           }
           this.isSyncing = true;
-          this.toast('开始同步配置...');
+          this.toast('开始同步配置…');
           this.vm.sync()
             .then(() => {
               this.isSyncing = false;
@@ -707,12 +648,12 @@ struct AccountSyncPage {
             })
             .catch((err: Object) => {
               this.isSyncing = false;
-              const msg: string = err instanceof Error ? err.message : '同步异常';
-              this.toast(`同步失败: ${msg}`);
+              const msg: string = err instanceof Error ? err.message : '';
+              this.toast(msg.length > 0 && msg.indexOf(' ') < 0 ? `同步失败：${msg}` : '操作失败，请重试');
             });
         })
 
-      Button('查看配置中心 (查看已同步主机与规则)')
+      Button('配置中心')
         .fontSize(Tokens.fontSize.caption)
         .fontColor(Tokens.Color.accent)
         .backgroundColor(Tokens.Color.surfaceHover)
@@ -730,10 +671,12 @@ struct AccountSyncPage {
         .margin({ top: Tokens.space.md, bottom: Tokens.space.xs })
 
       Row() {
-        Button('退出当前账号')
+        Button('退出登录')
           .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.textDim)
-          .backgroundColor(Color.Transparent)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.danger)
+          .borderRadius(Tokens.radius.sm)
           .height(34)
           .onClick(() => {
             this.run(this.vm.logout());
@@ -741,10 +684,12 @@ struct AccountSyncPage {
 
         Blank()
 
-        Button('退出所有设备')
+        Button('全部退出')
           .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.danger)
-          .backgroundColor(Color.Transparent)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.danger)
+          .borderRadius(Tokens.radius.sm)
           .height(34)
           .onClick(() => {
             this.run(this.vm.logoutAll());
@@ -765,16 +710,10 @@ struct AccountSyncPage {
   SensitiveBlock() {
     Column() {
       Column() {
-        Text('SECURITY')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('敏感凭据同步')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
         Text('主机登录密码与 SSH 私钥。出于安全考虑默认关闭。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
@@ -840,7 +779,7 @@ struct AccountSyncPage {
       if (this.vm.rotateHint) {
         Column() {
           Row() {
-            Text('⚠️ 建议轮换密钥')
+            Text('建议轮换密钥')
               .fontSize(Tokens.fontSize.body)
               .fontWeight(FontWeight.Bold)
               .fontColor(Tokens.Color.warn)
@@ -878,7 +817,7 @@ struct AccountSyncPage {
               this.vm.rotatePassword = v;
             })
 
-          Button('轮换密钥并清空历史')
+          Button('轮换密钥')
             .fontSize(Tokens.fontSize.body)
             .fontWeight(FontWeight.Medium)
             .fontColor(Tokens.Color.onAccent)
@@ -910,17 +849,11 @@ struct AccountSyncPage {
   ConflictBlock() {
     Column() {
       Column() {
-        Text('SYNC CONFLICT')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.warn)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
-        Text('检测到配置冲突')
+        Text('配置冲突')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.warn)
-          .margin({ top: Tokens.space.xs2 })
-        Text('云端版本与本机配置在同条目产生修改冲突，请选择解决方式：')
+        Text('检测到配置冲突：云端版本与本机配置在同条目产生修改冲突，请选择解决方式：')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
           .margin({ top: Tokens.space.xs2 })
@@ -953,7 +886,7 @@ struct AccountSyncPage {
       .margin({ top: Tokens.space.sm })
 
       Row() {
-        Button('保留本机修改')
+        Button('保留本机')
           .fontSize(Tokens.fontSize.body)
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.Color.onAccent)
@@ -965,7 +898,7 @@ struct AccountSyncPage {
             this.run(this.vm.resolveKeepLocal());
           })
 
-        Button('使用云端版本')
+        Button('使用云端')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.text)
           .backgroundColor(Tokens.Color.surfaceHover)
@@ -992,16 +925,10 @@ struct AccountSyncPage {
   DeviceBlock() {
     Column() {
       Column() {
-        Text('DEVICES')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('已授权设备')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')
@@ -1059,9 +986,10 @@ struct AccountSyncPage {
                   Button('撤销')
                     .fontSize(Tokens.fontSize.caption)
                     .fontColor(Tokens.Color.danger)
-                    .backgroundColor(Tokens.Color.surfaceHover)
+                    .backgroundColor(Tokens.Color.surface)
+                    .border({ width: 1, color: Tokens.Color.danger })
                     .borderRadius(Tokens.radius.xs)
-                    .height(28)
+                    .height(32)
                     .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
                     .onClick(() => {
                       this.run(this.vm.revokeDevice(d.id));
@@ -1127,16 +1055,10 @@ struct AccountSyncPage {
   HistoryBlock() {
     Column() {
       Column() {
-        Text('HISTORY')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('历史快照')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
         Text('可随时将云端配置回滚至指定历史版本')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
@@ -1163,7 +1085,7 @@ struct AccountSyncPage {
               }
               Row() {
                 Column() {
-                  Text(`Revision #${item.revision}`)
+                  Text(`版本 #${item.revision}`)
                     .fontSize(Tokens.fontSize.body)
                     .fontWeight(FontWeight.Medium)
                     .fontColor(Tokens.Color.text)
@@ -1175,7 +1097,7 @@ struct AccountSyncPage {
                 .alignItems(HorizontalAlign.Start)
                 .layoutWeight(1)
 
-                Button('回滚此版本')
+                Button('回滚')
                   .fontSize(Tokens.fontSize.caption)
                   .fontColor(Tokens.Color.text)
                   .backgroundColor(Tokens.Color.surfaceHover)
@@ -1209,16 +1131,10 @@ struct AccountSyncPage {
   AccountBlock() {
     Column() {
       Column() {
-        Text('ACCOUNT SECURITY')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('账号管理')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
-          .margin({ top: Tokens.space.xs2 })
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')
@@ -1258,7 +1174,7 @@ struct AccountSyncPage {
             this.vm.newPassword = v;
           })
 
-        Button('更新登录密码')
+        Button('更新密码')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.text)
           .backgroundColor(Tokens.Color.surfaceHover)
@@ -1304,11 +1220,11 @@ struct AccountSyncPage {
             this.vm.deletePassword = v;
           })
 
-        Button('注销并销毁所有数据')
+        Button('注销账号')
           .fontSize(Tokens.fontSize.body)
           .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.Color.danger)
-          .backgroundColor(Tokens.Color.surfaceHover)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.danger)
           .borderRadius(Tokens.radius.sm)
           .height(40)
           .width('100%')
@@ -1332,16 +1248,10 @@ struct AccountSyncPage {
   RecoveryBlock() {
     Column() {
       Column() {
-        Text('EMERGENCY RECOVERY')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.warn)
-          .fontWeight(FontWeight.Bold)
-          .letterSpacing(1)
         Text('应急恢复密钥')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.warn)
-          .margin({ top: Tokens.space.xs2 })
         Text('恢复密钥仅在此处展示一次，请妥善抄写并离线保存。若遗忘同步密码，该密钥是解密云端配置的唯一途径。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
@@ -1368,7 +1278,7 @@ struct AccountSyncPage {
       .borderRadius(Tokens.radius.sm)
       .margin({ top: Tokens.space.sm })
 
-      Button('我已妥善抄写并保存')
+      Button('已保存')
         .fontSize(Tokens.fontSize.body)
         .fontWeight(FontWeight.Medium)
         .fontColor(Tokens.Color.onAccent)

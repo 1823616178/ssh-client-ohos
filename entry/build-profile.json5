@@ -18,7 +18,11 @@
     {
       "name": "debug",
       "arkOptions": {
-        // 构建期注入的公开配置（DESIGN §6.5.1）：只放非敏感项，HAP 可解包，值即为明文常量
+        // 构建期注入的公开配置（DESIGN §6.5.1）：只放非敏感项，HAP 可解包，值即为明文常量。
+        // P6 HTTPS 就绪（docs/P6-HTTPS-READINESS.md / R-8）：运维挂好域名+证书后，
+        // 将 SYNC_API_URL 改为 https://<domain> 即可；在此之前保留明文 IP，
+        // 且 network_config.json 的 cleartext 白名单不得删。UI 明文告警由
+        // BuildConfig.shouldShowCleartextWarning() 在 https 时自动跳过。
         "buildProfileFields": {
           "SYNC_API_URL": "http://123.161.179.32:46926",
           "LOG_LEVEL": "debug",
@@ -31,7 +35,8 @@
     {
       "name": "release",
       "arkOptions": {
-        // release 与 debug 仅日志级别不同（DESIGN §6.5.1）
+        // release 与 debug 仅日志级别不同（DESIGN §6.5.1）。
+        // P6：上架前须将 SYNC_API_URL 切到 https://域名（docs/P6-HTTPS-READINESS.md）。
         "buildProfileFields": {
           "SYNC_API_URL": "http://123.161.179.32:46926",
           "LOG_LEVEL": "info",

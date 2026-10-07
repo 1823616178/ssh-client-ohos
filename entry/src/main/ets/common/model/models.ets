@@ -42,6 +42,15 @@ export interface HostProfile {
   envVars: Record<string, string>;
   /** 终端类型，默认 xterm-256color */
   termType: string;
+  /**
+   * 连接建立后自动附着 tmux 会话（本机专有，不上云）。
+   *
+   * 这是「断线不丢现场」的唯一真解：移动端再怎么保活也挡不住系统回收后台任务，
+   * 而远端 shell 一断，跑到一半的命令就没了。挂在 tmux 里则重连后原样回到现场。
+   */
+  tmuxAutoAttach: boolean;
+  /** tmux 会话名（空串 = 用 DEFAULT_TMUX_SESSION_NAME） */
+  tmuxSessionName: string;
 }
 
 /** 外观配置（DESIGN §5.2）；主题为独立实体，可被多个 HostProfile 引用并同步到云端 */
@@ -69,6 +78,15 @@ export interface AppearanceProfile {
   background: string;
   cursorColor: string;
   selectionColor: string;
+  /**
+   * A5：背景图路径（应用沙箱 / rawfile 路径；'' = 无背景图）。
+   * 本机专有，不参与云同步；TerminalCanvas 暂不合成，仅 Appearance 预览卡展示。
+   */
+  backgroundImagePath: string;
+  /** A5：背景图不透明度 0–1（预览与未来 canvas 合成用） */
+  backgroundImageOpacity: number;
+  /** A5：背景图模糊半径 vp（0 = 不模糊；canvas 合成 residual，见 A5 说明） */
+  backgroundBlur: number;
 }
 
 /** 命令片段（DESIGN §5.2） */
@@ -155,7 +173,9 @@ export function createDefaultHostProfile(id: string): HostProfile {
     jumpHostId: null,
     initCommands: [],
     envVars: {},
-    termType: 'xterm-256color'
+    termType: 'xterm-256color',
+    tmuxAutoAttach: false,
+    tmuxSessionName: ''
   };
 }
 
@@ -181,7 +201,11 @@ export function createDefaultAppearanceProfile(id: string): AppearanceProfile {
     foreground: '#E8EEFB',
     background: '#0E131D',
     cursorColor: '#4D8DFF',
-    selectionColor: '#26314A'
+    selectionColor: '#26314A',
+    // A5 默认：无背景图
+    backgroundImagePath: '',
+    backgroundImageOpacity: 1,
+    backgroundBlur: 0
   };
 }
 

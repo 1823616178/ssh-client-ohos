@@ -13,6 +13,14 @@
 # 用法：
 #   bash scripts/ci-local.sh
 #
+# 可选质量阶段（默认关闭，挂在上述四阶段之后，不改变既有快速失败语义）：
+#   CI_BENCH_GATE=1        Q2：bash scripts/bench/gate.sh（报告 BENCH_REPORT，默认 sample-report.json）
+#   CI_SECURITY_CHECK=1    Q4：check-logs.sh + check-hap.sh（无 HAP 时 check-hap 走 dry-run）
+#   CI_CVE_SCAN=1          Q4：cve-scan.sh（无 osv/nancy/trivy 时 stub 通过）
+#   CI_ASAN_HOST=1         Q3：asan-longrun.sh 且 RUN_ASAN=1（需要 WSL，同阶段 3）
+#   CI_DOCKER_SSHD=1       Q1：scripts/sshd-multi 多算法 sshd（无 docker 时跳过不红门禁）
+# 详见 docs/QUALITY-GATES.md。
+#
 # 可调环境变量（默认值即本机约定）：
 #   DEVECO_STUDIO     DevEco Studio 安装目录   默认 /c/Program Files/Huawei/DevEco Studio
 #   DEVECO_SDK_HOME   DevEco SDK 目录          默认 $DEVECO_STUDIO/sdk（hvigor 需要 Windows 风格路径）
@@ -169,6 +177,102 @@ stage_assemble() {
   log "HAP 产物：$HAP_PATH"
 }
 
+# ---------- 可选阶段（Q2/Q3/Q4；默认关闭） ----------
+# enable=1 时把 TOTAL_STAGES+1 并走同一 run_stage 框架，失败仍快速失败。
+run_optional_stage() {
+  local name="$1" func="$2" enable="$3"
+  if [ "$enable" != "1" ]; then
+    log "跳过可选阶段：$name（未设对应 CI_* 环境变量）"
+    return 0
+  fi
+  TOTAL_STAGES=$((TOTAL_STAGES + 1))
+  run_stage "$name" "$func"
+}
+
+stage_bench_gate() {
+  local report="${BENCH_REPORT:-scripts/bench/sample-report.json}"
+  local logfile="$LOG_DIR/stage-opt-bench.log"
+  bash "$PROJECT_ROOT/scripts/bench/gate.sh" "$report" > "$logfile" 2>&1 || {
+    echo "[ci] Q2 基准门禁失败：$logfile" >&2
+    return 1
+  }
+}
+
+stage_security_check() {
+  local logfile="$LOG_DIR/stage-opt-security.log"
+  {
+    bash "$PROJECT_ROOT/scripts/security/check-logs.sh" "$LOG_DIR"
+    local rc1=$?
+    # 阶段 4 已可能产出 HAP；check-hap 无 HAP 时 dry-run 退出 0
+    if [ -n "${HAP_PATH:-}" ] && [ -f "${HAP_PATH:-}" ]; then
+      bash "$PROJECT_ROOT/scripts/security/check-hap.sh" "$HAP_PATH"
+    else
+      bash "$PROJECT_ROOT/scripts/security/check-hap.sh"
+    fi
+    local rc2=$?
+    return $((rc1 != 0 ? rc1 : rc2))
+  } > "$logfile" 2>&1
+}
+
+stage_cve_scan() {
+  local logfile="$LOG_DIR/stage-opt-cve.log"
+  bash "$PROJECT_ROOT/scripts/security/cve-scan.sh" > "$logfile" 2>&1 || {
+    echo "[ci] Q4 CVE 扫描失败：$logfile" >&2
+    return 1
+  }
+}
+
+stage_asan_host() {
+  local logfile="$LOG_DIR/stage-opt-asan.log"
+  RUN_ASAN=1 bash "$PROJECT_ROOT/scripts/bench/asan-longrun.sh" > "$logfile" 2>&1 || {
+    echo "[ci] Q3 宿主 ASan 失败：$logfile" >&2
+    return 1
+  }
+}
+
+# Q1：Docker 多算法 sshd 集成环境（可选）。
+# 无 docker 时明确 SKIP 并返回 0——主路径已由 WSL 免 root sshd + 阶段 3 覆盖；
+# 本阶段只在 CI_DOCKER_SSHD=1 且本机 docker 可用时实跑 up + 端口探活。
+# x86_64 模拟器用例仍 blocked on device/SDK（见 scripts/sshd-multi/README.md）。
+stage_docker_sshd() {
+  local logfile="$LOG_DIR/stage-opt-docker-sshd.log"
+  if [ "${CI_DOCKER_SSHD:-0}" != "1" ]; then
+    log "跳过可选阶段：Q1 Docker sshd（未设 CI_DOCKER_SSHD=1）"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    log "CI_DOCKER_SSHD=1 但本机无 docker：SKIP（不判失败；宿主 sshd + native 测试仍覆盖主路径）"
+    echo "SKIP: docker not available on this host" > "$logfile"
+    return 0
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    log "docker 命令存在但 daemon 不可用：SKIP Q1 Docker sshd"
+    echo "SKIP: docker daemon not reachable" > "$logfile"
+    return 0
+  fi
+  {
+    echo "[ci] Q1 Docker 多算法 sshd：scripts/sshd-multi"
+    bash "$PROJECT_ROOT/scripts/sshd-multi/up.sh" --wait
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+      echo "[ci] Q1 sshd-multi 启动失败（详见日志）"
+      return $rc
+    fi
+    # 可选：把宿主 native 测试指到 docker sshd（需要 WSL 与 docker 端口连通）
+    if [ "${CI_DOCKER_SSHD_NATIVE:-0}" = "1" ]; then
+      wsl -d "$WSL_DISTRO" -- bash -lc \
+        "SSH_TEST_HOST=127.0.0.1 SSH_TEST_PORT=${SSH_TEST_DOCKER_PORT:-2222} \
+         SSH_TEST_USER=test SSH_TEST_PASSWORD=testpass \
+         bash '$WSL_PROJECT_ROOT/scripts/run-native-tests.sh'"
+    else
+      echo "[ci] 仅验证 sshd 容器就绪；CI_DOCKER_SSHD_NATIVE=1 时才把 native 测试指到 :2222"
+    fi
+  } > "$logfile" 2>&1 || {
+    echo "[ci] Q1 Docker sshd 阶段失败：$logfile" >&2
+    return 1
+  }
+}
+
 # ---------- 主流程 ----------
 log "项目根目录：$PROJECT_ROOT"
 log "日志目录：$LOG_DIR"
@@ -178,6 +282,19 @@ run_stage "ArkTS lint（codelinter）"      stage_lint
 run_stage "ArkTS 单元测试（hvigor test）"  stage_arkts_test
 run_stage "native 单元测试（WSL/gtest）"   stage_native_test
 run_stage "assembleHap"                  stage_assemble
+
+# 可选质量阶段（docs/QUALITY-GATES.md）：默认关闭，不改变上表四阶段语义
+run_optional_stage "Q2 基准门禁"         stage_bench_gate    "${CI_BENCH_GATE:-0}"
+run_optional_stage "Q4 安全自查脚本"      stage_security_check "${CI_SECURITY_CHECK:-0}"
+run_optional_stage "Q4 CVE 扫描"         stage_cve_scan      "${CI_CVE_SCAN:-0}"
+run_optional_stage "Q3 宿主 ASan"        stage_asan_host     "${CI_ASAN_HOST:-0}"
+# Q1 Docker sshd：函数内部处理「未启用 / 无 docker → skip」；启用且 docker 在时实跑
+if [ "${CI_DOCKER_SSHD:-0}" = "1" ]; then
+  TOTAL_STAGES=$((TOTAL_STAGES + 1))
+  run_stage "Q1 Docker 多算法 sshd" stage_docker_sshd
+else
+  log "跳过可选阶段：Q1 Docker sshd（未设 CI_DOCKER_SSHD=1）"
+fi
 
 print_summary "✅ 全部通过"
 exit 0

@@ -40,9 +40,24 @@ export interface CommittedDelta {
   backspaces: number;
 }
 
-/** 字符串码点数（退格按字符计，代理对如 emoji 只算 1 次） */
+/** 字符串码点数（退格按字符计，代理对如 emoji 只算 1 次）。不用 Array.from：ArkTS 下对代理对可能按 UTF-16 单元拆开。 */
 function codePointCount(s: string): number {
-  return Array.from(s).length;
+  let n = 0;
+  let i = 0;
+  while (i < s.length) {
+    const code = s.charCodeAt(i);
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < s.length) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        i += 2;
+        n++;
+        continue;
+      }
+    }
+    i++;
+    n++;
+  }
+  return n;
 }
 
 /**
@@ -142,6 +157,12 @@ export struct ImeInputSink {
    * 消费映射，可打印键放行」；返回 true 表示已消费不再进 IME
    */
   onInterceptKey: (event: KeyEvent) => boolean = () => false;
+  /**
+   * T10：外接键盘活跃时置 false——聚焦本承接框**不**拉起软键盘
+   * （enableKeyboardOnFocus=false；物理键仍经 onKeyPreIme 进宿主）。
+   * 默认 true 保持移动端 IME 原路径。@Prop：宿主 T10 抑制状态变更时跟随重建。
+   */
+  @Prop enableSoftKeyboardOnFocus: boolean = true;
 
   private controller: TextInputController = new TextInputController();
   /** 上次已提交基线（候选期不更新，见头注） */
@@ -189,7 +210,7 @@ export struct ImeInputSink {
       .height(1)
       .opacity(0.01) // 保持 focusable 的最小可见度（0 会被渲染管线裁掉）
       .showUnderline(false)
-      .enableKeyboardOnFocus(true)
+      .enableKeyboardOnFocus(this.enableSoftKeyboardOnFocus)
       .defaultFocus(this.autoFocus)
       .hitTestBehavior(HitTestMode.None) // 永不拦截触摸，点击全归终端画布
       .onChange((value: string, previewText?: PreviewText) => {

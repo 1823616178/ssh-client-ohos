@@ -273,23 +273,21 @@ function mapTildeKey(n: number, shift: boolean, alt: boolean, ctrl: boolean): Ui
   return asciiBytes(`\x1b[${n};${mod}~`);
 }
 
-/** F1–F12：F1–F4 尾字符型（SS3 P/Q/R/S），F5–F12 波浪号型 */
+/** F1–F12：无修饰 F1–F4 固定 SS3（ESC O P/Q/R/S），带修饰转 CSI；F5–F12 波浪号型 */
 function mapFunctionKey(keyCode: number, shift: boolean, alt: boolean, ctrl: boolean): Uint8Array | null {
   if (keyCode < KEY_F1 || keyCode > KEY_F12) {
     return null;
   }
   const n = keyCode - KEY_F1 + 1; // 1..12
-  switch (n) {
-    case 1:
-      return mapFinalCharKey('P', false, shift, alt, ctrl, false);
-    case 2:
-      return mapFinalCharKey('Q', false, shift, alt, ctrl, false);
-    case 3:
-      return mapFinalCharKey('R', false, shift, alt, ctrl, false);
-    case 4:
-      return mapFinalCharKey('S', false, shift, alt, ctrl, false);
-    default:
-      break;
+  const finals: string[] = ['P', 'Q', 'R', 'S'];
+  if (n <= 4) {
+    const finalChar: string = finals[n - 1];
+    const mod: number = modifierParam(shift, alt, ctrl);
+    if (mod === 1) {
+      // xterm PC-Style Function Keys：未修饰 F1–F4 一律 SS3，与 DECCKM 无关
+      return asciiBytes('\x1bO' + finalChar);
+    }
+    return asciiBytes(`\x1b[1;${mod}${finalChar}`);
   }
   // xterm 表：F5=15、F6=17、F7=18、F8=19、F9=20、F10=21、F11=23、F12=24
   const tildeCodes: number[] = [15, 17, 18, 19, 20, 21, 23, 24];

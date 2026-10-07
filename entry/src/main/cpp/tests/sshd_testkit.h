@@ -375,6 +375,7 @@ SshdInstance StartSshd(const std::string &sshdPath, const std::string &rt)
             while (std::fgets(line, sizeof(line), f) != nullptr) {
                 if (std::strstr(line, "Server listening on") != nullptr) {
                     std::fclose(f);
+                    // 不做 connect 探活：sshd -d 是单连接调试模式，探活会把唯一一次 accept 吃掉
                     return inst;
                 }
             }

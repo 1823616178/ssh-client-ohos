@@ -248,6 +248,9 @@ GoogleTest 获取策略（脚本头部注释有完整说明）：本地 `GOOGLET
 - **路线选择**：DESIGN §9 允许「x86_64-linux-ohos 或宿主机 clang」二选一。x86_64-linux-ohos
   二进制依赖 OHOS musl 运行时，WSL/普通 Linux CI 无法直接执行，故选**宿主机 clang +
   宿主机版依赖**；`TARGET=ohos-x86_64` 的交叉编译仅作为「OHOS 工具链下可编译」的看护。
+- **x86_64 模拟器用例仍 blocked on device/SDK**（Q1 残留）：即使交叉编译通过，也需
+  hdc 投递到 x86_64 模拟器并在 OHOS musl 环境内执行；当前无稳定模拟器 SDK 流水线，
+  故 CI 不依赖该路径。Docker 多算法 sshd（`scripts/sshd-multi/`）只服务**宿主机**集成测试。
 - **S2 黄金向量测试的可迁移性**：宿主机跑密码学测试时链接宿主机版 OpenSSL/libargon2
   （`apt install libssl-dev libargon2-dev` 或源码编，S2 时接入 tests CMake）。
   可迁移的前提是——libargon2 是参考实现（且 OHOS 侧固定 `OPTTARGET=generic` 走 `ref.c`，

@@ -48,14 +48,23 @@ import { SshError, SshErrorCode } from '../common/SshError';
 import { Logger } from '../common/utils/Logger';
 import { HostProfile } from '../common/model/models';
 import { recordHostLastUsed } from '../viewmodel/HostListViewModel';
+import { AppDatabase } from '../repository/AppDatabase';
 import {
   SshEvent,
   SshEventListener,
   SshNativeSession,
   SshSessionStateName
 } from '../napi/SshNative';
+import { AgentAuthPort, NativeAgentAuthPort, agentKeyIdForHost } from '../napi/AgentAuth';
 import { CredentialKind, CredentialStore } from '../repository/CredentialStore';
 import { SessionControl, SessionCountListener } from './background/SessionControl';
+import {
+  JumpHostBrief,
+  JumpHostLookup,
+  ProxyJumpOrchestration,
+  orchestrateProxyJumpPlan,
+  proxyJumpGapSummary
+} from './portforward/ProxyJump';
 
 const LOG_TAG: string = 'SessionManager';
 
@@ -79,7 +88,9 @@ const ALL_SESSION_STATE_NAMES: SshSessionStateName[] = [
 /** 触发 dirty 唤醒的事件类型：远端输出可能到达（channelData / terminal*） */
 const DIRTY_EVENT_TYPES: string[] = [
   'channelData', 'terminalOpen', 'terminalData', 'terminalClose',
-  'terminalBell', 'terminalTitle', 'terminalMouseMode'
+  'terminalBell', 'terminalTitle', 'terminalMouseMode',
+  // T10 stub：DECCKM 模式切换也会改变后续按键编码与 alt-screen 方向键形态
+  'terminalCursorKeys'
 ];
 
 /** stateChange 事件的 to 字段是否为合法状态名 */
@@ -115,6 +126,8 @@ export interface NativeSessionLike {
   connect(host: string, port: number, username: string): boolean;
   authenticatePassword(password: string): boolean;
   authenticatePublicKey(privateKey: ArrayBuffer | string, publicKey: string, passphrase: string): boolean;
+  /** N9：应用内 agent 认证（keyId 须已在进程级 agent 中解锁） */
+  authenticateAgent(keyId: string): boolean;
   setKeepalive(intervalSec: number, maxMisses: number): boolean;
   /** P1：网络切换后主动探测（仅 established 受理，false = 未受理） */
   probeNow(timeoutSec: number): boolean;
@@ -123,6 +136,49 @@ export interface NativeSessionLike {
   close(): void;
   /** native 句柄（只读；U4 装配终端用，业务层不应直接触碰） */
   readonly nativeHandle: number;
+  /**
+   * N16：把跳板 direct-tcpip 通道注册为本会话传输层。
+   * native SshSession 尚未抽象传输层时方法不存在；supportsChainedJump 探测用。
+   */
+  connectViaJumpChannel?(forwardHandle: number): boolean;
+}
+
+/** N16：具备串联传输层 API 的 native 会话（生产 SshNativeSession 目前不满足） */
+export interface ChainedNativeSession extends NativeSessionLike {
+  connectViaJumpChannel(forwardHandle: number): boolean;
+}
+
+/** 运行时探测：session 是否具备 connectViaJumpChannel */
+export function asChainedNativeSession(session: NativeSessionLike): ChainedNativeSession | null {
+  const candidate: ChainedNativeSession = session as ChainedNativeSession;
+  if (typeof candidate.connectViaJumpChannel === 'function') {
+    return candidate;
+  }
+  return null;
+}
+
+/** N16：HostProfile 窄口 → JumpHostLookup（ArkTS 禁止无接口对象字面量方法） */
+class HostProfileJumpLookup implements JumpHostLookup {
+  private readonly getter: (id: string) => HostProfile | null;
+
+  constructor(getter: (id: string) => HostProfile | null) {
+    this.getter = getter;
+  }
+
+  getById(id: string): JumpHostBrief | null {
+    const p: HostProfile | null = this.getter(id);
+    if (p === null) {
+      return null;
+    }
+    const brief: JumpHostBrief = {
+      id: p.id,
+      host: p.host,
+      port: p.port,
+      username: p.username,
+      jumpHostId: p.jumpHostId
+    };
+    return brief;
+  }
 }
 
 /** native 会话工厂：生产 = SshNativeSession.create，测试 = fake 工厂 */
@@ -157,6 +213,23 @@ export interface SessionManagerDeps {
   getSecret?: SecretProvider;
   scheduler?: ReconnectScheduler;
   newSessionId?: () => string;
+  /** N9：应用内 agent（缺省 = NativeAgentAuthPort） */
+  agentAuth?: AgentAuthPort;
+  /**
+   * N16：主机库窄口（生产 = AppDatabase.hosts().getById；测试 = fake）。
+   * jumpHostId 链展开用；未注入时 jump 路径按「主机缺失」阻断（不挂起）。
+   */
+  getJumpHost?: (id: string) => HostProfile | null;
+  /**
+   * N16：native 是否支持会话级串联传输层。
+   * 缺省：NativeSessionLike 上存在 connectViaJumpChannel 函数。
+   */
+  supportsChainedJump?: (session: NativeSessionLike | null) => boolean;
+  /**
+   * N16：在已建立会话上 openDirectTcpip（跳板下一跳数据面探测）。
+   * 参数 sessionId 为跳板主机 id（编排层约定），返回句柄；0 = 未受理。
+   */
+  openDirectTcpipOn?: (hostId: string, host: string, port: number) => number;
 }
 
 /** 会话事件监听器（全量事件透传：stateChange / hostKey / channel 系 / terminal 系等） */
@@ -224,10 +297,12 @@ interface SessionRecord {
 
 /** 认证材料（只在拨号调用栈内短暂存在，绝不入 SessionInfo/日志） */
 interface AuthMaterial {
-  method: 'password' | 'key';
+  method: 'password' | 'key' | 'agent';
   password: string;
   privateKey: string;
   passphrase: string;
+  /** N9：agent 认证的托管 keyId（method==='agent' 时有效；约定 = host.id） */
+  agentKeyId: string;
 }
 
 /** 每次拨号的事件源标记：记录本任句柄，用于丢弃上一任句柄的迟到事件 */
@@ -250,6 +325,13 @@ export class SessionManager implements SessionControl {
   private readonly getSecret: SecretProvider;
   private readonly scheduler: ReconnectScheduler;
   private readonly newSessionId: () => string;
+  private readonly agentAuth: AgentAuthPort;
+  /** N16：主机库（jumpHostId 展开） */
+  private readonly getJumpHost: (id: string) => HostProfile | null;
+  private readonly supportsChainedJump: (session: NativeSessionLike | null) => boolean;
+  private readonly openDirectTcpipOn: ((hostId: string, host: string, port: number) => number) | null;
+  /** N16 编排过程中创建的跳板临时会话（gap/失败时关闭；成功串联前不入 sessions 表） */
+  private readonly jumpHops: NativeSessionLike[] = [];
   /** sessionId ↔ 会话记录（与 native 句柄一一对应，绝不复用句柄） */
   private readonly sessions: Map<string, SessionRecord> = new Map();
   /** paneId → sessionId（反向经 SessionInfo.paneId；一个窗格最多绑一个会话） */
@@ -270,6 +352,20 @@ export class SessionManager implements SessionControl {
         CredentialStore.getSecret(hostId, kind));
     this.scheduler = deps?.scheduler ?? new SystemReconnectScheduler();
     this.newSessionId = deps?.newSessionId ?? ((): string => util.generateRandomUUID());
+    this.agentAuth = deps?.agentAuth ?? new NativeAgentAuthPort();
+    this.getJumpHost = deps?.getJumpHost ?? ((id: string): HostProfile | null => {
+      // 生产：AppDatabase.hosts().getById；未初始化 DB 的环境（单测）安全返回 null
+      try {
+        const dao = AppDatabase.hosts();
+        return dao.getById(id);
+      } catch (_e) {
+        return null;
+      }
+    });
+    this.supportsChainedJump = deps?.supportsChainedJump ??
+      ((session: NativeSessionLike | null): boolean =>
+        session !== null && typeof session.connectViaJumpChannel === 'function');
+    this.openDirectTcpipOn = deps?.openDirectTcpipOn ?? null;
   }
 
   /**
@@ -277,6 +373,17 @@ export class SessionManager implements SessionControl {
    * connect → authenticate*；任一环节未被受理即抛 SshError 且不留资源。
    * 后续状态迁移（handshaking/authenticating/established…）经事件异步推进，
    * 返回的 SessionInfo 即 UI 订阅入口。
+   *
+   * N16 ProxyJump 编排（DESIGN §3.3/§7.3）：
+   *   host.jumpHostId 非空时：
+   *     1. planProxyJumpPath 展开 hop 链（service/portforward/ProxyJump.ets）；
+   *     2. orchestrateProxyJumpPlan 生成 dial / openChannel / chainTransport /
+   *        gap 步骤；transport 未打通时 gap 步骤给出中文缺口说明；
+   *     3. 尝试拨号第一跳并在其上 openDirectTcpip 到下一跳（受理语义）；
+   *     4. 串联传输层未打通 → **目标主机显式 error 态 + proxyJumpGapSummary
+   *        中文说明**，关闭跳板临时会话，**绝不 dialNative 目标、绝不挂起**；
+   *     5. native 具备 connectViaJumpChannel 时走串联路径（当前生产恒无）。
+   *   缺口注记：SshNative.proxyJumpTransportNotes() / ssh/forward.h。
    */
   async connect(host: HostProfile): Promise<SessionInfo> {
     // 取凭据要走 ASSET 系统服务（异步）；这两条日志把「卡在取凭据」和
@@ -297,6 +404,22 @@ export class SessionManager implements SessionControl {
     // 先入表再拨号：事件（理论上）最早可在 connect 受理后到达
     this.sessions.set(info.sessionId, record);
     try {
+      // N16：jumpHostId 非空时先编排跳板；blocked → 显式错误态（不拨号、不挂起）
+      if (host.jumpHostId !== null && host.jumpHostId.length > 0) {
+        const jump: ProxyJumpOrchestration = this.orchestrateProxyJump(host);
+        if (jump.blocked) {
+          record.info.state = 'error';
+          record.info.errorMessage = jump.errorMessage;
+          record.info.errorCodeName = 'proxy_jump_gap';
+          Logger.error(
+            `ProxyJump 编排阻断（主机=${host.name}）: ${jump.errorMessage}`,
+            LOG_TAG
+          );
+          recordHostLastUsed(host.id);
+          this.notifySessionCount();
+          return info;
+        }
+      }
       this.dialNative(record, auth);
     } catch (err) {
       this.sessions.delete(info.sessionId);
@@ -309,6 +432,140 @@ export class SessionManager implements SessionControl {
     recordHostLastUsed(host.id);
     this.notifySessionCount();
     return info;
+  }
+
+  /**
+   * N16 ProxyJump 编排（additive）：规划 hop 链 → 尝试第一跳拨号 + 下一跳
+   * direct-tcpip → 传输层未打通则 blocked=true（调用方置目标 error，不挂起）。
+   * 测试经 SessionManagerDeps 注入 getJumpHost / openDirectTcpipOn / supportsChainedJump。
+   */
+  orchestrateProxyJump(host: HostProfile): ProxyJumpOrchestration {
+    const targetBrief: JumpHostBrief = {
+      id: host.id,
+      host: host.host,
+      port: host.port,
+      username: host.username,
+      jumpHostId: host.jumpHostId
+    };
+    const lookup: JumpHostLookup = new HostProfileJumpLookup(this.getJumpHost);
+    // transportReady：生产恒 false（native 未抽象传输层）；测试可注入 true
+    const transportReady: boolean = this.supportsChainedJump(null);
+    const orch: ProxyJumpOrchestration = orchestrateProxyJumpPlan(targetBrief, lookup, transportReady);
+    Logger.info(
+      `ProxyJump 规划 host=${host.name} hops=${orch.path === null ? 0 : orch.path.length} ` +
+        `blocked=${orch.blocked} transportReady=${transportReady}`,
+      LOG_TAG
+    );
+    for (const step of orch.steps) {
+      Logger.info(`ProxyJump step ${step.kind}: ${step.message}`, LOG_TAG);
+    }
+    if (orch.blocked && orch.firstHop === null) {
+      // 路径无效：无第一跳可拨
+      return orch;
+    }
+    if (orch.firstHop === null) {
+      return orch;
+    }
+    // 尝试第一跳真实拨号（受理语义；失败即 blocked，不重试、不挂起）
+    const hop: JumpHostBrief = orch.firstHop;
+    const hopUser: string = hop.username.length > 0 ? hop.username : host.username;
+    let hopSession: NativeSessionLike | null = null;
+    try {
+      hopSession = this.createNativeSession((event: SshEvent) => {
+        // 跳板临时会话事件只记日志，不驱动目标 SessionInfo
+        Logger.info(`ProxyJump hop(${hop.host}) event=${event.type}`, LOG_TAG);
+      });
+      if (hopSession === null) {
+        orch.blocked = true;
+        orch.errorMessage = `跳板会话创建失败：${hop.host}:${hop.port}`;
+        return orch;
+      }
+      hopSession.setKeepalive(host.keepalive, KEEPALIVE_MAX_MISSES);
+      if (!hopSession.connect(hop.host, hop.port, hopUser)) {
+        orch.blocked = true;
+        orch.errorMessage = `跳板主机拨号未被受理：${hopUser}@${hop.host}:${hop.port}`;
+        hopSession.close();
+        return orch;
+      }
+      this.jumpHops.push(hopSession);
+      Logger.info(`ProxyJump 第一跳拨号已受理：${hopUser}@${hop.host}:${hop.port}`, LOG_TAG);
+
+      const next: JumpHostBrief | null = orch.nextAfterFirst;
+      if (next !== null) {
+        let channelHandle: number = 0;
+        if (this.openDirectTcpipOn !== null) {
+          channelHandle = this.openDirectTcpipOn(hop.id, next.host, next.port);
+        }
+        Logger.info(
+          `ProxyJump openDirectTcpip ${hop.host} → ${next.host}:${next.port} handle=${channelHandle}`,
+          LOG_TAG
+        );
+        if (this.openDirectTcpipOn !== null && channelHandle <= 0) {
+          orch.blocked = true;
+          orch.errorMessage =
+            `跳板通道未受理：${hop.host} → ${next.host}:${next.port}（目标 ${host.host} 不可达）`;
+          this.closeJumpHops();
+          return orch;
+        }
+        if (!transportReady) {
+          // 串联未打通：显式错误 + 缺口说明；关闭跳板临时会话；绝不挂起
+          orch.blocked = true;
+          orch.errorMessage =
+            `${host.host}：${proxyJumpGapSummary()}` +
+            ` 目标会话不可用（jumpHostId=${host.jumpHostId ?? ''}）。` +
+            '剩余 native 工作：SshSession 抽象通道传输层（LIBSSH2_CALLBACK_SEND/RECV）。';
+          this.closeJumpHops();
+          return orch;
+        }
+        // transportReady：native 具备串联 API 时注册通道为下级传输层
+        const chainedSession: ChainedNativeSession | null = asChainedNativeSession(hopSession);
+        if (chainedSession !== null) {
+          const ok: boolean = chainedSession.connectViaJumpChannel(channelHandle);
+          Logger.info(`ProxyJump connectViaJumpChannel handle=${channelHandle} ok=${ok}`, LOG_TAG);
+          if (!ok) {
+            orch.blocked = true;
+            orch.errorMessage = `跳板传输层注册失败：${next.host}（native connectViaJumpChannel 拒绝）`;
+            this.closeJumpHops();
+            return orch;
+          }
+        } else {
+          // 声明 transportReady 但会话无串联 API：仍按缺口阻断，不挂起
+          orch.blocked = true;
+          orch.errorMessage =
+            `${host.host}：${proxyJumpGapSummary()}` +
+            '（supportsChainedJump=true 但 NativeSessionLike 无 connectViaJumpChannel）';
+          this.closeJumpHops();
+          return orch;
+        }
+      } else if (!transportReady && orch.steps.some((s) => s.kind === 'gap')) {
+        orch.blocked = true;
+        orch.errorMessage = `${host.host}：${proxyJumpGapSummary()}`;
+        this.closeJumpHops();
+        return orch;
+      }
+      return orch;
+    } catch (err) {
+      orch.blocked = true;
+      orch.errorMessage = err instanceof Error
+        ? `跳板编排异常：${err.message}`
+        : '跳板编排异常';
+      this.closeJumpHops();
+      return orch;
+    }
+  }
+
+  /** 关闭 N16 编排产生的跳板临时会话（幂等） */
+  private closeJumpHops(): void {
+    while (this.jumpHops.length > 0) {
+      const hop: NativeSessionLike | undefined = this.jumpHops.pop();
+      if (hop !== undefined) {
+        try {
+          hop.close();
+        } catch (_e) {
+          // 忽略：fake/native close 幂等
+        }
+      }
+    }
   }
 
   /** 优雅关闭（幂等）：取消在途重连 → close native → 解绑窗格 → 摘表 */
@@ -338,6 +595,7 @@ export class SessionManager implements SessionControl {
 
   /** 应用退出入口（§7.5，幂等）：优雅关闭全部会话 */
   closeAll(): void {
+    this.closeJumpHops();
     const ids: string[] = [];
     this.sessions.forEach((record: SessionRecord, sessionId: string) => {
       ids.push(sessionId);
@@ -675,7 +933,7 @@ export class SessionManager implements SessionControl {
 
   // ---------------------------------------------------------------- 内部：拨号与认证
 
-  /** 按 authType 取凭据（agent 暂未实现，显式报错）；凭据缺失抛 SshError，不建任何资源 */
+  /** 按 authType 取凭据；凭据缺失抛 SshError，不建任何资源 */
   private async prepareAuth(host: HostProfile): Promise<AuthMaterial> {
     switch (host.authType) {
       case 'password': {
@@ -686,7 +944,9 @@ export class SessionManager implements SessionControl {
           throw new SshError(SshErrorCode.CREDENTIAL_MISSING,
             '凭据库中没有该主机的登录密码，请先在主机配置中保存密码');
         }
-        return { method: 'password', password: password, privateKey: '', passphrase: '' };
+        return {
+          method: 'password', password: password, privateKey: '', passphrase: '', agentKeyId: ''
+        };
       }
       case 'key': {
         const privateKey: string | null = await this.getSecret(host.id, 'private_key');
@@ -695,10 +955,36 @@ export class SessionManager implements SessionControl {
             '凭据库中没有该主机的私钥，请先导入私钥');
         }
         const passphrase: string | null = await this.getSecret(host.id, 'passphrase');
-        return { method: 'key', password: '', privateKey: privateKey, passphrase: passphrase ?? '' };
+        return {
+          method: 'key', password: '', privateKey: privateKey, passphrase: passphrase ?? '',
+          agentKeyId: ''
+        };
       }
-      default:
-        throw new SshError(SshErrorCode.INTERNAL_ERROR, 'agent 认证暂未实现，请改用密码或密钥认证');
+      default: {
+        // N9：应用内 agent。keyId 约定 = host.id（见 napi/AgentAuth.ets）。
+        // 已解锁 → 直接走 authenticateAgent（多会话免密）；
+        // 未解锁 → 从凭据库取 private_key 解锁进 agent，再认证；
+        // 两条路都没有 → CREDENTIAL_MISSING（不是「暂未实现」）。
+        const keyId: string = agentKeyIdForHost(host);
+        if (keyId.length === 0) {
+          throw new SshError(SshErrorCode.INTERNAL_ERROR, '主机配置缺少 id，无法进行 agent 认证');
+        }
+        if (this.agentAuth.isLocked(keyId)) {
+          const privateKey: string | null = await this.getSecret(host.id, 'private_key');
+          if (privateKey === null) {
+            throw new SshError(SshErrorCode.CREDENTIAL_MISSING,
+              '应用内 agent 未解锁该主机的密钥，且凭据库中没有私钥。请先在密钥管理中导入私钥');
+          }
+          const passphrase: string | null = await this.getSecret(host.id, 'passphrase');
+          if (!this.agentAuth.unlock(keyId, privateKey, passphrase ?? '')) {
+            throw new SshError(SshErrorCode.CREDENTIAL_MISSING,
+              'agent 拒绝托管该私钥（格式不受支持），请改用 OpenSSH 或 PEM 格式');
+          }
+        }
+        return {
+          method: 'agent', password: '', privateKey: '', passphrase: '', agentKeyId: keyId
+        };
+      }
     }
   }
 
@@ -758,9 +1044,14 @@ export class SessionManager implements SessionControl {
     if (auth === null || session === null) {
       return;
     }
-    const accepted: boolean = auth.method === 'password'
-      ? session.authenticatePassword(auth.password)
-      : session.authenticatePublicKey(auth.privateKey, '', auth.passphrase);
+    let accepted: boolean = false;
+    if (auth.method === 'password') {
+      accepted = session.authenticatePassword(auth.password);
+    } else if (auth.method === 'agent') {
+      accepted = session.authenticateAgent(auth.agentKeyId);
+    } else {
+      accepted = session.authenticatePublicKey(auth.privateKey, '', auth.passphrase);
+    }
     if (accepted) {
       Logger.info(`会话 ${record.info.sessionId} 认证请求已受理（method=${auth.method}）`, LOG_TAG);
       return;

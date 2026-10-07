@@ -59,6 +59,8 @@ export interface TextRun {
   cellSpan: number;
   /** 最终前景色 ARGB */
   fgArgb: number;
+  /** 最终背景色 ARGB（文本段合并判定用；绘制仍以 backgrounds 为准） */
+  bgArgb: number;
   bold: boolean;
   italic: boolean;
   underline: boolean;
@@ -174,6 +176,7 @@ export function generateRowsCommands(view: DataView, startRow: number, rowCount:
           y: rowY + env.cellHeight / 2,
           cellSpan: span,
           fgArgb: style.fg,
+          bgArgb: style.bg,
           bold: style.bold,
           italic: style.italic,
           underline: style.underline,
@@ -201,7 +204,9 @@ function makeBgRun(startCol: number, endCol: number, rowY: number, argb: number,
 }
 
 function sameTextStyle(run: TextRun, style: ResolvedStyle): boolean {
-  return run.fgArgb === style.fg && run.bold === style.bold && run.italic === style.italic &&
+  // 背景也参与合并判定：默认底↔自定义底、reverse 互换等场景下同 fg 不可跨段合并
+  return run.fgArgb === style.fg && run.bgArgb === style.bg &&
+    run.bold === style.bold && run.italic === style.italic &&
     run.underline === style.underline && run.strike === style.strike;
 }
 
@@ -210,6 +215,31 @@ const CURSOR_BAR_MIN_WIDTH_VP = 1.5;
 const CURSOR_BAR_WIDTH_FRACTION = 0.15;
 const CURSOR_UNDERLINE_MIN_HEIGHT_VP = 1.5;
 const CURSOR_UNDERLINE_HEIGHT_FRACTION = 0.12;
+
+/**
+ * 光标闪烁整周期（ms）。常见终端 half≈530ms；这里整周期 1060ms，
+ * `cursorVisibleAt` 前半可见、后半不可见。
+ */
+export const CURSOR_BLINK_PERIOD_MS: number = 1060;
+
+/**
+ * 光标可见性纯函数（A3 residual）。
+ * blinkEnabled=false 或 periodMs 非法 → 恒可见（静止语义）；
+ * true 时按 now 相对周期的半段奇偶判定（floor 稳定，避免浮点边界抖动）。
+ */
+export function cursorVisibleAt(now: number, blinkEnabled: boolean, periodMs: number): boolean {
+  if (!blinkEnabled) {
+    return true;
+  }
+  if (!(periodMs > 0) || !Number.isFinite(now)) {
+    return true;
+  }
+  const half: number = Math.floor(periodMs / 2);
+  if (half <= 0) {
+    return true;
+  }
+  return (Math.floor(now / half) % 2) === 0;
+}
 
 /**
  * 生成光标绘制指令。
@@ -278,6 +308,7 @@ export function generateCursorCommands(style: CursorStyle, view: DataView | null
       y: rowY + env.cellHeight / 2,
       cellSpan: cellSpan,
       fgArgb: bg, // 反色：原背景当字形色
+      bgArgb: fg,
       bold: bold,
       italic: italic,
       underline: false,

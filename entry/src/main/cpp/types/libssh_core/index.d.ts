@@ -51,6 +51,8 @@ export const getArgon2Version: () => string;
  *   terminalBell：terminal（vterm bell，UI 触感）
  *   terminalTitle：terminal / title（OSC 标题变更）
  *   terminalMouseMode：terminal / mouseMode（0=关 1=点击 2=拖动 3=任意移动）
+ *   terminalCursorKeys（T10 stub，native 未实现）：terminal / applicationCursorKeys
+ *     （true=DECCKM 应用光标键，方向键发 SS3；对称 mouseMode 的会话级标志）
  *
  * 注意：channelData 与 channelClose 走两条独立 TSFN 队列（背压隔离），
  * 最后的 channelData 与 channelClose 之间不保证到达顺序——exec 场景以
@@ -91,6 +93,8 @@ export interface SshNativeEvent {
   title?: string;
   /** T3：terminalMouseMode 事件的模式（0=关 1=点击 2=拖动 3=任意移动） */
   mouseMode?: number;
+  /** T10 stub：terminalCursorKeys 事件的 DECCKM 标志（native 未实现前缺省） */
+  applicationCursorKeys?: boolean;
 }
 
 /**
@@ -177,6 +181,61 @@ export const setReconnectPolicy: (handle: number, delaysSec: number[], maxAttemp
 export const nextReconnectDelaySec: (handle: number, attempt: number) => number;
 
 // ------------------------------------------------------------------
+// N9 应用内 SSH Agent（进程级内存密钥托管，多会话复用，超时自动清除）
+// 语义详见 cpp/ssh/agent.h：unlock 成功 = 格式粗检 + 入库，有效性在首次
+// 认证时才验证；超时为惰性判定（公开 API 调用时检查滑动窗口）。
+// ------------------------------------------------------------------
+
+/** 解锁并托管私钥（keyId 由上层分配，如密钥 id / 主机配置 id） */
+export const agentUnlock: (
+  keyId: string,
+  privateKey: ArrayBuffer | string,
+  passphrase: string
+) => boolean;
+
+/** 锁定指定 keyId（清除托管材料）；不存在返回 false */
+export const agentLock: (keyId: string) => boolean;
+
+/** 锁定全部（幂等） */
+export const agentLockAll: () => boolean;
+
+/** keyId 是否锁定（不存在/已清除/已超时 → true） */
+export const agentIsLocked: (keyId: string) => boolean;
+
+/** 当前托管密钥条数 */
+export const agentKeyCount: () => number;
+
+/** 托管超时（分钟，0 = 永不超时；默认 0） */
+export const agentSetTimeout: (minutes: number) => boolean;
+
+export const agentTimeoutMinutes: () => number;
+
+/**
+ * 会话 agent 认证（仅 authenticating 受理）。从进程级 agent 取 keyId
+ * 托管的私钥/短语做公钥认证；未解锁/无 keyId 时返回 false，不消耗
+ * 认证重试计数（session.h 受理语义）
+ */
+export const authenticateAgent: (handle: number, keyId: string) => boolean;
+
+/**
+ * U3：生成 ed25519 密钥对（OpenSSL EVP）。
+ * 私钥为 PKCS#8 PEM（空短语 = BEGIN PRIVATE KEY；非空 = BEGIN ENCRYPTED PRIVATE KEY，
+ * AES-256-CBC）。公钥为 OpenSSH 单行 `ssh-ed25519 <b64> [comment]`。
+ * 失败返回 null。详见 cpp/ssh/keygen.h。
+ */
+export interface NativeAgentKeygenResult {
+  keyType: string;
+  privateKeyPem: string;
+  publicKeyLine: string;
+  comment: string;
+}
+
+export const agentKeygen: (
+  comment: string,
+  passphrase: string
+) => NativeAgentKeygenResult | null;
+
+// ------------------------------------------------------------------
 // T3 终端零拷贝快照（终端桥接；帧协议与生命周期保护的完整约定见
 // cpp/bridge/terminal_bridge.h 与 cpp/term/frame_sync.h 头注）
 //
@@ -222,6 +281,8 @@ export interface TerminalFrameSnapshot {
   altScreen: boolean;
   /** 鼠标上报模式：0=关 1=点击(1000) 2=拖动(1002) 3=任意移动(1003) */
   mouseMode: number;
+  /** T10 stub：DECCKM 应用光标键（native 未暴露前缺省 undefined/false） */
+  applicationCursorKeys?: boolean;
   bellCount: number;
   /** 回滚有效窗口 [scrollbackOldest, scrollbackTotal)，getScrollbackWindow 的查询基准 */
   scrollbackOldest: number;
@@ -382,3 +443,137 @@ export const vaultRewrap: (
 ) => VaultNativeCreateResult | null;
 export const vaultRotate: (handle: number, password: string) => VaultNativeCreateResult | null;
 export const vaultClose: (handle: number) => boolean;
+
+// ------------------------------------------------------------------
+// N14 SFTP（事件随所属会话 onEvent 上抛）
+// 事件 type：
+// - sftpOpen：sftp / success / error / message
+// - sftpList：sftp / success / path / error / message / entriesJson
+// - sftpStat：sftp / success / path / error / message / entryJson
+// - sftpOpDone：sftp / success / op / path / error / message / linkTarget
+// - sftpProgress：sftp / transferId / transferred / total
+// - sftpTransferDone：sftp / transferId / success / error / message /
+//   transferred / total
+// entriesJson / entryJson 字段见 SftpNativeEntry。
+// ------------------------------------------------------------------
+
+export interface SftpNativeEntry {
+  name: string;
+  path: string;
+  /** file | dir | symlink | other */
+  type: string;
+  size: number;
+  mtime: number;
+  mode: number;
+  /** "rwxr-xr-x" */
+  permissions: string;
+  linkTarget: string;
+}
+
+/**
+ * 在已 established 的会话上打开 SFTP 通道。
+ * 返回句柄（>0 = 已受理，打开结果经 sftpOpen 事件）；0 = 未受理
+ */
+export const sftpOpen: (sessionHandle: number) => number;
+
+/** 关闭 SFTP（幂等） */
+export const sftpClose: (sftpHandle: number) => boolean;
+
+/** 列目录；结果经 sftpList（entriesJson） */
+export const sftpList: (sftpHandle: number, path: string) => boolean;
+
+/** 路径 stat；结果经 sftpStat（entryJson） */
+export const sftpStat: (sftpHandle: number, path: string) => boolean;
+
+/**
+ * 下载远端文件到本地路径（应用沙箱内 POSIX 路径）。
+ * transferId 由上层分配（与 TransferQueue 对齐）；进度/终态经
+ * sftpProgress / sftpTransferDone
+ */
+export const sftpDownload: (
+  sftpHandle: number,
+  transferId: number,
+  remotePath: string,
+  localPath: string
+) => boolean;
+
+/** 上传本地文件到远端路径；事件同 sftpDownload */
+export const sftpUpload: (
+  sftpHandle: number,
+  transferId: number,
+  localPath: string,
+  remotePath: string
+) => boolean;
+
+/** 重命名；结果经 sftpOpDone（op=rename） */
+export const sftpRename: (sftpHandle: number, fromPath: string, toPath: string) => boolean;
+
+export const sftpMkdir: (sftpHandle: number, path: string, mode?: number) => boolean;
+
+export const sftpRmdir: (sftpHandle: number, path: string) => boolean;
+
+export const sftpUnlink: (sftpHandle: number, path: string) => boolean;
+
+export const sftpChmod: (sftpHandle: number, path: string, mode: number) => boolean;
+
+/** 读软链接目标；sftpOpDone.linkTarget */
+export const sftpReadlink: (sftpHandle: number, path: string) => boolean;
+
+// ------------------------------------------------------------------
+// N15 端口转发（事件随所属会话 onEvent 上抛）
+// 事件 type：
+// - forwardOpen：forward / success / error / message
+//   （direct-tcpip 数据通道打开结果）
+// - forwardData：forward / data（ArrayBuffer，远端→本端字节）
+// - forwardClose：forward / reason（peer_eof|local_close|error|session_lost）/ message
+// - forwardListen：forward（listen 句柄）/ success / boundPort / error / message
+//   （远程 -R 监听打开；sshd 需 AllowTcpForwarding）
+// - forwardAccept：forward（新数据通道句柄）/ listen（监听句柄）/ success / origin
+//   （origin 常为空：libssh2 未暴露 originator host:port）
+//
+// N16 ProxyJump 缺口：native 仅提供规划/注记 API；多级会话串联需要
+// SshSession 抽象传输层（LIBSSH2_CALLBACK_SEND/RECV），尚未打通。
+// ------------------------------------------------------------------
+
+/**
+ * 在已 established 的会话上打开 direct-tcpip 通道（-L / -D 的数据面）。
+ * 返回句柄（>0 = 已受理，打开结果经 forwardOpen）；0 = 未受理。
+ * host:port 为远端网络内可达目标；写入用 forwardWrite。
+ */
+export const openDirectTcpip: (
+  sessionHandle: number,
+  host: string,
+  port: number
+) => number;
+
+/**
+ * 向转发数据通道写入（ArrayBuffer 或 string）。
+ * false = 通道已关 / 背压拒收（4 MiB 上限，整次拒收，稍后重试）
+ */
+export const forwardWrite: (forwardHandle: number, data: ArrayBuffer | string) => boolean;
+
+/** 关闭转发数据通道或远程监听（幂等） */
+export const forwardClose: (forwardHandle: number) => boolean;
+
+/**
+ * 开启远程转发监听（-R）。bindAddress 空串 = 服务器默认；port 为远端监听端口。
+ * 返回 listen 句柄（>0 = 已受理，结果经 forwardListen）；0 = 未受理。
+ * 入站连接经 forwardAccept 上抛新数据通道句柄。
+ */
+export const remoteForwardListen: (
+  sessionHandle: number,
+  bindAddress: string,
+  port: number
+) => number;
+
+/** 取消远程监听（等价 forwardClose） */
+export const remoteForwardCancel: (listenHandle: number) => boolean;
+
+/** N16：ProxyJump 传输层设计注记（多行英文说明；诊断/文档用） */
+export const forwardProxyJumpNotes: () => string;
+
+/**
+ * N16：解析 OpenSSH ProxyJump 规格（-J 子集）。
+ * 返回 hops 的 JSON 数组字符串：[{username,host,port},…]；非法规格返回 "[]"。
+ */
+export const forwardParseJumpSpec: (spec: string) => string;

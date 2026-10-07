@@ -15,7 +15,10 @@
  * 无绘制后 ticker.stop()，displaySync 完全摘出 vsync 管线。
  * native 每次发布新网格 revision 后都会推送 terminalData，SessionManager 将其路由到
  * wakeup()；本地输入还会在 write 前预唤醒，使远端回显可直接赶上下一个 vsync。
- * 其他唤醒源：register / setVisible(true) / onAreaChange / 外观变更。
+ * 其他唤醒源：register / setVisible(true) / onAreaChange / 外观变更 /
+ * **U4 会话事件（terminalOpen/Close/Title、stateChange、terminalCursorKeys 等）**
+ * ——TerminalViewModel.onSessionEvent 对可见叶调 dirtyHook →
+ * TerminalPage.onContentDirty → FrameScheduler.get().wakeup()（T4 跟进项已接线）。
  *
  * 语义约定（全部有测试锚定）：
  *  - register：id 重复或空串抛 Error；注册即唤醒帧循环；

@@ -1,0 +1,60 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "SSH Terminal Client"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "SSH Terminal Client"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "SSH Client"
+    },
+    {
+      "name": "reason_vibrate",
+      "value": "Haptic feedback for keys and copy success"
+    },
+    {
+      "name": "reason_read_pasteboard",
+      "value": "Read clipboard content to paste into the terminal"
+    },
+    {
+      "name": "settings_title",
+      "value": "Settings"
+    },
+    {
+      "name": "settings_eyebrow",
+      "value": "SETTINGS"
+    },
+    {
+      "name": "settings_background_section",
+      "value": "Background & battery"
+    },
+    {
+      "name": "settings_background_keep_alive",
+      "value": "Keep alive in background"
+    },
+    {
+      "name": "settings_tools_section",
+      "value": "Tools"
+    },
+    {
+      "name": "settings_about_section",
+      "value": "About & compliance"
+    },
+    {
+      "name": "settings_about_open_source",
+      "value": "Open-source licenses"
+    },
+    {
+      "name": "settings_about_open_source_sub",
+      "value": "Third-party license summary"
+    },
+    {
+      "name": "nav_back",
+      "value": "Back"
+    }
+  ]
+}

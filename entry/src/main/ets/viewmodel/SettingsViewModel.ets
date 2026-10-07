@@ -5,6 +5,8 @@
  * 息屏断开分钟数与选项档位的互相换算，故单独放这里由 hypium 断言。
  */
 
+import { KeepScreenOnMode } from '../repository/SettingsRepository';
+
 /** 息屏断开档位 */
 export interface ScreenOffOption {
   readonly label: string;
@@ -71,4 +73,60 @@ export function backgroundSummary(keepAlive: boolean, screenOffMinutes: number):
     return head;
   }
   return `${head}；息屏满 ${screenOffMinutes} 分钟断开`;
+}
+
+// ---------------------------------------------------------------- 屏幕常亮
+
+/** 屏幕常亮档位 */
+export interface KeepScreenOnOption {
+  readonly label: string;
+  readonly mode: KeepScreenOnMode;
+}
+
+/**
+ * 可选档位。默认落在 `session`：终端页开着又有会话在跑，说明用户正等着远端输出，
+ * 此时息屏除了触发 §7.5 的后台降级链（进而断连接）没有别的作用。
+ */
+export const KEEP_SCREEN_ON_OPTIONS: KeepScreenOnOption[] = [
+  { label: '不常亮', mode: 'never' },
+  { label: '有会话时', mode: 'session' },
+  { label: '始终', mode: 'always' }
+];
+
+/** 档位标签数组（分段控件用） */
+export function keepScreenOnLabels(): string[] {
+  const labels: string[] = [];
+  for (const option of KEEP_SCREEN_ON_OPTIONS) {
+    labels.push(option.label);
+  }
+  return labels;
+}
+
+/** 档位 → 下标（未知值按默认档 session） */
+export function keepScreenOnOptionIndex(mode: KeepScreenOnMode): number {
+  for (let i: number = 0; i < KEEP_SCREEN_ON_OPTIONS.length; i++) {
+    if (KEEP_SCREEN_ON_OPTIONS[i].mode === mode) {
+      return i;
+    }
+  }
+  return 1;
+}
+
+/** 下标 → 档位（越界按默认档 session） */
+export function keepScreenOnModeOf(index: number): KeepScreenOnMode {
+  if (index < 0 || index >= KEEP_SCREEN_ON_OPTIONS.length) {
+    return 'session';
+  }
+  return KEEP_SCREEN_ON_OPTIONS[index].mode;
+}
+
+/** 当前档位的一句话说明 */
+export function keepScreenOnSummary(mode: KeepScreenOnMode): string {
+  if (mode === 'always') {
+    return '打开终端页就保持屏幕常亮';
+  }
+  if (mode === 'never') {
+    return '不干预系统息屏（息屏后按上面的后台策略处理）';
+  }
+  return '终端页有活跃会话时保持屏幕常亮，避免自动息屏后被系统回收后台任务';
 }

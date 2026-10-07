@@ -22,6 +22,9 @@
  */
 
 import { HostProfile } from '../common/model/models';
+import { buildAutoRunCommands, encodeAutoRunCommands } from '../common/utils/AutoRun';
+import { encodeSnippetForTerminal, snippetVarsOf } from '../common/utils/SnippetVars';
+import { utf8Bytes } from '../view/terminal/KeyMap';
 import { SshError, SshErrorCode } from '../common/SshError';
 import { CredentialStore } from '../repository/CredentialStore';
 import { Logger } from '../common/utils/Logger';
@@ -29,6 +32,7 @@ import { SshEvent, SshNativeSession } from '../napi/SshNative';
 import { SshTerminal } from '../napi/SshTerminal';
 import { AppDatabase } from '../repository/AppDatabase';
 import { SessionManager } from '../service/SessionManager';
+import { SnippetSendHub } from '../view/terminal/SnippetSendHub';
 import {
   DividerRect,
   PANE_DIVIDER_SIZE_VP,
@@ -516,6 +520,13 @@ export class TerminalViewModel {
   @Trace focusedPaneId: string = '';
   /** 当前断点（由视口宽度派生；默认 sm，页面 onAreaChange 后校正） */
   @Trace breakpoint: PaneBreakpoint = 'sm';
+  /**
+   * T10 DECCKM：会话级应用光标键模式（native terminalCursorKeys 事件驱动；
+   * 未暴露前恒 false）。页面透传给 TerminalCanvas / KeyBar → mapKeyEvent。
+   */
+  @Trace applicationCursorKeys: boolean = false;
+  /** sessionId → 最近 mouseMode（terminalMouseMode 事件；页面可读） */
+  @Trace focusedMouseMode: number = 0;
   /** 关末叶/末标签后为 true，页面据此返回列表 */
   @Trace shouldExit: boolean = false;
   /** 密码补录框（凭据库里没有该主机密码时弹出，替代「无法进入终端」死路） */
@@ -1062,7 +1073,7 @@ export class TerminalViewModel {
    * replace 且已在某窗格 → 只聚焦（同一 PTY 不能绑两个窗格）；
    * 新标签 / 分屏 → 按同一主机再拨一路独立会话，允许同一连接开两次。
    */
-  openSession(sessionId: string, mode: ConnectionOpenMode): void {
+  async openSession(sessionId: string, mode: ConnectionOpenMode): Promise<void> {
     if (this.disposed) {
       return;
     }
@@ -1081,9 +1092,11 @@ export class TerminalViewModel {
         Logger.warn(`活跃会话缺少主机快照（sessionId=${sessionId}）`, LOG_TAG);
         return;
       }
-      this.openHostProfile(host, mode).catch((err: Object) => {
+      try {
+        await this.openHostProfile(host, mode);
+      } catch (err) {
         Logger.error(`同一主机再次打开失败: ${JSON.stringify(err)}`, LOG_TAG);
-      });
+      }
       return;
     }
     const host: HostProfile | null = this.hostForSession(sessionId) ?? this.lookupHost(info.hostId);
@@ -1453,6 +1466,70 @@ export class TerminalViewModel {
     }
   }
 
+  /**
+   * U10：发送命令片段到聚焦终端（Snippets → 终端）。
+   * 内容经 SnippetVars 替换 `${host}`/`${user}`/`${port}`/`${name}` 后补 `\n`。
+   * 返回 false = 无聚焦终端 / 内容为空 / 通道拒收。
+   */
+  sendSnippet(content: string): boolean {
+    const terminal: TerminalLike | null = this.terminal;
+    if (this.disposed || terminal === null) {
+      return false;
+    }
+    const host: HostProfile | null = this.currentSessionId.length > 0
+      ? this.sessionHost().hostOf(this.currentSessionId) : null;
+    const vars = host !== null
+      ? snippetVarsOf(host.name, host.host, host.username, host.port)
+      : snippetVarsOf('', '', '', 22);
+    const payload: string = encodeSnippetForTerminal(content, vars);
+    if (payload.length === 0) {
+      return false;
+    }
+    this.dirtyHook();
+    const bytes: Uint8Array = utf8Bytes(payload);
+    const accepted: boolean =
+      terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    if (!accepted) {
+      Logger.warn('片段发送未被终端通道受理', LOG_TAG);
+    } else {
+      Logger.info(`片段已发送到聚焦会话（sessionId=${this.currentSessionId}）`, LOG_TAG);
+    }
+    return accepted;
+  }
+
+  /** 注册片段发送出口（ConfigManager 等外部页面调用；dispose 时注销） */
+  private readonly snippetHubSender = (payload: string): boolean => {
+    // 契约：Hub 传来的是片段原文（可含 ${host} 等占位符），
+    // 变量替换统一在 sendSnippet 内按聚焦会话主机完成。
+    return this.sendSnippet(payload);
+  };
+
+  /**
+   * 连接建立后的自动执行（AutoRun 纯逻辑决定发什么，这里只管发）。
+   *
+   * 只写该会话自己的终端，不走 `this.terminal`（那是聚焦投影，多窗格下会打错窗格）。
+   * 日志只记条数：initCommands 里可能有 `export TOKEN=...` 这类内容，不得落盘。
+   */
+  private runAutoCommands(sessionId: string): void {
+    const host: HostProfile | null = this.sessionHost().hostOf(sessionId);
+    if (host === null) {
+      return;
+    }
+    const commands: string[] = buildAutoRunCommands(host);
+    if (commands.length === 0) {
+      return;
+    }
+    const entry: AttachedTerminal | undefined = this.attachedTerminals.get(sessionId);
+    if (entry === undefined) {
+      Logger.warn('自动执行跳过：终端尚未装配', LOG_TAG);
+      return;
+    }
+    const bytes: Uint8Array = utf8Bytes(encodeAutoRunCommands(commands));
+    const accepted: boolean =
+      entry.terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    Logger.info(`连接后自动执行 ${commands.length} 条命令（受理=${accepted}）`, LOG_TAG);
+  }
+
   // ---------------------------------------------------------------- 退出
 
   /**
@@ -1466,6 +1543,7 @@ export class TerminalViewModel {
     this.disposed = true;
     this.unsubFocus();
     this.unregisterListeners();
+    SnippetSendHub.get().unregister(this.snippetHubSender);
     this.attachedTerminals.forEach((entry: AttachedTerminal) => {
       entry.terminal.detach();
     });
@@ -1494,6 +1572,10 @@ export class TerminalViewModel {
       return;
     }
     const focused: boolean = session.sessionId === this.currentSessionId;
+    // T4 帧调度自动休眠：会话事件可能带来画面变化（attach/关闭/标题/模式位），
+    // 可见叶一律 notifyContentDirty（FrameSchedulerCore 头注「其他唤醒源」）。
+    // terminal* 输出类事件 SessionManager 已走 dirtyListener，这里补非 dirty 通路。
+    const wake: boolean = this.isSessionVisible(session.sessionId);
     switch (event.type) {
       case 'stateChange':
         if (event.to === 'established') {
@@ -1507,21 +1589,49 @@ export class TerminalViewModel {
         } else if (event.to === 'error' || event.to === 'disconnected') {
           this.maybePromptPasswordAfterAuthFailure(session, event);
         }
+        if (wake) {
+          this.dirtyHook();
+        }
         break;
       case 'terminalOpen':
         this.closedBySession.set(session.sessionId, false);
+        // shell 刚开出来：把该主机的自动执行（tmux 附着 + initCommands）打进去。
+        // 每次 terminalOpen 都发一遍是有意的——重连后正是要重新 attach 回原来的 tmux 会话
+        this.runAutoCommands(session.sessionId);
+        if (wake) {
+          this.dirtyHook();
+        }
         break;
       case 'terminalClose':
         this.closedBySession.set(session.sessionId, true);
+        if (wake) {
+          this.dirtyHook();
+        }
         break;
       case 'terminalTitle':
         if (focused) {
           this.terminalTitle = event.title ?? '';
         }
+        if (wake) {
+          this.dirtyHook();
+        }
         break;
       case 'terminalBell':
         if (focused) {
           this.vibrateHook();
+        }
+        break;
+      case 'terminalMouseMode':
+        // mouseMode 已在 SessionManager DIRTY_EVENT_TYPES；这里只缓存聚焦投影
+        if (focused && event.mouseMode !== undefined) {
+          this.focusedMouseMode = event.mouseMode;
+        }
+        break;
+      case 'terminalCursorKeys':
+        // T10 stub：native 暴露 DECCKM 后投递本事件；KeyMap/画布已接受该标志
+        this.applicationCursorKeys = event.applicationCursorKeys === true;
+        if (wake) {
+          this.dirtyHook();
         }
         break;
       default:
@@ -1924,6 +2034,8 @@ export class TerminalViewModel {
     this.listenersOn = true;
     this.sessionHost().addEventListener(this.eventListener);
     this.sessionHost().addDirtyListener(this.dirtyListener);
+    // U10：片段发送出口（ConfigManager 等外部页面经 Hub 写聚焦终端）
+    SnippetSendHub.get().register(this.snippetHubSender);
   }
 
   private unregisterListeners(): void {
@@ -1933,6 +2045,7 @@ export class TerminalViewModel {
     this.listenersOn = false;
     this.sessionHost().removeEventListener(this.eventListener);
     this.sessionHost().removeDirtyListener(this.dirtyListener);
+    SnippetSendHub.get().unregister(this.snippetHubSender);
   }
 
   private sessionHost(): TerminalSessionHostLike {

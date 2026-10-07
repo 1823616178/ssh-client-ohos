@@ -15,6 +15,8 @@
 
 import { describe, it, expect } from '@ohos/hypium';
 import {
+  AppearanceProfile,
+  HostGroup,
   HostProfile,
   KnownHostEntry,
   PortForwardRule,
@@ -27,8 +29,10 @@ import {
   CredentialDraft,
   ForwardRuleErrors,
   ForwardRuleForm,
+  HostEditAppearanceDaoLike,
   HostEditErrors,
   HostEditForm,
+  HostEditGroupDaoLike,
   HostEditHostDaoLike,
   HostEditKnownHostDaoLike,
   HostEditForwardDaoLike,
@@ -289,6 +293,18 @@ interface VmFixture {
   readonly runner: FakeRunner;
 }
 
+class FakeGroupDao implements HostEditGroupDaoLike {
+  listAll(): HostGroup[] {
+    return [];
+  }
+}
+
+class FakeAppearanceDao implements HostEditAppearanceDaoLike {
+  listAll(): AppearanceProfile[] {
+    return [];
+  }
+}
+
 function makeVmFixture(): VmFixture {
   const hostDao: FakeHostDao = new FakeHostDao();
   const forwardDao: FakeForwardDao = new FakeForwardDao();
@@ -298,6 +314,8 @@ function makeVmFixture(): VmFixture {
   let idSeq: number = 0;
   const deps: HostEditViewModelDeps = {
     hostDao: hostDao,
+    groupDao: new FakeGroupDao(),
+    appearanceDao: new FakeAppearanceDao(),
     forwardDao: forwardDao,
     knownHostDao: knownHostDao,
     getSecret: store.get,
@@ -787,7 +805,8 @@ export default function hostEditViewModelTest() {
       const form: HostEditForm = makeValidForm();
       form.authType = 'agent';
       await fixture.vm.runTestConnection(form, createEmptyCredentialDraft());
-      expect(fixture.vm.testMessage.indexOf('暂未开放') >= 0).assertTrue();
+      expect(fixture.vm.testMessage.indexOf('Agent') >= 0 ||
+        fixture.vm.testMessage.indexOf('测试连接') >= 0).assertTrue();
       form.authType = 'password';
       await fixture.vm.runTestConnection(form, createEmptyCredentialDraft());
       expect(fixture.vm.testMessage.indexOf('请填写登录密码') >= 0).assertTrue();

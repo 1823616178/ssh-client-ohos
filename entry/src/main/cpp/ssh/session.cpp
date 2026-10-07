@@ -1,13 +1,18 @@
 #include "session.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 #include <fcntl.h>
 #include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -18,6 +23,7 @@
 
 #include "../io/SessionThread.h"
 #include "channel.h"
+#include "forward.h"
 
 #include <algorithm>
 
@@ -115,11 +121,53 @@ SshSession::SshSession(io::SessionThread &thread, SshSessionOptions options, Sta
 SshSession::~SshSession()
 {
     // 析构约定（见头文件）：到达终态后或 SessionThread::stop() 之后析构。
-    // 终态迁移前 releaseResources() 已回收 fd_/session_，这里只是兜底，
-    // 绝不在运行中的循环上并发 removeFd。
+    // Q3 兜底：调用方未 stop（测试 SKIP 路径等）时不得 UAF——
+    //   1. disposed_ 闩：循环线程入口立即返回，不再触碰 session_/fd_；
+    //   2. wakeup 循环，避免其停在 epoll_wait；
+    //   3. 循环仍在跑 → post releaseResources（循环线程合法 removeFd）并等待；
+    //      已停 → 本地 forceReleaseLocal（fd 不在 epoll 或线程已 join，无并发回调）。
+    disposed_.store(true, std::memory_order_release);
+    thread_.loop().wakeup();
+
+    if (thread_.isRunning() && (session_ != nullptr || fd_ >= 0)) {
+        // 同步块用 shared_ptr 承载：超时后本析构返回，迟到的 post 任务不得再碰 this
+        auto sync = std::make_shared<std::mutex>();
+        auto cv = std::make_shared<std::condition_variable>();
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto self = std::make_shared<SshSession *>(this);
+        thread_.post([self, sync, cv, done]() {
+            SshSession *s = *self;
+            if (s != nullptr) {
+                s->releaseResources();
+            }
+            done->store(true, std::memory_order_release);
+            cv->notify_all();
+        });
+        thread_.loop().wakeup();
+        std::unique_lock<std::mutex> lock(*sync);
+        if (!cv->wait_for(lock, std::chrono::seconds(2), [&] {
+                return done->load(std::memory_order_acquire);
+            })) {
+            // 超时兜底：先作废迟到任务再本地回收，避免 post 任务在析构后触碰 this
+            SSH_LOG("~SshSession: 循环线程 2s 内未完成 releaseResources，本地兜底回收");
+            *self = nullptr;
+            forceReleaseLocal();
+        }
+    } else {
+        forceReleaseLocal();
+    }
+}
+
+// Q3：~SshSession 本地兜底（循环线程已停 / post 超时）。
+// 不调用 EventLoop::removeFd（契约：仅循环线程）；Linux 对已 close 的 fd
+// 会自动从 epoll 摘除。fdRegistered_ 仅置位不再操作循环表。
+void SshSession::forceReleaseLocal()
+{
+    cancelTimers();
+    clearAuthState();
+    notifyChannelsSessionLost();
     if (session_ != nullptr) {
         if (::libssh2_session_free(session_) == LIBSSH2_ERROR_EAGAIN && fd_ >= 0) {
-            // 同 releaseResources 的 EAGAIN 防护：close 后重试使残留 flush 立即失败
             ::close(fd_);
             fd_ = -1;
             ::libssh2_session_free(session_);
@@ -130,6 +178,7 @@ SshSession::~SshSession()
         ::close(fd_);
         fd_ = -1;
     }
+    fdRegistered_ = false;
 }
 
 // ------------------------------------------------------------------ 公共 API
@@ -238,6 +287,10 @@ bool SshSession::isLegalTransition(SshSessionState from, SshSessionState to)
 
 void SshSession::doConnect()
 {
+    // Q3：析构闩——对象可能正在 teardown
+    if (disposed_.load(std::memory_order_acquire)) {
+        return;
+    }
     transitionTo(SshSessionState::kConnecting); // idle → connecting
 
     if (!g_libssh2InitOk) {
@@ -247,9 +300,20 @@ void SshSession::doConnect()
 
     // 同步 getaddrinfo：数值地址近乎零开销；域名解析可能短暂阻塞循环线程，
     // N6 按任务约定保持简单，后续需要时再挪出循环线程。
+    // 数值 IP 直接钉死地址族：AF_UNSPEC 会先解析出对方族（常见 ::1），
+    // 对端只监听 127.0.0.1 时 SYN 被丢弃，本应「立即拒绝」的用例会拖满 connect 超时。
     struct addrinfo hints {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    {
+        struct in_addr v4 {};
+        struct in6_addr v6 {};
+        if (::inet_pton(AF_INET, host_.c_str(), &v4) == 1) {
+            hints.ai_family = AF_INET;
+        } else if (::inet_pton(AF_INET6, host_.c_str(), &v6) == 1) {
+            hints.ai_family = AF_INET6;
+        }
+    }
     char portStr[8];
     std::snprintf(portStr, sizeof(portStr), "%u", static_cast<unsigned>(port_));
 
@@ -313,6 +377,12 @@ void SshSession::doConnect()
 
 void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
 {
+    // Q3：teardown 后循环线程不再触碰 session_/fd_（~SshSession 已置闩）。
+    // 注意：session_（libssh2 句柄）要到 beginHandshake 才创建，
+    // connecting 阶段为 nullptr 是正常态，不能据此丢弃可写/错误事件。
+    if (disposed_.load(std::memory_order_acquire)) {
+        return;
+    }
     switch (state()) {
     case SshSessionState::kConnecting: {
         // 非阻塞 connect 完成判定：以 SO_ERROR 为准（HUP 与 OUT 常同时到达）
@@ -336,6 +406,10 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
         return;
     }
     case SshSessionState::kHandshaking:
+        if (session_ == nullptr) {
+            failWith(SshSessionError::kInternal, "握手阶段 libssh2 会话未就绪");
+            return;
+        }
         driveHandshake();
         if (state() != SshSessionState::kHandshaking) {
             return; // 成功进 authenticating 或已失败
@@ -379,7 +453,7 @@ void SshSession::onSocketEvent(int /*fd*/, uint32_t events)
             } else if (authOp_) {
                 driveAuth();
             }
-        } else if (!channels_.empty()) {
+        } else if (!channels_.empty() || !forwardChannels_.empty() || !remoteForwards_.empty()) {
             driveChannels();
         }
         return;
@@ -532,6 +606,9 @@ void SshSession::abortHostKeyMismatch(const std::string &message)
 
 void SshSession::doClose()
 {
+    if (disposed_.load(std::memory_order_acquire)) {
+        return;
+    }
     const SshSessionState st = state();
     switch (st) {
     case SshSessionState::kIdle:
@@ -620,10 +697,17 @@ void SshSession::updateFdInterest()
         // N10：有注册通道时常开 EPOLLIN（通道数据/EOF/close/窗口调整等入向报文）；
         // EPOLLOUT 仅在某通道最近一次 EAGAIN 为发送方向（OUTBOUND）停滞时挂——
         // 对端停读导致的窗口耗尽是 INBOUND 停滞，挂 EPOLLOUT 会 LT 空转
-        if (!channels_.empty()) {
+        // N15：转发数据通道 / 远程监听同样需要 EPOLLIN
+        if (!channels_.empty() || !forwardChannels_.empty() || !remoteForwards_.empty()) {
             mask |= EPOLLIN;
             for (const SshChannel *ch : channels_) {
                 if (ch->wantsOutboundBlocked()) {
+                    mask |= EPOLLOUT;
+                    break;
+                }
+            }
+            for (const SshForwardChannel *fwd : forwardChannels_) {
+                if (fwd->wantsOutboundBlocked()) {
                     mask |= EPOLLOUT;
                     break;
                 }
@@ -752,6 +836,36 @@ void SshSession::unregisterChannel(SshChannel *channel)
     updateFdInterest(); // 无通道后回到只挂 RDHUP 的断线检测
 }
 
+void SshSession::registerForwardChannel(SshForwardChannel *channel)
+{
+    forwardChannels_.push_back(channel);
+    updateFdInterest();
+}
+
+void SshSession::unregisterForwardChannel(SshForwardChannel *channel)
+{
+    const auto it = std::find(forwardChannels_.begin(), forwardChannels_.end(), channel);
+    if (it != forwardChannels_.end()) {
+        forwardChannels_.erase(it);
+    }
+    updateFdInterest();
+}
+
+void SshSession::registerForwardChannel(SshRemoteForward *listener)
+{
+    remoteForwards_.push_back(listener);
+    updateFdInterest();
+}
+
+void SshSession::unregisterForwardChannel(SshRemoteForward *listener)
+{
+    const auto it = std::find(remoteForwards_.begin(), remoteForwards_.end(), listener);
+    if (it != remoteForwards_.end()) {
+        remoteForwards_.erase(it);
+    }
+    updateFdInterest();
+}
+
 void SshSession::driveChannels()
 {
     // 多轮泵送直到一轮无任何进展：A 通道的读会把 B 通道的报文搬进 libssh2
@@ -765,6 +879,27 @@ void SshSession::driveChannels()
                 continue;
             }
             if (ch->pump()) {
+                progress = true;
+            }
+        }
+        // N15：转发数据通道与远程监听一并泵送
+        const std::vector<SshForwardChannel *> fwdSnapshot = forwardChannels_;
+        for (SshForwardChannel *fwd : fwdSnapshot) {
+            if (std::find(forwardChannels_.begin(), forwardChannels_.end(), fwd) ==
+                forwardChannels_.end()) {
+                continue;
+            }
+            if (fwd->pump()) {
+                progress = true;
+            }
+        }
+        const std::vector<SshRemoteForward *> remSnapshot = remoteForwards_;
+        for (SshRemoteForward *rem : remSnapshot) {
+            if (std::find(remoteForwards_.begin(), remoteForwards_.end(), rem) ==
+                remoteForwards_.end()) {
+                continue;
+            }
+            if (rem->pump()) {
                 progress = true;
             }
         }
@@ -783,6 +918,16 @@ void SshSession::notifyChannelsSessionLost()
         ch->onSessionLost();
     }
     channels_.clear();
+    const std::vector<SshForwardChannel *> fwdSnapshot = forwardChannels_;
+    for (SshForwardChannel *fwd : fwdSnapshot) {
+        fwd->onSessionLost();
+    }
+    forwardChannels_.clear();
+    const std::vector<SshRemoteForward *> remSnapshot = remoteForwards_;
+    for (SshRemoteForward *rem : remSnapshot) {
+        rem->onSessionLost();
+    }
+    remoteForwards_.clear();
 }
 
 // ------------------------------------------------------------------ N12 keepalive（循环线程）
@@ -820,6 +965,9 @@ void SshSession::armKeepalive()
 
 void SshSession::onKeepaliveTick()
 {
+    if (disposed_.load(std::memory_order_acquire) || session_ == nullptr) {
+        return;
+    }
     keepaliveTimer_ = 0; // 本拍定时器已到期消费；下方按需预约下一拍
     if (state() != SshSessionState::kEstablished || session_ == nullptr || fd_ < 0) {
         return; // 已离开 established（关闭/断线收尾中），keepalive 链自然终止
@@ -875,6 +1023,9 @@ void SshSession::onKeepaliveTick()
 
 void SshSession::doProbeNow(uint32_t timeoutSec)
 {
+    if (disposed_.load(std::memory_order_acquire) || session_ == nullptr) {
+        return;
+    }
     if (state() != SshSessionState::kEstablished || session_ == nullptr || fd_ < 0) {
         return; // 受理与执行之间已离开 established：断线重连链自会接手，探测作废
     }
@@ -936,6 +1087,9 @@ void SshSession::doProbeNow(uint32_t timeoutSec)
 
 void SshSession::onProbeDeadline(uint32_t timeoutSec)
 {
+    if (disposed_.load(std::memory_order_acquire)) {
+        return;
+    }
     keepaliveTimer_ = 0; // 本窗口定时器已到期消费
     if (state() != SshSessionState::kEstablished || session_ == nullptr || fd_ < 0) {
         keepaliveProbe_.disarm();

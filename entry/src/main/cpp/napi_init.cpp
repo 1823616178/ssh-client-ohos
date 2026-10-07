@@ -21,6 +21,12 @@
 // T3：终端桥接（零拷贝快照 + 终端事件），实现见 bridge/terminal_bridge.cpp
 #include "bridge/terminal_bridge.h"
 #include "bridge/vault_bridge.h"
+// N9：应用内 Agent 桥接（内存密钥托管 + authenticateAgent）
+#include "bridge/agent_bridge.h"
+// N14：SFTP 桥接
+#include "bridge/sftp_bridge.h"
+// N15：端口转发桥接
+#include "bridge/forward_bridge.h"
 
 namespace {
 
@@ -91,6 +97,12 @@ napi_value Init(napi_env env, napi_value exports)
     // detachTerminal）；终端事件经 N11 的 stateTsfn 上抛，清理随会话钩子走
     sshclient::bridge::RegisterTerminalBridge(env, exports);
     sshclient::bridge::RegisterVaultBridge(env, exports);
+    // N9：注册应用内 agent（agentUnlock/agentLock/…/authenticateAgent）
+    sshclient::bridge::RegisterAgentBridge(env, exports);
+    // N14：注册 SFTP（sftpOpen/sftpList/sftpDownload/…）
+    sshclient::bridge::RegisterSftpBridge(env, exports);
+    // N15：注册端口转发（openDirectTcpip/forwardWrite/remoteForwardListen/…）
+    sshclient::bridge::RegisterForwardBridge(env, exports);
     return exports;
 }
 

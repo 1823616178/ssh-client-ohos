@@ -22,10 +22,15 @@ import {
   Snippet
 } from '../common/model/models';
 import { Tokens } from '../theme/Tokens';
+import { PageHeader, PageHeaderAction } from '../view/PageHeader';
 import { ConfigManagerViewModel, ConfigTabType } from '../viewmodel/ConfigManagerViewModel';
 import { Logger } from '../common/utils/Logger';
+import { previewSnippet, snippetVarsOf } from '../common/utils/SnippetVars';
+import { SnippetSendHub } from '../view/terminal/SnippetSendHub';
 
 const LOG_TAG: string = 'ConfigManagerPage';
+/** 行内次级按钮高度（vp）：Token 表无「按钮高度」项，页内统一取值 */
+const ACTION_BTN_HEIGHT_VP: number = 32;
 
 /**
  * 必须是 @ComponentV2：ConfigManagerViewModel 是 @ObservedV2 + @Trace，
@@ -58,61 +63,50 @@ struct ConfigManagerPage {
     }
   }
 
+  /** 片段发送前预览：无会话时提示占位符；有终端会话时展示原文（发送时按主机替换） */
+  private snippetPreview(content: string): string {
+    const hub = SnippetSendHub.get();
+    if (!hub.available) {
+      return previewSnippet(content, snippetVarsOf('(未连接)', '(host)', '(user)', 22));
+    }
+    return content;
+  }
+
+  /** U10：发送片段到聚焦终端（TerminalViewModel 经 SnippetSendHub 注册的出口） */
+  private sendSnippet(snippet: Snippet): void {
+    const hub = SnippetSendHub.get();
+    if (!hub.available) {
+      this.toast('请先打开并聚焦一个终端会话');
+      return;
+    }
+    // Hub 契约：传片段原文；${host}/${user} 等在 TerminalViewModel.sendSnippet
+    // 内按聚焦会话的主机配置替换后补 \n 写入终端。
+    const ok: boolean = hub.send(snippet.content, snippet.content);
+    this.toast(ok ? `已发送「${snippet.name}」到聚焦终端` : '发送失败：终端通道未就绪');
+  }
+
   build() {
-    Column() {
-      // 顶栏：返回按钮 + 页面标题与重新加载
-      Row() {
-        Button() {
-          Text('‹')
-            .fontSize(28)
-            .fontColor(Tokens.Color.text)
-            .fontWeight(FontWeight.Regular)
+    const headerActions: PageHeaderAction[] = [
+      {
+        label: '刷新',
+        onClick: (): void => {
+          this.vm.reload();
+          this.toast('配置数据已刷新');
         }
-        .backgroundColor(Tokens.Color.surface)
-        .borderRadius(Tokens.radius.sm)
-        .width(36)
-        .height(36)
-        .onClick(() => {
-          router.back();
-        })
-
-        Column() {
-          Text('CONFIG MANAGER')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.accent)
-            .fontWeight(FontWeight.Bold)
-            .letterSpacing(1.2)
-          Text('配置管理中心')
-            .fontSize(Tokens.fontSize.headline)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(Tokens.Color.text)
-            .margin({ top: Tokens.space.xs2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .margin({ left: Tokens.space.sm })
-
-        Blank()
-
-        Button('刷新')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.textDim)
-          .backgroundColor(Tokens.Color.surface)
-          .borderRadius(Tokens.radius.sm)
-          .height(32)
-          .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
-          .onClick(() => {
-            this.vm.reload();
-            this.toast('配置数据已刷新');
-          })
       }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
+    ];
+    Column() {
+      PageHeader({
+        title: '配置中心',
+        subtitle: '主机、分组、转发与本机配置',
+        actions: headerActions
+      })
 
       // 同步边界说明条
       Row() {
         Column()
           .width(Tokens.space.xs2)
-          .height(34)
+          .height(Tokens.space.xl)
           .backgroundColor(Tokens.Color.accent)
           .borderRadius(Tokens.radius.xs)
           .margin({ right: Tokens.space.xs })
@@ -126,7 +120,7 @@ struct ConfigManagerPage {
       .padding(Tokens.space.sm)
       .backgroundColor(Tokens.Color.surface)
       .borderRadius(Tokens.radius.sm)
-      .margin({ top: Tokens.space.sm })
+      .margin({ top: Tokens.space.sm, left: Tokens.space.md, right: Tokens.space.md })
 
       // 搜索框：实时过滤当前配置（名称 / IP / 端口 / 内容）
       TextInput({ placeholder: '搜索配置 (名称 / IP / 用户 / 端口 / 内容)...', text: this.vm.searchText })
@@ -137,7 +131,7 @@ struct ConfigManagerPage {
         .borderRadius(Tokens.radius.sm)
         .height(42)
         .width('100%')
-        .margin({ top: Tokens.space.sm })
+        .margin({ top: Tokens.space.sm, left: Tokens.space.md, right: Tokens.space.md })
         .onChange((value: string) => {
           this.vm.setSearchText(value);
         })
@@ -145,14 +139,14 @@ struct ConfigManagerPage {
       // 横向滚动 Tab 栏
       Scroll() {
         Row() {
-          this.TabButton('hosts', `主机 (${this.vm.hosts.length})`, '☁')
-          this.TabButton('groups', `分组 (${this.vm.groups.length})`, '☁')
-          this.TabButton('forwards', `转发 (${this.vm.forwards.length})`, '☁')
-          this.TabButton('themes', `主题 (${this.vm.appearances.length})`, '💻')
-          this.TabButton('snippets', `片段 (${this.vm.snippets.length})`, '💻')
-          this.TabButton('knownHosts', `指纹 (${this.vm.knownHosts.length})`, '💻')
+          this.TabButton('hosts', `主机 (${this.vm.hosts.length})`, '同步')
+          this.TabButton('groups', `分组 (${this.vm.groups.length})`, '同步')
+          this.TabButton('forwards', `转发 (${this.vm.forwards.length})`, '同步')
+          this.TabButton('themes', `主题 (${this.vm.appearances.length})`, '本机')
+          this.TabButton('snippets', `片段 (${this.vm.snippets.length})`, '本机')
+          this.TabButton('knownHosts', `指纹 (${this.vm.knownHosts.length})`, '本机')
         }
-        .padding({ top: Tokens.space.xs, bottom: Tokens.space.xs })
+        .padding({ top: Tokens.space.xs, bottom: Tokens.space.xs, left: Tokens.space.md })
       }
       .scrollable(ScrollDirection.Horizontal)
       .scrollBar(BarState.Off)
@@ -177,7 +171,7 @@ struct ConfigManagerPage {
           }
         }
         .width('100%')
-        .padding({ bottom: Tokens.space.md })
+        .padding({ left: Tokens.space.md, right: Tokens.space.md, bottom: Tokens.space.md })
       }
       .layoutWeight(1)
       .width('100%')
@@ -186,12 +180,6 @@ struct ConfigManagerPage {
     }
     .width('100%')
     .height('100%')
-    .padding({
-      top: Tokens.space.md,
-      left: Tokens.space.md,
-      right: Tokens.space.md,
-      bottom: 0
-    })
     .backgroundColor(Tokens.Color.appBg)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
@@ -200,14 +188,15 @@ struct ConfigManagerPage {
   TabButton(tab: ConfigTabType, label: string, badge: string) {
     Row() {
       Text(badge)
-        .fontSize(11)
+        .fontSize(Tokens.fontSize.caption)
+        .fontColor(this.vm.currentTab === tab ? Tokens.Color.onAccent : Tokens.Color.textDim)
         .margin({ right: Tokens.space.xs2 })
       Text(label)
         .fontSize(Tokens.fontSize.body)
         .fontWeight(this.vm.currentTab === tab ? FontWeight.Bold : FontWeight.Regular)
         .fontColor(this.vm.currentTab === tab ? Tokens.Color.onAccent : Tokens.Color.textDim)
     }
-    .height(34)
+    .height(Tokens.space.xl)
     .padding({ left: Tokens.space.md, right: Tokens.space.md })
     .backgroundColor(this.vm.currentTab === tab ? Tokens.Color.accent : Tokens.Color.surface)
     .borderRadius(Tokens.radius.sm)
@@ -232,7 +221,7 @@ struct ConfigManagerPage {
           .fontColor(Tokens.Color.onAccent)
           .backgroundColor(Tokens.Color.accent)
           .borderRadius(Tokens.radius.sm)
-          .height(28)
+          .height(ACTION_BTN_HEIGHT_VP)
           .onClick(() => {
             router.pushUrl({ url: 'pages/HostEditPage' });
           })
@@ -291,7 +280,7 @@ struct ConfigManagerPage {
               .margin({ top: Tokens.space.sm, bottom: Tokens.space.sm })
 
             Row() {
-              Text(`Keepalive: ${host.keepalive}s · 终端: ${host.termType}`)
+              Text(`心跳 ${host.keepalive}秒 · 终端 ${host.termType}`)
                 .fontSize(Tokens.fontSize.caption)
                 .fontColor(Tokens.Color.textFaint)
 
@@ -302,7 +291,7 @@ struct ConfigManagerPage {
                 .fontColor(Tokens.Color.text)
                 .backgroundColor(Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.sm)
-                .height(28)
+                .height(ACTION_BTN_HEIGHT_VP)
                 .margin({ right: Tokens.space.xs })
                 .onClick(() => {
                   const params: Record<string, Object> = {};
@@ -315,7 +304,7 @@ struct ConfigManagerPage {
                 .fontColor(Tokens.Color.danger)
                 .backgroundColor(Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.sm)
-                .height(28)
+                .height(ACTION_BTN_HEIGHT_VP)
                 .onClick(() => {
                   if (this.vm.deleteHost(host.id)) {
                     this.toast('已删除主机');
@@ -350,7 +339,7 @@ struct ConfigManagerPage {
           .fontColor(Tokens.Color.onAccent)
           .backgroundColor(Tokens.Color.accent)
           .borderRadius(Tokens.radius.sm)
-          .height(28)
+          .height(ACTION_BTN_HEIGHT_VP)
           .onClick(() => {
             this.showAddGroupDialog = !this.showAddGroupDialog;
           })
@@ -384,7 +373,7 @@ struct ConfigManagerPage {
               .fontColor(Tokens.Color.textDim)
               .backgroundColor(Tokens.Color.surfaceHover)
               .borderRadius(Tokens.radius.sm)
-              .height(28)
+              .height(ACTION_BTN_HEIGHT_VP)
               .margin({ right: Tokens.space.xs })
               .onClick(() => {
                 this.showAddGroupDialog = false;
@@ -396,7 +385,7 @@ struct ConfigManagerPage {
               .fontColor(Tokens.Color.onAccent)
               .backgroundColor(Tokens.Color.accent)
               .borderRadius(Tokens.radius.sm)
-              .height(28)
+              .height(ACTION_BTN_HEIGHT_VP)
               .onClick(() => {
                 if (this.vm.createGroup(this.newGroupName)) {
                   this.toast('分组创建成功');
@@ -443,7 +432,7 @@ struct ConfigManagerPage {
               .fontColor(Tokens.Color.danger)
               .backgroundColor(Tokens.Color.surfaceHover)
               .borderRadius(Tokens.radius.sm)
-              .height(28)
+              .height(ACTION_BTN_HEIGHT_VP)
               .onClick(() => {
                 if (this.vm.deleteGroup(group.id)) {
                   this.toast('已删除分组');
@@ -530,7 +519,7 @@ struct ConfigManagerPage {
                 .fontColor(Tokens.Color.danger)
                 .backgroundColor(Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.sm)
-                .height(28)
+                .height(ACTION_BTN_HEIGHT_VP)
                 .onClick(() => {
                   if (this.vm.deleteForward(rule.id)) {
                     this.toast('已删除端口转发规则');
@@ -560,6 +549,15 @@ struct ConfigManagerPage {
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
         Blank()
+        Button('外观页')
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.accent)
+          .borderRadius(Tokens.radius.sm)
+          .height(ACTION_BTN_HEIGHT_VP)
+          .onClick(() => {
+            router.pushUrl({ url: 'pages/AppearancePage' });
+          })
       }
       .width('100%')
       .margin({ bottom: Tokens.space.sm })
@@ -592,7 +590,7 @@ struct ConfigManagerPage {
                   .fontColor(Tokens.Color.danger)
                   .backgroundColor(Tokens.Color.surfaceHover)
                   .borderRadius(Tokens.radius.sm)
-                  .height(28)
+                  .height(ACTION_BTN_HEIGHT_VP)
                   .onClick(() => {
                     if (this.vm.deleteAppearance(app.id)) {
                       this.toast('已删除外观主题');
@@ -641,7 +639,7 @@ struct ConfigManagerPage {
           .fontColor(Tokens.Color.onAccent)
           .backgroundColor(Tokens.Color.accent)
           .borderRadius(Tokens.radius.sm)
-          .height(28)
+          .height(ACTION_BTN_HEIGHT_VP)
           .onClick(() => {
             this.showAddSnippetDialog = !this.showAddSnippetDialog;
           })
@@ -687,7 +685,7 @@ struct ConfigManagerPage {
               .fontColor(Tokens.Color.textDim)
               .backgroundColor(Tokens.Color.surfaceHover)
               .borderRadius(Tokens.radius.sm)
-              .height(28)
+              .height(ACTION_BTN_HEIGHT_VP)
               .margin({ right: Tokens.space.xs })
               .onClick(() => {
                 this.showAddSnippetDialog = false;
@@ -700,7 +698,7 @@ struct ConfigManagerPage {
               .fontColor(Tokens.Color.onAccent)
               .backgroundColor(Tokens.Color.accent)
               .borderRadius(Tokens.radius.sm)
-              .height(28)
+              .height(ACTION_BTN_HEIGHT_VP)
               .onClick(() => {
                 if (this.vm.createSnippet(this.newSnippetName, this.newSnippetContent)) {
                   this.toast('命令片段创建成功');
@@ -736,12 +734,22 @@ struct ConfigManagerPage {
                 .fontColor(Tokens.Color.text)
                 .layoutWeight(1)
 
+              Button('发送')
+                .fontSize(Tokens.fontSize.caption)
+                .fontColor(Tokens.Color.onAccent)
+                .backgroundColor(Tokens.Color.accent)
+                .borderRadius(Tokens.radius.sm)
+                .height(ACTION_BTN_HEIGHT_VP)
+                .margin({ right: Tokens.space.xs })
+                .onClick(() => {
+                  this.sendSnippet(snippet);
+                })
               Button('删除')
                 .fontSize(Tokens.fontSize.caption)
                 .fontColor(Tokens.Color.danger)
                 .backgroundColor(Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.sm)
-                .height(28)
+                .height(ACTION_BTN_HEIGHT_VP)
                 .onClick(() => {
                   if (this.vm.deleteSnippet(snippet.id)) {
                     this.toast('已删除命令片段');
@@ -751,7 +759,7 @@ struct ConfigManagerPage {
             .width('100%')
 
             Row() {
-              Text(snippet.content)
+              Text(this.snippetPreview(snippet.content))
                 .fontSize(Tokens.fontSize.caption)
                 .fontColor(Tokens.Color.accent)
                 .fontFamily('monospace')
@@ -780,7 +788,7 @@ struct ConfigManagerPage {
   KnownHostsSection() {
     Column() {
       Row() {
-        Text('已信任的主机密钥指纹 (Known Hosts)')
+        Text('已信任的主机密钥指纹')
           .fontSize(Tokens.fontSize.title)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.Color.text)
@@ -790,7 +798,7 @@ struct ConfigManagerPage {
       .margin({ bottom: Tokens.space.sm })
 
       if (this.vm.knownHosts.length === 0) {
-        this.EmptyCard('暂无主机指纹记录', '首次连接 SSH 主机时通过 TOFU 验证后自动记录主机指纹')
+        this.EmptyCard('暂无主机指纹记录', '首次连接并确认主机指纹后自动记录')
       } else if (this.vm.filteredKnownHosts().length === 0) {
         this.EmptyCard('无匹配主机指纹', `未找到与「${this.vm.searchText.trim()}」相关的指纹记录`)
       } else {
@@ -816,7 +824,7 @@ struct ConfigManagerPage {
                 .fontColor(Tokens.Color.danger)
                 .backgroundColor(Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.sm)
-                .height(28)
+                .height(ACTION_BTN_HEIGHT_VP)
                 .onClick(() => {
                   if (this.vm.deleteKnownHost(entry.id)) {
                     this.toast('已删除主机指纹');

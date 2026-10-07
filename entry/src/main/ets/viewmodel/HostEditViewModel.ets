@@ -33,6 +33,7 @@
 
 import { util } from '@kit.ArkTS';
 import { Logger } from '../common/utils/Logger';
+import { sanitizeTmuxSessionName } from '../common/utils/AutoRun';
 import { SshError, SshErrorCode } from '../common/SshError';
 import {
   AppearanceProfile,
@@ -78,6 +79,10 @@ export interface HostEditForm {
   envVarsText: string;
   /** null = 默认外观 */
   appearanceId: string | null;
+  /** 连接后自动附着 tmux 会话 */
+  tmuxAutoAttach: boolean;
+  /** tmux 会话名（空 = 用默认名） */
+  tmuxSessionName: string;
 }
 
 /** 新建模式表单默认值（与 createDefaultHostProfile 对齐） */
@@ -94,7 +99,9 @@ export function createEmptyHostEditForm(): HostEditForm {
     keepaliveText: '30',
     initCommandsText: '',
     envVarsText: '',
-    appearanceId: null
+    appearanceId: null,
+    tmuxAutoAttach: false,
+    tmuxSessionName: ''
   };
 }
 
@@ -430,7 +437,9 @@ export function hostProfileToForm(profile: HostProfile): HostEditForm {
     keepaliveText: `${profile.keepalive}`,
     initCommandsText: serializeInitCommands(profile.initCommands),
     envVarsText: serializeEnvVars(profile.envVars),
-    appearanceId: profile.appearanceId
+    appearanceId: profile.appearanceId,
+    tmuxAutoAttach: profile.tmuxAutoAttach,
+    tmuxSessionName: profile.tmuxSessionName
   };
 }
 
@@ -461,6 +470,10 @@ export function hostEditFormToProfile(form: HostEditForm, id: string, hostFinger
   profile.initCommands = parseInitCommandsText(form.initCommandsText);
   profile.envVars = parseEnvVarsText(form.envVarsText).envVars;
   profile.termType = form.termType.trim();
+  profile.tmuxAutoAttach = form.tmuxAutoAttach;
+  // 存归一后的名字：发命令时还会再归一一次，这里先存干净值，免得用户看到的和实际用的不一样
+  profile.tmuxSessionName =
+    form.tmuxAutoAttach ? sanitizeTmuxSessionName(form.tmuxSessionName) : form.tmuxSessionName.trim();
   return profile;
 }
 
@@ -628,7 +641,7 @@ export class HostEditViewModel {
       return hostProfileToForm(profile);
     } catch (err) {
       Logger.error(`主机编辑加载失败（hostId=${hostId}）: ${JSON.stringify(err)}`, LOG_TAG);
-      this.loadError = '加载失败，详见日志';
+      this.loadError = '操作失败，请重试';
       this.loading = false;
       return null;
     }
@@ -868,7 +881,7 @@ export class HostEditViewModel {
       return;
     }
     if (form.authType === 'agent') {
-      this.testMessage = '应用内 agent 暂未开放，无法测试连接';
+      this.testMessage = 'Agent 认证请在终端连接时使用；测试连接仅支持密码/密钥';
       return;
     }
     try {

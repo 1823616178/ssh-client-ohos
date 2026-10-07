@@ -48,7 +48,7 @@ export interface MigrationStep {
 }
 
 /** 当前 schema 版本（从 1 起；PRAGMA user_version 的 0 表示全新库） */
-export const SCHEMA_VERSION: number = 1;
+export const SCHEMA_VERSION: number = 3;
 
 // ---------- hosts → HostProfile ----------
 
@@ -69,7 +69,9 @@ export const HOSTS_TABLE: TableDef = {
     'jump_host_id TEXT REFERENCES hosts(id), ' +
     "init_commands TEXT NOT NULL DEFAULT '[]', " +
     "env_vars TEXT NOT NULL DEFAULT '{}', " +
-    'term_type TEXT NOT NULL' +
+    'term_type TEXT NOT NULL, ' +
+    'tmux_auto_attach INTEGER NOT NULL DEFAULT 0, ' +
+    "tmux_session_name TEXT NOT NULL DEFAULT ''" +
     ')',
   columns: [
     { name: 'id', type: 'TEXT', nullable: false },
@@ -85,9 +87,37 @@ export const HOSTS_TABLE: TableDef = {
     { name: 'jump_host_id', type: 'TEXT', nullable: true },
     { name: 'init_commands', type: 'TEXT', nullable: false },
     { name: 'env_vars', type: 'TEXT', nullable: false },
-    { name: 'term_type', type: 'TEXT', nullable: false }
+    { name: 'term_type', type: 'TEXT', nullable: false },
+    { name: 'tmux_auto_attach', type: 'INTEGER', nullable: false },
+    { name: 'tmux_session_name', type: 'TEXT', nullable: false }
   ]
 };
+
+/**
+ * v1 时期的 hosts 建表 SQL（冻结快照）。
+ *
+ * 迁移步骤必须引用**当时**的 DDL 而不是 HOSTS_TABLE.createSql：后者会随 schema 演进，
+ * 若 v0→v1 直接建出 v2 形态的表，紧接着的 v1→v2 `ALTER TABLE ADD COLUMN` 就会
+ * 撞上 duplicate column 而失败（SQLite 的 ADD COLUMN 没有 IF NOT EXISTS 可用），
+ * 全新安装反而起不来。
+ */
+const HOSTS_TABLE_SQL_V1: string =
+  'CREATE TABLE IF NOT EXISTS hosts (' +
+  'id TEXT PRIMARY KEY, ' +
+  'name TEXT NOT NULL, ' +
+  'host TEXT NOT NULL, ' +
+  'port INTEGER NOT NULL, ' +
+  'username TEXT NOT NULL, ' +
+  'auth_type TEXT NOT NULL, ' +
+  'host_fingerprint TEXT NOT NULL, ' +
+  'keepalive INTEGER NOT NULL, ' +
+  'group_id TEXT REFERENCES host_groups(id), ' +
+  'appearance_id TEXT REFERENCES appearance(id), ' +
+  'jump_host_id TEXT REFERENCES hosts(id), ' +
+  "init_commands TEXT NOT NULL DEFAULT '[]', " +
+  "env_vars TEXT NOT NULL DEFAULT '{}', " +
+  'term_type TEXT NOT NULL' +
+  ')';
 
 // ---------- host_groups → HostGroup ----------
 
@@ -108,6 +138,34 @@ export const HOST_GROUPS_TABLE: TableDef = {
 
 // ---------- appearance → AppearanceProfile ----------
 
+/**
+ * v2 时期的 appearance 建表 SQL（冻结快照，A5 之前）。
+ * 迁移步骤必须引用冻结 SQL 而不是 APPEARANCE_TABLE.createSql（与 hosts 同理，
+ * 见 HOSTS_TABLE_SQL_V1 头注：否则 v0→v1 建出 v3 形态后 v2→v3 ADD COLUMN 会撞 duplicate）。
+ */
+const APPEARANCE_TABLE_SQL_V2: string =
+  'CREATE TABLE IF NOT EXISTS appearance (' +
+  'id TEXT PRIMARY KEY, ' +
+  'name TEXT NOT NULL, ' +
+  'font_family TEXT NOT NULL, ' +
+  'font_size INTEGER NOT NULL, ' +
+  'line_height REAL NOT NULL, ' +
+  'letter_spacing REAL NOT NULL, ' +
+  'font_weight INTEGER NOT NULL, ' +
+  'ligatures INTEGER NOT NULL DEFAULT 0, ' +
+  'bold_as_bright INTEGER NOT NULL DEFAULT 1, ' +
+  'cursor_style TEXT NOT NULL, ' +
+  'cursor_blink INTEGER NOT NULL DEFAULT 1, ' +
+  'background_opacity REAL NOT NULL DEFAULT 1, ' +
+  'padding REAL NOT NULL DEFAULT 0, ' +
+  "palette TEXT NOT NULL DEFAULT '[]', " +
+  'foreground TEXT NOT NULL, ' +
+  'background TEXT NOT NULL, ' +
+  'cursor_color TEXT NOT NULL, ' +
+  'selection_color TEXT NOT NULL' +
+  ')';
+
+/** 当前 appearance 表（v3：A5 背景图路径 / 不透明度 / 模糊） */
 export const APPEARANCE_TABLE: TableDef = {
   name: 'appearance',
   createSql:
@@ -129,7 +187,10 @@ export const APPEARANCE_TABLE: TableDef = {
     'foreground TEXT NOT NULL, ' +
     'background TEXT NOT NULL, ' +
     'cursor_color TEXT NOT NULL, ' +
-    'selection_color TEXT NOT NULL' +
+    'selection_color TEXT NOT NULL, ' +
+    "background_image_path TEXT NOT NULL DEFAULT '', " +
+    'background_image_opacity REAL NOT NULL DEFAULT 1, ' +
+    'background_blur REAL NOT NULL DEFAULT 0' +
     ')',
   columns: [
     { name: 'id', type: 'TEXT', nullable: false },
@@ -149,7 +210,10 @@ export const APPEARANCE_TABLE: TableDef = {
     { name: 'foreground', type: 'TEXT', nullable: false },
     { name: 'background', type: 'TEXT', nullable: false },
     { name: 'cursor_color', type: 'TEXT', nullable: false },
-    { name: 'selection_color', type: 'TEXT', nullable: false }
+    { name: 'selection_color', type: 'TEXT', nullable: false },
+    { name: 'background_image_path', type: 'TEXT', nullable: false },
+    { name: 'background_image_opacity', type: 'REAL', nullable: false },
+    { name: 'background_blur', type: 'REAL', nullable: false }
   ]
 };
 
@@ -250,8 +314,8 @@ export const MIGRATIONS: MigrationStep[] = [
     toVersion: 1,
     sqls: [
       HOST_GROUPS_TABLE.createSql,
-      APPEARANCE_TABLE.createSql,
-      HOSTS_TABLE.createSql,
+      APPEARANCE_TABLE_SQL_V2,
+      HOSTS_TABLE_SQL_V1,
       SNIPPETS_TABLE.createSql,
       KNOWN_HOSTS_TABLE.createSql,
       FORWARDS_TABLE.createSql,
@@ -260,6 +324,25 @@ export const MIGRATIONS: MigrationStep[] = [
       INDEX_SQLS[2]
     ],
     comment: '初始建表：hosts / host_groups / appearance / snippets / known_hosts / forwards + 外键索引'
+  },
+  {
+    fromVersion: 1,
+    toVersion: 2,
+    sqls: [
+      'ALTER TABLE hosts ADD COLUMN tmux_auto_attach INTEGER NOT NULL DEFAULT 0',
+      "ALTER TABLE hosts ADD COLUMN tmux_session_name TEXT NOT NULL DEFAULT ''"
+    ],
+    comment: 'hosts 增加 tmux 自动附着两列（本机专有，不参与同步）'
+  },
+  {
+    fromVersion: 2,
+    toVersion: 3,
+    sqls: [
+      "ALTER TABLE appearance ADD COLUMN background_image_path TEXT NOT NULL DEFAULT ''",
+      'ALTER TABLE appearance ADD COLUMN background_image_opacity REAL NOT NULL DEFAULT 1',
+      'ALTER TABLE appearance ADD COLUMN background_blur REAL NOT NULL DEFAULT 0'
+    ],
+    comment: 'A5：appearance 增加背景图路径 / 图不透明度 / 模糊半径（本机专有，不参与同步）'
   }
 ];
 

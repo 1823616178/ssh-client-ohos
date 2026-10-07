@@ -200,7 +200,7 @@ export class AccountSyncViewModel {
       // 恢复解锁不走 Argon2（KEK 由恢复密钥 HKDF 派生），所以与 KDF 参数无关，
       // 但 keyVersion 仍参与包裹 AAD，信封坏掉一样会被误报成「恢复密钥无效」
       if (env.keyVersion < 1) {
-        this.errorText = `云端信封的 keyVersion 异常（${env.keyVersion}），无法解锁`;
+        this.errorText = '云端数据版本异常，无法解锁，请重新登录或联系支持';
         this.refreshFromAuth();
         return;
       }

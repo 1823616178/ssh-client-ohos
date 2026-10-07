@@ -41,14 +41,17 @@ TEST(KeepaliveConfigTest, SetKeepaliveConfigOnlyInIdle)
     ASSERT_TRUE(thread.start());
     StateRecorder rec;
     {
-        SshSession session(thread, {}, std::ref(rec));
+        SshSessionOptions opts;
+        opts.connectTimeoutMs = 1500;
+        opts.handshakeTimeoutMs = 2000;
+        SshSession session(thread, opts, std::ref(rec));
         // idle 态受理
         EXPECT_TRUE(session.setKeepaliveConfig(5, 2));
 
         // 连一个必然拒绝的端口（刚释放的空闲端口）：connecting → error
         const uint16_t port = PickFreePort();
         ASSERT_TRUE(session.connect("127.0.0.1", port, "tester"));
-        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 10s));
+        ASSERT_TRUE(rec.waitFor(SshSessionState::kError, 8s));
 
         // 非 idle（终态）一律拒绝
         EXPECT_FALSE(session.setKeepaliveConfig(10, 5));

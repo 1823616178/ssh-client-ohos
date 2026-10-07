@@ -152,6 +152,22 @@ export default function keyMapTest() {
       assertSeq(mapKeyEvent(KEY_F1 + 11, false, true, true, false, false), '\x1b[24;7~'); // Alt+Ctrl+F12
     });
 
+    it('T10_F1F4_SS3与DECCKM无关_导航键随标志切SS3', 0, () => {
+      // xterm PC-Style：未修饰 F1–F4 一律 SS3，应用光标模式下同形
+      assertSeq(key(KEY_F1, true), '\x1bOP');
+      assertSeq(key(KEY_F1 + 3, true), '\x1bOS');
+      // Home/End/PgUp/PgDn 不受 DECCKM 影响（xterm 变体 CSI H/F 与波浪号型）
+      assertSeq(key(KEY_MOVE_HOME, true), '\x1b[H');
+      assertSeq(key(KEY_MOVE_END, true), '\x1b[F');
+      assertSeq(key(KEY_PAGE_UP, true), '\x1b[5~');
+      assertSeq(key(KEY_PAGE_DOWN, true), '\x1b[6~');
+      // 方向键在 DECCKM 下 SS3（已有用例，此处与 F 键对照锚定）
+      assertSeq(key(KEY_DPAD_UP, true), '\x1bOA');
+      // Alt+B / Alt+F（readline 词跳转，T10 验收点）
+      assertSeq(mapKeyEvent(KEY_A + 1, false, true, false, false, false), '\x1bb');
+      assertSeq(mapKeyEvent(KEY_A + 5, false, true, false, false, false), '\x1bf');
+    });
+
     it('Ctrl加字母全表a到z', 0, () => {
       for (let i = 0; i < 26; i++) {
         const bytes = mapKeyEvent(KEY_A + i, false, false, true, false, false);

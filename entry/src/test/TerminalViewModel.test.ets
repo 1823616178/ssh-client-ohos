@@ -680,6 +680,31 @@ export default function terminalViewModelTest() {
       expect(env.dirtyCount).assertEqual(1);
     });
 
+    it('T4_会话事件也唤醒notifyContentDirty_DECCKM事件投影标志', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 702);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      expect(env.vm.applicationCursorKeys).assertFalse();
+      env.dirtyCount = 0;
+      // T4：非 terminalData 会话事件（可见叶）也要唤醒帧循环
+      env.host.emit('s-1', { type: 'terminalOpen' });
+      expect(env.dirtyCount >= 1).assertTrue();
+      env.dirtyCount = 0;
+      env.host.emit('s-1', stateChange('disconnected'));
+      expect(env.dirtyCount >= 1).assertTrue();
+      // T10 stub：terminalCursorKeys 投影 DECCKM 标志
+      env.host.emit('s-1', {
+        type: 'terminalCursorKeys',
+        applicationCursorKeys: true
+      });
+      expect(env.vm.applicationCursorKeys).assertTrue();
+      env.host.emit('s-1', {
+        type: 'terminalCursorKeys',
+        applicationCursorKeys: false
+      });
+      expect(env.vm.applicationCursorKeys).assertFalse();
+    });
+
     it('手动重连与取消_转发会话宿主并刷新蒙层', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.dao.put(sampleHost('h1'));
@@ -1011,7 +1036,7 @@ export default function terminalViewModelTest() {
       await env.vm.start({ hostId: '', sessionId: 's-1' });
       env.vm.setViewportWidth(900);
       env.vm.setPaneAreaSize(900, 400);
-      env.vm.openSession('s-2', 'column');
+      await env.vm.openSession('s-2', 'column');
       expect(env.host.connectCalls.length).assertEqual(0);
       expect(env.vm.visiblePanes.length).assertEqual(2);
       expect(env.vm.currentSessionId).assertEqual('s-2');
@@ -1025,7 +1050,7 @@ export default function terminalViewModelTest() {
       await env.vm.start({ hostId: '', sessionId: 's-1' });
       env.vm.setViewportWidth(900);
       env.vm.setPaneAreaSize(900, 400);
-      env.vm.openSession('s-1', 'row');
+      await env.vm.openSession('s-1', 'row');
       expect(env.host.connectCalls.length).assertEqual(1);
       expect(env.host.connectCalls[0].id).assertEqual('h1');
       expect(env.vm.visiblePanes.length).assertEqual(2);

@@ -764,9 +764,10 @@ HarmonyOS 的等价机制是 hvigor 的 `buildProfileFields`——在 `entry/bui
 |---|---|
 | 主机、分组、转发规则、片段 | 当前打开的会话与标签 |
 | 外观主题与字体配置 | 字体文件本身（随包） |
-| known_hosts 指纹 | 后台保活策略、触感开关 |
+| known_hosts 指纹 | 后台保活策略、屏幕常亮档、触感开关 |
 | 密码 / 密码短语（**独立开关，默认关**） | 屏幕方向锁定、功能键条布局 |
 | 私钥内容（**独立开关，默认关**） | 日志、账号 token、设备 id |
+| — | 主机的 tmux 自动附着设置（`tmuxAutoAttach` / `tmuxSessionName`） |
 
 关闭敏感同步时，与桌面端行为一致：**轮换 Vault key + 生成新恢复密钥 + 原子清除云端历史**。
 
@@ -810,6 +811,12 @@ HarmonyOS 的等价机制是 hvigor 的 `buildProfileFields`——在 `entry/bui
 接系统 API），会话侧口子在 `SessionManager`（`activeSessionCount` / `setQuiet` /
 `notifyNetworkChanged` / `suspendAllForPolicy` / `resumeAllSuspended`）。
 
+**先掐源头，再谈降级。** 用户实际遇到的掉线绝大多数始于「自动息屏」，而不是主动切后台：
+息屏 → 应用进后台 → 空闲 SSH 被判低速 → 长时任务被回收 → 优雅断开。所以第一道措施是
+`service/ScreenAwake.ets`：终端页在前台且有活跃会话时给主窗口打常亮标记
+（`window.setWindowKeepScreenOn`，无需权限），设置项「屏幕常亮」三档
+`never / session / always`，默认 `session`。用户按电源键照样能息屏，这里只是不让系统**自动**息屏。
+
 **长时任务不是「申请到就一劳永逸」**：SDK 明确有
 `ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED` 与
 `ContinuousTaskSuspendReason.SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED`——`dataTransfer`
@@ -818,14 +825,24 @@ HarmonyOS 的等价机制是 hvigor 的 `buildProfileFields`——在 `entry/bui
 | 阶段 | 行为 |
 |---|---|
 | 切后台且有活跃会话 | 申请 `dataTransfer` 长时任务（`ohos.permission.KEEP_BACKGROUND_RUNNING` + ability 的 `backgroundModes`），同时进入静默模式（抑制 dirty 唤醒，事件照收、数据不丢） |
+| 息屏（**不假定伴随 `onBackground`**） | 同样按「等同后台」申请长时任务。机型/场景不一，一旦息屏没走到 `onBackground` 就是零保活 + 进程冻结 = 静默失联，正是本节明令不许出现的形态。幂等：已申请/在宽限/在重申则跳过 |
 | 被系统挂起（低速） | **不断连接**，等 `continuousTaskActive` 回来 |
-| 被取消 / 申请失败 | 用短时任务 `requestSuspendDelay` 换一个宽限窗口（≤ 8 s） |
+| 被低速取消（`reason == 4`） | **退避重申**：5 s / 30 s / 120 s，最多 3 次（每个后台回合独立计数，回前台或会话清零即清零）。系统按瞬时速率判低速，空闲 SSH 必然中枪，但隔一阵重申常常还能拿到；一取消就断等于把后台存活砍到几分钟。取舍：重申窗口内若进程被冻结，会退化为静默失联 |
+| 重申耗尽 / 非低速取消 / 申请失败 | 用短时任务 `requestSuspendDelay` 换一个宽限窗口（≤ 8 s） |
 | 宽限到期 | **优雅断开**：只断连接，保留会话面孔与窗格绑定，`SessionInfo.errorMessage` 写明原因与出路 |
-| 回前台 | 释放长时任务、解除静默、原地重连被挂起的会话（sessionId 不变、句柄换新）；没挂起过则做一次切网收敛 |
+| 回前台 | 释放长时任务、撤销重申、解除静默、原地重连被挂起的会话（sessionId 不变、句柄换新）；没挂起过则做一次切网收敛 |
 | 后台会话数归零 | 立刻释放长时任务（不白占资源） |
 
-- 设置项：「后台保持连接」（默认开）/「息屏 N 分钟后断开」（默认关）。前者关掉即走上表的宽限窗口；
-  后者到期同样是策略性断开而非静默失联
+- 「该不该占长时任务」的判据统一收在 `BackgroundPolicy.needsTask()`：有活跃会话 + 没被策略挂起 +
+  用户开着保活 + **画面不在眼前（切后台或息屏）**。唯一不需要的组合是「前台且亮屏」
+- 设置项：「后台保持连接」（默认开）/「息屏 N 分钟后断开」（默认关）/「屏幕常亮」（默认 `session`）。
+  第一项关掉即走上表的宽限窗口；第二项到期同样是策略性断开而非静默失联
+- **断了也不心疼的那一手**：主机级「自动附着 tmux 会话」（`tmuxAutoAttach` / `tmuxSessionName`，
+  本机专有不上云）。移动端保活再努力也挡不住系统回收，而现场挂在 tmux 里，重连后
+  `tmux new -A -s <name>` attach 回去就是原样。执行点在 `TerminalViewModel` 的 `terminalOpen`
+  （每次连接建立都发一遍——重连正是要重新 attach），同一处顺带把此前只存不发的
+  `initCommands` 接上（顺序在 tmux 之后，命令因而跑在 tmux 会话里）；发什么由
+  `common/utils/AutoRun.ets` 纯函数决定，日志只记条数不记内容
 - 系统回收前：模块级 `AbilityStage.onMemoryLevel` 收到 `CRITICAL` 即优雅断开（UIAbility 没有这个回调）
 - 网络切换（WiFi ⇄ 蜂窝）：`NetworkWatcher` 监听默认网，以 **netId 或承载类型变化**为判据
   （同一张网的 capability 抖动不算）。切网后**主动收敛**而不是干等超时——退避倒计时中的会话
