@@ -763,11 +763,18 @@ export struct TerminalCanvas {
     this.paneFocused = focused;
     this.needsFullRedraw = true;
     this.syncBlinkWakeTimer();
-    if (focused && this.useCustomIme && this.visible) {
-      // 软键盘正开着时让输入跟到新聚焦窗格（不改变键盘显隐）
-      const ime: TerminalImeEditor = TerminalImeEditor.get();
-      if (ime.isKeyboardShown()) {
-        ime.attach(this.schedulerId, this.imeClient, true);
+    if (focused && this.visible) {
+      if (this.useCustomIme) {
+        // 物理键事件跟随 ArkUI 焦点：快捷键切窗格时把焦点移到本窗格的宿主 Stack
+        focusControl.requestFocus(this.hostId);
+        // 软键盘正开着时让输入跟到新聚焦窗格（不改变键盘显隐）
+        const ime: TerminalImeEditor = TerminalImeEditor.get();
+        if (ime.isKeyboardShown()) {
+          ime.attach(this.schedulerId, this.imeClient, true);
+        }
+      } else {
+        // 兜底路径：键盘/IME 都经隐藏 TextInput 进来，焦点要跟到本窗格
+        focusControl.requestFocus(this.imeSinkId);
       }
     }
     FrameScheduler.get().wakeup();

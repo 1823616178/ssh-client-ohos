@@ -29,7 +29,7 @@ import { Logger } from '../common/utils/Logger';
  * 键位类别：char=直接字符 / keyCode=经 KeyMap 映射的功能键 / ctrl/alt=粘滞修饰 /
  * copy|paste=剪贴板动作（不产出字节，经 onAction 交给宿主的终端画布执行）
  */
-export type KeyBarKeyKind = 'char' | 'keyCode' | 'ctrl' | 'alt' | 'copy' | 'paste';
+export type KeyBarKeyKind = 'char' | 'keyCode' | 'ctrl' | 'alt' | 'copy' | 'paste' | 'keyboard';
 
 /** 一个键位（自定义布局 JSON 反序列化结果；字段补全为完整形态便于渲染） */
 export interface KeyBarKeySpec {
@@ -109,6 +109,8 @@ export function knownKeySpec(name: string): KeyBarKeySpec | null {
       return { id: 'copy', label: '复制', kind: 'copy', char: '', keyCode: 0 };
     case 'paste':
       return { id: 'paste', label: '粘贴', kind: 'paste', char: '', keyCode: 0 };
+    case 'keyboard':
+      return { id: 'keyboard', label: '⌨', kind: 'keyboard', char: '', keyCode: 0 };
     default:
       return null;
   }
@@ -219,7 +221,7 @@ export function keyFaceOverlayForBackground(color: string): string {
 /** 键位编辑器可选的内置键名（顺序即编辑器「添加按键」列表顺序） */
 export const KEY_BAR_KNOWN_KEY_NAMES: string[] = [
   'esc', 'tab', 'ctrl', 'alt', 'up', 'down', 'left', 'right', 'enter', 'backspace',
-  'home', 'end', 'pgup', 'pgdn', 'copy', 'paste'
+  'home', 'end', 'pgup', 'pgdn', 'copy', 'paste', 'keyboard'
 ];
 
 /** 编辑器「添加字符键」的常用候选 */

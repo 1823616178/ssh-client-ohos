@@ -42,6 +42,7 @@ import {
   TerminalSessionLike,
   TerminalViewModel,
   TerminalParkingLot,
+  adaptSplitDirection,
   deriveOverlay,
   isPasswordRetryError,
   overlayPresentation,
@@ -1331,6 +1332,22 @@ export default function terminalViewModelTest() {
       expect(overlayPresentation(deriveOverlay(overlayInput('established')), true)).assertEqual('none');
       expect(overlayPresentation(deriveOverlay(overlayInput('connecting')), true)).assertEqual('banner');
       expect(overlayPresentation(deriveOverlay(overlayInput('connecting')), false)).assertEqual('full');
+    });
+    it('窄竖屏左右分屏自动改上下_宽屏与尺寸未知保持', 0, async () => {
+      expect(adaptSplitDirection('row', 390, 800)).assertEqual('column');
+      expect(adaptSplitDirection('row', 900, 600)).assertEqual('row');
+      expect(adaptSplitDirection('row', 0, 0)).assertEqual('row');
+      expect(adaptSplitDirection('column', 390, 800)).assertEqual('column');
+      expect(adaptSplitDirection('tab', 390, 800)).assertEqual('tab');
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3401);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(390);
+      env.vm.setPaneAreaSize(390, 700);
+      await env.vm.splitFocused('row');
+      expect(env.vm.dividers.length).assertEqual(1);
+      expect(env.vm.dividers[0].direction).assertEqual('column');
     });
   });
 }

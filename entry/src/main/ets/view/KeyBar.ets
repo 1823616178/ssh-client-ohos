@@ -78,8 +78,8 @@ const KEY_SPACE_VP = 4;
 /** 锁定态描边宽（vp）：与 pressed 态区分（pressed 无描边） */
 const KEY_LOCKED_BORDER_VP = 2;
 
-/** 键位无障碍朗读名 */
-function accessibilityNameOf(spec: KeyBarKeySpec): string {
+/** 键位无障碍朗读名（编辑器页复用） */
+export function accessibilityNameOf(spec: KeyBarKeySpec): string {
   switch (spec.id) {
     case 'up':
       return '上方向键';
@@ -97,8 +97,14 @@ function accessibilityNameOf(spec: KeyBarKeySpec): string {
       return 'Ctrl 修饰键，点按一次生效，长按锁定';
     case 'alt':
       return 'Alt 修饰键，点按一次生效，长按锁定';
+    case 'keyboard':
+      return '显示或隐藏软键盘';
+    case 'esc':
+      return 'Esc 键';
+    case 'tab':
+      return 'Tab 键';
     default:
-      return spec.label;
+      return spec.kind === 'char' ? `字符 ${spec.char}` : spec.label;
   }
 }
 
@@ -210,7 +216,7 @@ export struct KeyBar {
       vibrateLight(this.hapticEnabled);
       return;
     }
-    if (spec.kind === 'copy' || spec.kind === 'paste') {
+    if (spec.kind === 'copy' || spec.kind === 'paste' || spec.kind === 'keyboard') {
       this.onClipboardAction(spec.kind);
       vibrateLight(this.hapticEnabled);
       return;

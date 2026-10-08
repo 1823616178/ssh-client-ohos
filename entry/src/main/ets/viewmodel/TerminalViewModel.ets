@@ -238,6 +238,21 @@ export function overlayPresentation(model: OverlayModel, hasTerminal: boolean): 
   return hasTerminal ? 'banner' : 'full';
 }
 
+/** 窄竖屏判定阈值（vp）：比这窄且竖向时左右分屏每侧不足 40 列，改上下分屏 */
+export const NARROW_SPLIT_WIDTH_VP: number = 600;
+
+/**
+ * 分屏方向自适应：手机竖屏上「左右分屏」两侧都只剩二三十列，几乎没法用，
+ * 自动改为上下分屏；尺寸未知（0）或宽屏时尊重请求。
+ */
+export function adaptSplitDirection(mode: ConnectionOpenMode, widthVp: number,
+  heightVp: number): ConnectionOpenMode {
+  if (mode !== 'row' || widthVp <= 0 || heightVp <= 0) {
+    return mode;
+  }
+  return widthVp < NARROW_SPLIT_WIDTH_VP && widthVp < heightVp ? 'column' : 'row';
+}
+
 // ---------------------------------------------------------------- 渲染快照（页面 ForEach 用）
 
 /** 标签栏一项 */
@@ -1372,7 +1387,8 @@ export class TerminalViewModel {
       this.adoptSession(info, host);
       return;
     }
-    const placement: ConnectionOpenMode = this.resolvePlacementMode(mode);
+    const placement: ConnectionOpenMode =
+      adaptSplitDirection(this.resolvePlacementMode(mode), this.areaWidthVp, this.areaHeightVp);
     if (placement === 'replace') {
       this.switchSession(info.sessionId);
       return;
