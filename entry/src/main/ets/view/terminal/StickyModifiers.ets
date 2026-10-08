@@ -19,7 +19,13 @@
  *     轻震反馈（@ohos.vibrator）也归 T7，本类只管状态。
  *
  * 纯逻辑、不碰 UI；TerminalCanvas 持有实例并在按键出口消费，T7 键条读写状态。
+ * 状态变化通过 addListener 广播：画布在软键盘/物理键出口 consume() 后，
+ * 键条的 Ctrl/Alt 高亮能立即熄灭（旧实现只在键条自己被点时才读回状态，
+ * 用软键盘敲完 Ctrl+C 后 Ctrl 仍显示高亮）。
  */
+
+/** 状态变化监听器 */
+export type StickyModifiersListener = () => void;
 
 /** 粘滞态：idle 未激活 / pressed 下一键生效后复位 / locked 持续生效 */
 export enum StickyState {
@@ -37,25 +43,49 @@ export interface StickySnapshot {
 export class StickyModifiers {
   private ctrl: StickyState = StickyState.IDLE;
   private alt: StickyState = StickyState.IDLE;
+  private readonly listeners: StickyModifiersListener[] = [];
+
+  /** 订阅状态变化；返回取消订阅函数 */
+  addListener(cb: StickyModifiersListener): () => void {
+    this.listeners.push(cb);
+    return (): void => {
+      const i: number = this.listeners.indexOf(cb);
+      if (i >= 0) {
+        this.listeners.splice(i, 1);
+      }
+    };
+  }
+
+  private update(ctrl: StickyState, alt: StickyState): void {
+    if (ctrl === this.ctrl && alt === this.alt) {
+      return;
+    }
+    this.ctrl = ctrl;
+    this.alt = alt;
+    const snapshot: StickyModifiersListener[] = this.listeners.slice();
+    for (const cb of snapshot) {
+      cb();
+    }
+  }
 
   /** 点按 Ctrl：IDLE→PRESSED、PRESSED→IDLE、LOCKED→IDLE（取消锁定） */
   tapCtrl(): void {
-    this.ctrl = this.tapNext(this.ctrl);
+    this.update(this.tapNext(this.ctrl), this.alt);
   }
 
   /** 点按 Alt：同 tapCtrl */
   tapAlt(): void {
-    this.alt = this.tapNext(this.alt);
+    this.update(this.ctrl, this.tapNext(this.alt));
   }
 
   /** 长按 Ctrl（T7 键条入口）：任意态 → LOCKED */
   lockCtrl(): void {
-    this.ctrl = StickyState.LOCKED;
+    this.update(StickyState.LOCKED, this.alt);
   }
 
   /** 长按 Alt（T7 键条入口）：任意态 → LOCKED */
   lockAlt(): void {
-    this.alt = StickyState.LOCKED;
+    this.update(this.ctrl, StickyState.LOCKED);
   }
 
   get ctrlState(): StickyState {
@@ -86,18 +116,13 @@ export class StickyModifiers {
    * 无论该键是否映射出字节序列都应调用（「下一个按键带修饰」以按键计）。
    */
   consume(): void {
-    if (this.ctrl === StickyState.PRESSED) {
-      this.ctrl = StickyState.IDLE;
-    }
-    if (this.alt === StickyState.PRESSED) {
-      this.alt = StickyState.IDLE;
-    }
+    this.update(this.ctrl === StickyState.PRESSED ? StickyState.IDLE : this.ctrl,
+      this.alt === StickyState.PRESSED ? StickyState.IDLE : this.alt);
   }
 
   /** 全部复位（会话切换/窗格关闭时调用） */
   reset(): void {
-    this.ctrl = StickyState.IDLE;
-    this.alt = StickyState.IDLE;
+    this.update(StickyState.IDLE, StickyState.IDLE);
   }
 
   private tapNext(state: StickyState): StickyState {

@@ -17,7 +17,7 @@ import {
   keyBarBytesForKey,
   keyFaceOverlayForBackground,
   parseKeyBarLayout
-} from '../main/ets/view/KeyBar';
+} from '../main/ets/view/KeyBarLayout';
 import { KEY_DPAD_UP, KEY_ESCAPE, KEY_TAB } from '../main/ets/view/terminal/KeyMap';
 
 /** 字节序列断言（null 视为失败） */
@@ -51,7 +51,7 @@ export default function keyBarTest() {
       // 默认布局含 DESIGN §4.4 版面的全部键，外加剪贴板动作键 复制/粘贴
       const ids = keys.map((k: KeyBarKeySpec) => k.id);
       expect(ids.join(',')).assertEqual(
-        'esc,tab,ctrl,alt,up,down,left,right,char:-,char:|,char:~,char:/,copy,paste');
+        'esc,tab,ctrl,alt,up,down,left,right,enter,backspace,char:-,char:|,char:~,char:/,copy,paste');
     });
 
     it('非法JSON回退默认布局', 0, () => {

@@ -10,7 +10,8 @@
  *  - 组件 KeyBar：横向 Scroll + 等高等宽键位；Ctrl/Alt 键点击=tap、长按=lock
  *    （StickyModifiers 三态状态机），高亮态用 app_accent，切换时轻震
  *    （vibrateLight，设备不支持时静默降级）；
- *  - 可见键面 34vp、横向滑动，紧凑但保留外层触摸空间：
+ *  - 键面 40vp 高（≥40vp 触摸目标）、横向滑动；方向键/退格长按自动连发；
+ *    Ctrl/Alt 高亮跟随 StickyModifiers 监听实时刷新（软键盘消费后立即熄灭）：
  *    Ctrl+C 路径 = 点 Ctrl（高亮）→ 软键盘敲 C（T6 IME 出口消费粘滞 → 0x03）；
  *    也可在自定义布局里直接放字母键。
  *
@@ -26,229 +27,79 @@
  * 非聚焦窗格不投递）——键条自身不做焦点判断，多窗格下只投聚焦窗格。
  */
 
-import { JSON } from '@kit.ArkTS';
-import {
-  KEY_BACKSPACE,
-  KEY_DPAD_DOWN,
-  KEY_DPAD_LEFT,
-  KEY_DPAD_RIGHT,
-  KEY_DPAD_UP,
-  KEY_ENTER,
-  KEY_ESCAPE,
-  KEY_MOVE_END,
-  KEY_MOVE_HOME,
-  KEY_PAGE_DOWN,
-  KEY_PAGE_UP,
-  KEY_TAB,
-  mapKeyEvent,
-  mapPrintableChar
-} from './terminal/KeyMap';
 import { StickyModifiers, StickyState } from './terminal/StickyModifiers';
 import { vibrateLight } from '../common/utils/Haptics';
-import { Logger } from '../common/utils/Logger';
 import { Tokens } from '../theme/Tokens';
 import { TerminalClipboardAction } from './terminal/TerminalActionHub';
 import {
   TerminalAppearance,
   createDefaultTerminalAppearance
 } from './terminal/TerminalAppearance';
+import {
+  DEFAULT_KEY_BAR_LAYOUT,
+  KEY_REPEAT_DELAY_MS,
+  KEY_REPEAT_INTERVAL_MS,
+  KeyBarKeySpec,
+  isRepeatableKey,
+  keyBarBytesForKey,
+  keyFaceOverlayForBackground,
+  parseKeyBarLayout
+} from './KeyBarLayout';
 
-// ---------------------------------------------------------------- 键位模型与默认布局
-
-/**
- * 键位类别：char=直接字符 / keyCode=经 KeyMap 映射的功能键 / ctrl/alt=粘滞修饰 /
- * copy|paste=剪贴板动作（不产出字节，经 onAction 交给宿主的终端画布执行）
- */
-export type KeyBarKeyKind = 'char' | 'keyCode' | 'ctrl' | 'alt' | 'copy' | 'paste';
-
-/** 一个键位（自定义布局 JSON 反序列化结果；字段补全为完整形态便于渲染） */
-export interface KeyBarKeySpec {
-  /** 稳定 id（ForEach 键生成器与测试断言用；自定义布局里同名校验不强制） */
-  readonly id: string;
-  /** 键面文字 */
-  readonly label: string;
-  readonly kind: KeyBarKeyKind;
-  /** kind=char 时的发送字符（必须是单字符） */
-  readonly char: string;
-  /** kind=keyCode 时的 HarmonyOS 键码（@ohos.multimodalInput.keyCode 数值） */
-  readonly keyCode: number;
-}
-
-function makeKeyCodeKey(id: string, label: string, keyCode: number): KeyBarKeySpec {
-  return { id: id, label: label, kind: 'keyCode', char: '', keyCode: keyCode };
-}
-
-function makeCharKey(ch: string, label?: string): KeyBarKeySpec {
-  return { id: `char:${ch}`, label: label ?? ch, kind: 'char', char: ch, keyCode: 0 };
-}
-
-/** 内置默认布局（DESIGN §4.4 版面图；C3 keyBarLayout 空串时使用） */
-export const DEFAULT_KEY_BAR_LAYOUT: KeyBarKeySpec[] = [
-  makeKeyCodeKey('esc', 'Esc', KEY_ESCAPE),
-  makeKeyCodeKey('tab', 'Tab', KEY_TAB),
-  { id: 'ctrl', label: 'Ctrl', kind: 'ctrl', char: '', keyCode: 0 },
-  { id: 'alt', label: 'Alt', kind: 'alt', char: '', keyCode: 0 },
-  makeKeyCodeKey('up', '↑', KEY_DPAD_UP),
-  makeKeyCodeKey('down', '↓', KEY_DPAD_DOWN),
-  makeKeyCodeKey('left', '←', KEY_DPAD_LEFT),
-  makeKeyCodeKey('right', '→', KEY_DPAD_RIGHT),
-  makeCharKey('-'),
-  makeCharKey('|'),
-  makeCharKey('~'),
-  makeCharKey('/'),
-  { id: 'copy', label: '复制', kind: 'copy', char: '', keyCode: 0 },
-  { id: 'paste', label: '粘贴', kind: 'paste', char: '', keyCode: 0 }
-];
-
-/** 自定义布局里可按名引用的已知功能键（key 字段 → 规格；char 键走另一条路径） */
-function knownKeySpec(name: string): KeyBarKeySpec | null {
-  switch (name) {
-    case 'esc':
-      return makeKeyCodeKey('esc', 'Esc', KEY_ESCAPE);
-    case 'tab':
-      return makeKeyCodeKey('tab', 'Tab', KEY_TAB);
-    case 'ctrl':
-      return { id: 'ctrl', label: 'Ctrl', kind: 'ctrl', char: '', keyCode: 0 };
-    case 'alt':
-      return { id: 'alt', label: 'Alt', kind: 'alt', char: '', keyCode: 0 };
-    case 'up':
-      return makeKeyCodeKey('up', '↑', KEY_DPAD_UP);
-    case 'down':
-      return makeKeyCodeKey('down', '↓', KEY_DPAD_DOWN);
-    case 'left':
-      return makeKeyCodeKey('left', '←', KEY_DPAD_LEFT);
-    case 'right':
-      return makeKeyCodeKey('right', '→', KEY_DPAD_RIGHT);
-    case 'home':
-      return makeKeyCodeKey('home', 'Home', KEY_MOVE_HOME);
-    case 'end':
-      return makeKeyCodeKey('end', 'End', KEY_MOVE_END);
-    case 'pgup':
-      return makeKeyCodeKey('pgup', 'PgUp', KEY_PAGE_UP);
-    case 'pgdn':
-      return makeKeyCodeKey('pgdn', 'PgDn', KEY_PAGE_DOWN);
-    case 'enter':
-      return makeKeyCodeKey('enter', '⏎', KEY_ENTER);
-    case 'backspace':
-      return makeKeyCodeKey('backspace', '⌫', KEY_BACKSPACE);
-    case 'copy':
-      return { id: 'copy', label: '复制', kind: 'copy', char: '', keyCode: 0 };
-    case 'paste':
-      return { id: 'paste', label: '粘贴', kind: 'paste', char: '', keyCode: 0 };
-    default:
-      return null;
-  }
-}
-
-/**
- * 解析 C3 keyBarLayout 自定义布局 JSON：
- *   [{"key":"esc"},{"key":"ctrl"},{"key":"char","char":";","label":":"}, ...]
- *   - key 为已知功能键名（esc/tab/ctrl/alt/方向/home/end/pgup/pgdn/enter/backspace），
- *     可选 "label" 覆盖键面文字；
- *   - {"key":"char","char":"X"} 定义任意单字符键；
- *   - 容错：非法 JSON / 非数组 / 未知键名 / 非单字符 char 一律跳过或回退默认布局，
- *     绝不因配置损坏让键条消失（空串与解析结果为空均回退 DEFAULT_KEY_BAR_LAYOUT）。
- */
-export function parseKeyBarLayout(json: string): KeyBarKeySpec[] {
-  if (json.trim().length === 0) {
-    return DEFAULT_KEY_BAR_LAYOUT;
-  }
-  let parsed: Object | null;
-  try {
-    parsed = JSON.parse(json);
-  } catch (err) {
-    Logger.warn(`功能键条布局 JSON 非法，回退默认布局：${JSON.stringify(err)}`, 'KeyBar');
-    return DEFAULT_KEY_BAR_LAYOUT;
-  }
-  if (parsed === null || !Array.isArray(parsed)) {
-    Logger.warn('功能键条布局不是数组，回退默认布局', 'KeyBar');
-    return DEFAULT_KEY_BAR_LAYOUT;
-  }
-  const result: KeyBarKeySpec[] = [];
-  for (const item of parsed as Object[]) {
-    const spec = parseKeyBarEntry(item);
-    if (spec !== null) {
-      result.push(spec);
-    }
-  }
-  if (result.length === 0) {
-    Logger.warn('功能键条布局无有效键位，回退默认布局', 'KeyBar');
-    return DEFAULT_KEY_BAR_LAYOUT;
-  }
-  return result;
-}
-
-/** 单条自定义键位解析；非法条目返回 null（跳过，容错） */
-function parseKeyBarEntry(item: Object): KeyBarKeySpec | null {
-  const entry = item as Record<string, Object>;
-  const key = entry['key'];
-  if (typeof key !== 'string') {
-    return null;
-  }
-  const labelOverride = entry['label'];
-  const label = typeof labelOverride === 'string' && labelOverride.length > 0 ? labelOverride : '';
-  if (key === 'char') {
-    const ch = entry['char'];
-    // 单字符判定按码点计（避免把代理对当成两个字符）
-    if (typeof ch !== 'string' || Array.from(ch).length !== 1) {
-      return null;
-    }
-    return makeCharKey(ch, label.length > 0 ? label : undefined);
-  }
-  const known = knownKeySpec(key);
-  if (known === null) {
-    return null; // 未知键名：跳过
-  }
-  if (label.length === 0) {
-    return known;
-  }
-  return { id: known.id, label: label, kind: known.kind, char: known.char, keyCode: known.keyCode };
-}
-
-/**
- * 键位 → VT 字节序列（点击非修饰键时调用；粘滞 Ctrl/Alt 快照在此并入）：
- *   char 键 → mapPrintableChar（Ctrl→控制字符、Alt→ESC 前缀，未定义组合 null 不发送）；
- *   keyCode 键 → mapKeyEvent（方向键序列、Tab、Esc 等，修饰参数由 KeyMap 结算）；
- *   ctrl/alt 修饰键返回 null（不产生字节，只驱动 StickyModifiers 状态机）。
- */
-export function keyBarBytesForKey(spec: KeyBarKeySpec, ctrl: boolean, alt: boolean,
-  applicationCursorKeys: boolean): Uint8Array | null {
-  if (spec.kind === 'char') {
-    return mapPrintableChar(spec.char, alt, ctrl);
-  }
-  if (spec.kind === 'keyCode') {
-    return mapKeyEvent(spec.keyCode, false, alt, ctrl, false, applicationCursorKeys);
-  }
-  return null;
-}
+export {
+  DEFAULT_KEY_BAR_LAYOUT,
+  KEY_BAR_KNOWN_KEY_NAMES,
+  KEY_BAR_SUGGESTED_CHARS,
+  KEY_REPEAT_DELAY_MS,
+  KEY_REPEAT_INTERVAL_MS,
+  KeyBarKeyKind,
+  KeyBarKeySpec,
+  isDefaultKeyBarLayout,
+  isRepeatableKey,
+  keyBarBytesForKey,
+  keyBarContains,
+  keyBarEntryName,
+  keyFaceOverlayForBackground,
+  knownKeySpec,
+  makeKeyBarCharKey,
+  moveKeyBarKey,
+  parseKeyBarLayout,
+  serializeKeyBarLayout
+} from './KeyBarLayout';
 
 // ---------------------------------------------------------------- 组件
 
-/** 可见键面更紧凑；外层键栏仍提供足够的纵向触摸区域。 */
-const KEY_HEIGHT_VP = 34;
+/** 键面高度（vp）：≥40vp 触摸目标 */
+const KEY_HEIGHT_VP = 40;
 /** 键最小宽度（vp） */
-const KEY_MIN_WIDTH_VP = 40;
+const KEY_MIN_WIDTH_VP = 44;
 /** 键间距（vp） */
 const KEY_SPACE_VP = 4;
 /** 锁定态描边宽（vp）：与 pressed 态区分（pressed 无描边） */
 const KEY_LOCKED_BORDER_VP = 2;
-/** 键面底色：叠在终端背景上的低透明度白，深/浅终端外观下都能与底色拉开层次 */
-const KEY_FACE_DARK_OVERLAY = '#26FFFFFF';
-const KEY_FACE_LIGHT_OVERLAY = '#1F000000';
 
-function terminalBackgroundIsDark(color: string): boolean {
-  if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
-    return true;
+/** 键位无障碍朗读名 */
+function accessibilityNameOf(spec: KeyBarKeySpec): string {
+  switch (spec.id) {
+    case 'up':
+      return '上方向键';
+    case 'down':
+      return '下方向键';
+    case 'left':
+      return '左方向键';
+    case 'right':
+      return '右方向键';
+    case 'enter':
+      return '回车';
+    case 'backspace':
+      return '退格';
+    case 'ctrl':
+      return 'Ctrl 修饰键，点按一次生效，长按锁定';
+    case 'alt':
+      return 'Alt 修饰键，点按一次生效，长按锁定';
+    default:
+      return spec.label;
   }
-  const red: number = parseInt(color.substring(1, 3), 16);
-  const green: number = parseInt(color.substring(3, 5), 16);
-  const blue: number = parseInt(color.substring(5, 7), 16);
-  return red * 299 + green * 587 + blue * 114 < 128000;
-}
-
-/** 终端背景明暗 → 键面叠加色；导出供纯逻辑测试覆盖浅色主题适配。 */
-export function keyFaceOverlayForBackground(color: string): string {
-  return terminalBackgroundIsDark(color) ? KEY_FACE_DARK_OVERLAY : KEY_FACE_LIGHT_OVERLAY;
 }
 
 @Component
@@ -278,13 +129,63 @@ export struct KeyBar {
   @Prop appearance: TerminalAppearance = createDefaultTerminalAppearance();
 
   @State private keys: KeyBarKeySpec[] = DEFAULT_KEY_BAR_LAYOUT;
-  // StickyModifiers 非 @Observed：点击后手动读回状态驱动高亮刷新
+  // StickyModifiers 非 @Observed：订阅其监听器，任何出口 consume 后都刷新高亮
   @State private ctrlState: StickyState = StickyState.IDLE;
   @State private altState: StickyState = StickyState.IDLE;
+  /** 正在按住的连发键 id（按下态高亮） */
+  @State private pressedKeyId: string = '';
+  private unsubscribeSticky: () => void = () => {};
+  private repeatDelayTimer: number = -1;
+  private repeatTimer: number = -1;
 
   aboutToAppear(): void {
     this.keys = parseKeyBarLayout(this.layoutJson);
     this.syncModifierStates();
+    this.unsubscribeSticky = this.stickyModifiers.addListener((): void => {
+      this.syncModifierStates();
+    });
+  }
+
+  aboutToDisappear(): void {
+    this.unsubscribeSticky();
+    this.stopRepeat();
+  }
+
+  /** 连发键按下：立即发一次，按住 KEY_REPEAT_DELAY_MS 后按 KEY_REPEAT_INTERVAL_MS 连发 */
+  private startRepeat(spec: KeyBarKeySpec): void {
+    this.stopRepeat();
+    this.pressedKeyId = spec.id;
+    this.sendKey(spec);
+    vibrateLight(this.hapticEnabled);
+    this.repeatDelayTimer = setTimeout((): void => {
+      this.repeatDelayTimer = -1;
+      this.repeatTimer = setInterval((): void => {
+        this.sendKey(spec);
+      }, KEY_REPEAT_INTERVAL_MS);
+    }, KEY_REPEAT_DELAY_MS);
+  }
+
+  private stopRepeat(): void {
+    if (this.repeatDelayTimer >= 0) {
+      clearTimeout(this.repeatDelayTimer);
+      this.repeatDelayTimer = -1;
+    }
+    if (this.repeatTimer >= 0) {
+      clearInterval(this.repeatTimer);
+      this.repeatTimer = -1;
+    }
+    this.pressedKeyId = '';
+  }
+
+  /** 非修饰键出字节（并入粘滞修饰并消费一次性粘滞） */
+  private sendKey(spec: KeyBarKeySpec): void {
+    const snap = this.stickyModifiers.snapshot();
+    const bytes = keyBarBytesForKey(spec, snap.ctrl, snap.alt, this.applicationCursorKeys);
+    // 「下一个按键带修饰」以按键计：无论是否映射出字节都消费一次性粘滞
+    this.stickyModifiers.consume();
+    if (bytes !== null) {
+      this.onSendBytes(bytes);
+    }
   }
 
   private onLayoutChanged(): void {
@@ -314,14 +215,8 @@ export struct KeyBar {
       vibrateLight(this.hapticEnabled);
       return;
     }
-    const snap = this.stickyModifiers.snapshot();
-    const bytes = keyBarBytesForKey(spec, snap.ctrl, snap.alt, this.applicationCursorKeys);
-    // 「下一个按键带修饰」以按键计：无论是否映射出字节都消费一次性粘滞
-    this.stickyModifiers.consume();
-    this.syncModifierStates();
-    if (bytes !== null) {
-      this.onSendBytes(bytes);
-    }
+    this.sendKey(spec);
+    vibrateLight(this.hapticEnabled);
   }
 
   private onKeyLongPress(spec: KeyBarKeySpec): void {
@@ -365,23 +260,46 @@ export struct KeyBar {
     return false;
   }
 
+  @Builder
+  KeyFace(spec: KeyBarKeySpec) {
+    Text(spec.label)
+      .height(KEY_HEIGHT_VP)
+      .constraintSize({ minWidth: KEY_MIN_WIDTH_VP })
+      .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
+      .fontSize(Tokens.fontSize.body)
+      .fontColor(this.isModifierActive(spec) ? Tokens.Color.onAccent : this.appearance.foreground)
+      .textAlign(TextAlign.Center)
+      .backgroundColor(this.isModifierActive(spec) || this.pressedKeyId === spec.id
+        ? Tokens.Color.accent : this.keyFaceColor())
+      .borderRadius(Tokens.radius.sm)
+      .border({
+        width: this.isModifierLocked(spec) ? KEY_LOCKED_BORDER_VP : 0,
+        color: this.appearance.foreground
+      })
+      .accessibilityText(accessibilityNameOf(spec))
+  }
+
   build() {
     Scroll() {
       Row({ space: KEY_SPACE_VP }) {
         ForEach(this.keys, (spec: KeyBarKeySpec) => {
-          Text(spec.label)
-            .height(KEY_HEIGHT_VP)
-            .constraintSize({ minWidth: KEY_MIN_WIDTH_VP })
-            .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
-            .fontSize(Tokens.fontSize.body)
-            .fontColor(this.isModifierActive(spec) ? Tokens.Color.onAccent : this.appearance.foreground)
-            .textAlign(TextAlign.Center)
-            .backgroundColor(this.isModifierActive(spec) ? Tokens.Color.accent : this.keyFaceColor())
-            .borderRadius(Tokens.radius.sm)
-            .border({
-              width: this.isModifierLocked(spec) ? KEY_LOCKED_BORDER_VP : 0,
-              color: this.appearance.foreground
+          if (isRepeatableKey(spec)) {
+            // 连发键：按下即发、按住连发；用 onTouch 而不是手势，避免与横滑抢识别
+            // 时出现「按下不发、抬手才发」的迟滞。横滑时系统发 Cancel，连发随之停止。
+            Column() {
+              this.KeyFace(spec)
+            }
+            .onTouch((event: TouchEvent) => {
+              if (event.type === TouchType.Down) {
+                this.startRepeat(spec);
+              } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+                this.stopRepeat();
+              }
             })
+          } else {
+            Column() {
+              this.KeyFace(spec)
+            }
             .gesture(
               // 互斥识别：快速点按 = tap，按住超阈值 = lock（长按仅修饰键响应）
               GestureGroup(GestureMode.Exclusive,
@@ -395,14 +313,18 @@ export struct KeyBar {
                   })
               )
             )
+          }
         }, (spec: KeyBarKeySpec) => spec.id)
       }
-      .padding({ left: Tokens.space.xs, right: Tokens.space.xs, top: 4, bottom: 4 })
+      .padding({ left: Tokens.space.xs, right: Tokens.space.xs, top: 2, bottom: 2 })
     }
     .scrollable(ScrollDirection.Horizontal)
     .scrollBar(BarState.Off)
     .align(Alignment.Start)
     .width('100%')
     .backgroundColor(this.appearance.background)
+    .onScrollStart(() => {
+      this.stopRepeat();
+    })
   }
 }
