@@ -60,7 +60,8 @@
  *    双指捏合 = 画面缩放预览 + 字号标签，松手只重排一次并经 onFontSizeCommit 落库；
  *  - 光标：DECSCUSR 形状/闪烁覆盖外观设置；闪烁定时器只在可见且聚焦时运行，
  *    输入后重置相位（打字时光标常亮）；非聚焦窗格画空心框；
- *  - 响铃：bellSeq 每变一次闪一下（视觉响铃，节流由 VM 负责）。
+ *  - 响铃：页面经 TerminalActionHub 投递 'bell' 动作时闪一下（视觉响铃，节流由 VM 负责；
+ *    不走 @Prop 计数器——ForEach 同 key 复用节点时 item 快照不会刷新）。
  */
 import { common } from '@kit.AbilityKit';
 import { NativeTerminalFrame } from '../napi/SshNative';
@@ -478,8 +479,6 @@ export struct TerminalCanvas {
    * （每个终端各自的模式，多窗格不串）；旧 native 无该字段时用本参数。
    */
   @Prop applicationCursorKeys: boolean = false;
-  /** 视觉响铃序号：每变化一次画面闪一下（节流在 VM 的 BellLimiter） */
-  @Prop @Watch('onBellSeqChanged') bellSeq: number = 0;
   /**
    * 粘滞修饰键状态机（T6）：T7 功能键条读写（tapCtrl/tapAlt/lockCtrl/lockAlt），
    * 组件在每次物理按键与 IME 提交出口取快照并 consume
@@ -724,6 +723,10 @@ export struct TerminalCanvas {
     }
     if (action === 'scrollBottom') {
       this.scrollToBottom();
+      return;
+    }
+    if (action === 'bell') {
+      this.flashBell();
     }
   }
 
@@ -1946,7 +1949,7 @@ export struct TerminalCanvas {
   }
 
   /** 视觉响铃：叠一层前景色薄膜闪一下 */
-  private onBellSeqChanged(): void {
+  private flashBell(): void {
     if (!this.visible) {
       return;
     }
