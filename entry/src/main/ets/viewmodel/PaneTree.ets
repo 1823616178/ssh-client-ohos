@@ -410,6 +410,33 @@ class SequentialPaneIdFactory implements PaneIdFactory {
   }
 }
 
+/**
+ * 带前缀的自增 id（多窗口改造）：PaneTabSet 的 id 只在实例内唯一，而窗格 id 会进入
+ * 进程级注册表（SessionManager 窗格绑定 / TerminalActionHub），两个窗口各自从
+ * `pane-1` 数起就会撞车。非主窗口注入 `${windowKey}:` 前缀；前缀为空串时与
+ * 默认序列逐字相同（主窗口零行为变化）。
+ */
+export class PrefixedPaneIdFactory implements PaneIdFactory {
+  private readonly prefix: string;
+  private readonly inner: SequentialPaneIdFactory = new SequentialPaneIdFactory();
+
+  constructor(prefix: string) {
+    this.prefix = prefix;
+  }
+
+  newTabId(): string {
+    return `${this.prefix}${this.inner.newTabId()}`;
+  }
+
+  newPaneId(): string {
+    return `${this.prefix}${this.inner.newPaneId()}`;
+  }
+
+  newSplitId(): string {
+    return `${this.prefix}${this.inner.newSplitId()}`;
+  }
+}
+
 export interface AddTabResult {
   readonly tab: PaneTab;
   readonly leaf: PaneLeaf;

@@ -12,13 +12,17 @@
  *
  * 状态来源三处，任一变化都重算一次：
  *   - 终端页可见性：TerminalPage 的 aboutToAppear / aboutToDisappear；
- *   - 应用前后台：EntryAbility 的 onForeground / onBackground；
+ *   - 窗口前后台：所属 Ability 的 onForeground / onBackground（经 WindowLifecycle）；
  *   - 活跃会话数：SessionManager 的会话数监听（与 BackgroundKeepAlive 同一个口）。
+ *
+ * 多窗口：常亮标记是「窗口」属性，故每个窗口一个实例（forWindow(windowKey)），
+ * 各自绑定自己的 WindowStage、各自记终端页可见性与窗口前后台；get() = 主窗口实例。
  *
  * 常亮标记只是「阻止系统自动息屏」，用户按电源键照样能息屏，也不会阻止手动锁屏。
  */
 
 import { window } from '@kit.ArkUI';
+import { MAIN_WINDOW_KEY } from '../common/constants/WindowKeys';
 import { Logger } from '../common/utils/Logger';
 import { KeepScreenOnMode, SettingsRepository } from '../repository/SettingsRepository';
 import { SessionManager } from './SessionManager';
@@ -61,14 +65,48 @@ export interface ScreenAwakeDeps {
 }
 
 export class ScreenAwake {
-  private static instance: ScreenAwake | null = null;
+  /** windowKey → 该窗口的生产实例 */
+  private static readonly byWindow: Map<string, ScreenAwake> = new Map();
 
-  /** 生产单例（EntryAbility / TerminalPage 接线用）；单测请自行 new ScreenAwake(deps) */
+  /** 主窗口生产实例（与改造前单例同义）；单测请自行 new ScreenAwake(deps) */
   static get(): ScreenAwake {
-    if (ScreenAwake.instance === null) {
-      ScreenAwake.instance = new ScreenAwake();
+    return ScreenAwake.forWindow(MAIN_WINDOW_KEY);
+  }
+
+  /** 指定窗口的生产实例（首次访问时创建） */
+  static forWindow(windowKey: string): ScreenAwake {
+    let instance: ScreenAwake | undefined = ScreenAwake.byWindow.get(windowKey);
+    if (instance === undefined) {
+      instance = new ScreenAwake();
+      ScreenAwake.byWindow.set(windowKey, instance);
     }
-    return ScreenAwake.instance;
+    return instance;
+  }
+
+  /** 窗口销毁：停服务并丢弃实例（主窗口只 stop，实例保留） */
+  static releaseWindow(windowKey: string): void {
+    const instance: ScreenAwake | undefined = ScreenAwake.byWindow.get(windowKey);
+    if (instance === undefined) {
+      return;
+    }
+    instance.stop();
+    if (windowKey !== MAIN_WINDOW_KEY) {
+      ScreenAwake.byWindow.delete(windowKey);
+    }
+  }
+
+  /** 设置页改了档位：所有窗口一起刷新 */
+  static refreshAllSettings(): void {
+    ScreenAwake.byWindow.forEach((instance: ScreenAwake) => {
+      instance.refreshSettings();
+    });
+  }
+
+  /** 应用退出：所有窗口还回常亮标记 */
+  static stopAll(): void {
+    ScreenAwake.byWindow.forEach((instance: ScreenAwake) => {
+      instance.stop();
+    });
   }
 
   private readonly deps: ScreenAwakeDeps;
@@ -129,7 +167,7 @@ export class ScreenAwake {
     this.syncSessionCount();
   }
 
-  /** 应用前后台（EntryAbility onForeground / onBackground） */
+  /** 窗口前后台（所属 Ability onForeground / onBackground） */
   setForeground(foreground: boolean): void {
     if (this.foreground === foreground) {
       return;

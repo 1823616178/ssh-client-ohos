@@ -1,79 +1,45 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
-import { Logger } from '../common/utils/Logger';
-import { AppDatabase } from '../repository/AppDatabase';
-import { SettingsRepository } from '../repository/SettingsRepository';
-import { SessionManager } from '../service/SessionManager';
-import { BackgroundKeepAlive } from '../service/background/BackgroundKeepAlive';
-import { ScreenAwake } from '../service/ScreenAwake';
-import { SyncRuntime } from '../service/sync/SyncRuntime';
-import { registerTerminalFonts } from '../theme/FontService';
-import { themeModeToColorModeName } from '../theme/ThemePresets';
+import { MAIN_WINDOW_KEY } from '../common/constants/WindowKeys';
+import { createWindowStorage } from '../common/utils/WindowContext';
+import { WindowLifecycle } from '../service/window/WindowLifecycle';
 
 const DOMAIN = 0x0000;
 
+/**
+ * 主窗口（launchType 缺省 singleton，仍是唯一的主机列表入口）。
+ *
+ * 多窗口改造：进程级初始化与收尾、前后台、屏幕常亮都改走 WindowLifecycle——
+ * 终端窗口（TerminalWindowAbility）与本 Ability 共用一套记账，关闭任意一个
+ * 窗口不再 closeAll，只有最后一个窗口销毁才收尾。单窗口时行为与改造前逐拍一致。
+ */
 export default class EntryAbility extends UIAbility {
+  /** 本窗口的 LocalStorage（windowKey = MAIN_WINDOW_KEY），loadContent 时绑定给页面 */
+  private storage: LocalStorage = createWindowStorage(MAIN_WINDOW_KEY, null);
+  private windowStage: window.WindowStage | null = null;
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    // 初始化日志（X4）：注入上下文以启用 filesDir/logs 文件输出，失败自动降级为仅 hilog
-    Logger.init(this.context);
-    Logger.info('应用启动', 'App');
-    // 初始化应用设置（C3）：获取 preferences store，并对缺失键写入默认值（不覆盖已有值）
-    SettingsRepository.init(this.context);
-    SettingsRepository.ensureDefaults();
-    // 初始化数据库（C1）：打开/迁移 ssh_client.db，失败只记日志不阻断启动
-    AppDatabase.init(this.context);
-    // 注册终端内置字体（T5）：JetBrains Mono + Sarasa Term SC；失败只记日志不阻断启动
-    registerTerminalFonts();
-    // 同步运行时（S6）：保存防抖 / 轮询 / 网络恢复；start() 内部先 hydrate 账号 token（asset），fire-and-forget
-    void SyncRuntime.get().start();
-    // 后台保活（P1，§7.5）：长时任务 + 息屏策略 + 切网收敛；系统能力缺失时内部降级，不阻断启动
-    BackgroundKeepAlive.get().start(this.context);
-    // A6：按 SettingsRepository.themeMode 应用 colorMode（system → NOT_SET 跟随系统；
-    // dark/light 强制；resources/dark/element 的 token 覆盖随之生效）
-    try {
-      const colorModeName = themeModeToColorModeName(SettingsRepository.getThemeMode());
-      let colorMode: ConfigurationConstant.ColorMode =
-        ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
-      if (colorModeName === 'dark') {
-        colorMode = ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
-      } else if (colorModeName === 'light') {
-        colorMode = ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT;
-      }
-      this.context.getApplicationContext().setColorMode(colorMode);
-      Logger.info(`A6 themeMode 应用 colorMode=${colorModeName}`, 'App');
-    } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
-    }
+    // 进程级一次性初始化（日志 / 设置 / 数据库 / 字体 / 同步 / 后台保活 / colorMode）+ 窗口登记
+    WindowLifecycle.onAbilityCreate(MAIN_WINDOW_KEY, this.context);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
 
   onDestroy(): void {
-    // 应用退出/系统回收：先停后台保活（还电、摘系统监听），再优雅关闭全部 SSH 会话
-    // （C4，DESIGN §7.5；幂等，native 后台完成回收）
-    BackgroundKeepAlive.get().stop();
-    ScreenAwake.get().stop();
-    SessionManager.get().closeAll();
-    SyncRuntime.get().stop();
+    // 引用计数减一：最后一个窗口销毁才停后台保活、优雅关闭全部 SSH 会话
+    // （C4，DESIGN §7.5；幂等，native 后台完成回收）；还有终端窗口时它们的会话不受影响
+    WindowLifecycle.onAbilityDestroy(MAIN_WINDOW_KEY);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+    this.windowStage = windowStage;
+    // 屏幕常亮 / 窗口底色 / 窗口获焦订阅（本窗口）
+    WindowLifecycle.onWindowStageCreate(MAIN_WINDOW_KEY, windowStage);
 
-    // 屏幕常亮：终端页在前台且有活跃会话时不让系统自动息屏（避免走上 §7.5 的后台降级链）
-    ScreenAwake.get().start(windowStage);
-
-    windowStage.getMainWindow().then((win: window.Window) => {
-      try {
-        win.setWindowBackgroundColor('#03060A');
-      } catch (_e) {
-      }
-    }).catch((_err: Object) => {
-    });
-
-    windowStage.loadContent('pages/Index', (err) => {
+    windowStage.loadContent('pages/Index', this.storage, (err) => {
       if (err.code) {
         hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
         return;
@@ -84,24 +50,20 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageDestroy(): void {
     // Main window is destroyed, release UI related resources
-    ScreenAwake.get().stop();
+    WindowLifecycle.onWindowStageDestroy(MAIN_WINDOW_KEY, this.windowStage);
+    this.windowStage = null;
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
   }
 
   onForeground(): void {
-    // Ability has brought to foreground
+    // Ability has brought to foreground：应用级前后台由 WindowRegistry 计数后驱动同步 / 后台保活
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
-    SyncRuntime.get().notifyForeground();
-    // P1：还电、解除静默、恢复被策略挂起的会话；没挂起过也会做一次切网收敛
-    BackgroundKeepAlive.get().notifyForeground();
-    ScreenAwake.get().setForeground(true);
+    WindowLifecycle.onForeground(MAIN_WINDOW_KEY);
   }
 
   onBackground(): void {
     // Ability has back to background
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
-    // P1：按设置申请长时任务保活，或走宽限窗口优雅断开（§7.5，绝不静默失联）
-    BackgroundKeepAlive.get().notifyBackground();
-    ScreenAwake.get().setForeground(false);
+    WindowLifecycle.onBackground(MAIN_WINDOW_KEY);
   }
 }

@@ -110,6 +110,9 @@ import {
   withOpacity
 } from './terminal/TerminalPalette';
 import { FocusManager } from './terminal/FocusManager';
+import { MAIN_WINDOW_KEY } from '../common/constants/WindowKeys';
+import { windowKeyOf } from '../common/utils/WindowContext';
+import { WindowRegistry } from '../service/window/WindowRegistry';
 import {
   TerminalActionHub,
   TerminalActionExecutor,
@@ -533,6 +536,11 @@ export struct TerminalCanvas {
   private unsubscribeImeAvailability: () => void = () => {};
   private unsubscribeFocus: () => void = () => {};
   private unsubscribeKeyboardMonitor: () => void = () => {};
+  private unsubscribeWindowActive: () => void = () => {};
+  /** 所在系统窗口（多窗口：焦点表 / 输入法 owner 按窗口区分；aboutToAppear 解析） */
+  private windowKey: string = MAIN_WINDOW_KEY;
+  /** 所在窗口的焦点管理器（每个窗口各一个，窗口间互不抢焦点） */
+  private focusManager: FocusManager = FocusManager.get();
   /** 本窗格是否为输入目标（FocusManager 监听维护；非聚焦画空心光标、不闪烁） */
   private paneFocused: boolean = true;
   /** struct 不能 implements 接口，故用适配器把剪贴板动作转回本实例 */
@@ -688,6 +696,8 @@ export struct TerminalCanvas {
   private bellFlashTimer: number = -1;
 
   aboutToAppear(): void {
+    this.windowKey = windowKeyOf(this.getUIContext());
+    this.focusManager = FocusManager.forWindow(this.windowKey);
     this.shortcutBindings = parseShortcutLayout(this.shortcutBindingsJson);
     this.paneFocused = this.isInputTarget();
     this.applyAppearance();
@@ -705,9 +715,13 @@ export struct TerminalCanvas {
           }
         }
       });
-    this.unsubscribeFocus = FocusManager.get().addListener((_id: string): void => {
+    this.unsubscribeFocus = this.focusManager.addListener((_id: string): void => {
       this.onPaneFocusChanged();
     });
+    this.unsubscribeWindowActive = WindowRegistry.get().addWindowActiveListener(this.windowKey,
+      (): void => {
+        this.onHostWindowActive();
+      });
     this.unsubscribeKeyboardMonitor = ExternalKeyboardMonitor.get().subscribe(
       (change: KeyboardChange): void => {
         this.externalKeyboardActive = nextExternalKeyboardActive(this.externalKeyboardActive, change);
@@ -757,6 +771,7 @@ export struct TerminalCanvas {
     this.unsubscribeImeAvailability();
     this.unsubscribeFocus();
     this.unsubscribeKeyboardMonitor();
+    this.unsubscribeWindowActive();
     TerminalImeEditor.get().release(this.schedulerId);
     TerminalActionHub.get().unregister(this.focusId, this.clipboardExecutor);
     FrameScheduler.get().unregister(this.schedulerId);
@@ -778,7 +793,7 @@ export struct TerminalCanvas {
         // 软键盘正开着时让输入跟到新聚焦窗格（不改变键盘显隐）
         const ime: TerminalImeEditor = TerminalImeEditor.get();
         if (ime.isKeyboardShown()) {
-          ime.attach(this.schedulerId, this.imeClient, true);
+          ime.attach(this.schedulerId, this.imeClient, true, this.windowKey);
         }
       } else {
         // 兜底路径：键盘/IME 都经隐藏 TextInput 进来，焦点要跟到本窗格
@@ -786,6 +801,27 @@ export struct TerminalCanvas {
       }
     }
     FrameScheduler.get().wakeup();
+  }
+
+  /**
+   * 所在窗口获焦（多窗口）：输入法控制器进程唯一、attach 跟随当时的焦点窗口。
+   * 若输入法此刻还挂在别的窗口的画布上，而本画布是本窗口的输入目标，就把它
+   * attach 回来（不弹软键盘）。单窗口时 owner 恒在本窗口，这里永远是 no-op。
+   */
+  private onHostWindowActive(): void {
+    if (!this.useCustomIme || !this.visible || !this.isInputTarget()) {
+      return;
+    }
+    const ime: TerminalImeEditor = TerminalImeEditor.get();
+    if (!ime.isOwnedByOtherWindow(this.windowKey)) {
+      return;
+    }
+    focusControl.requestFocus(this.hostId);
+    ime.attach(this.schedulerId, this.imeClient, false, this.windowKey).then((ok: boolean) => {
+      if (!ok) {
+        Logger.warn('窗口切换后重新 attach 自绘编辑器失败，已切换隐藏输入框兜底', 'Terminal');
+      }
+    });
   }
 
   // ---------------------------------------------------------------- 对外入口
@@ -851,7 +887,7 @@ export struct TerminalCanvas {
 
   /** 输入投递判定：单窗格模式（focusId 空）直通；否则仅聚焦窗格（DESIGN §4.3.1） */
   private isInputTarget(): boolean {
-    return this.focusId.length === 0 || FocusManager.get().isFocused(this.focusId);
+    return this.focusId.length === 0 || this.focusManager.isFocused(this.focusId);
   }
 
   /**
@@ -869,12 +905,12 @@ export struct TerminalCanvas {
     if (this.selection.selecting) {
       this.exitSelectionMode();
       if (this.focusId.length > 0) {
-        FocusManager.get().focus(this.focusId);
+        this.focusManager.focus(this.focusId);
       }
       return;
     }
     if (this.focusId.length > 0) {
-      FocusManager.get().focus(this.focusId);
+      this.focusManager.focus(this.focusId);
     }
     if (event.fingerList.length > 0) {
       const finger = event.fingerList[0];
@@ -902,8 +938,8 @@ export struct TerminalCanvas {
       focusControl.requestFocus(this.hostId);
       const ime: TerminalImeEditor = TerminalImeEditor.get();
       const done: Promise<boolean> = showKeyboard
-        ? ime.show(this.schedulerId, this.imeClient)
-        : ime.attach(this.schedulerId, this.imeClient, false);
+        ? ime.show(this.schedulerId, this.imeClient, this.windowKey)
+        : ime.attach(this.schedulerId, this.imeClient, false, this.windowKey);
       done.then((ok: boolean) => {
         if (!ok) {
           Logger.warn('自绘编辑器不可用，已切换隐藏输入框兜底', 'Terminal');
@@ -930,7 +966,7 @@ export struct TerminalCanvas {
     }
     this.externalKeyboardActive = false;
     if (this.focusId.length > 0) {
-      FocusManager.get().focus(this.focusId);
+      this.focusManager.focus(this.focusId);
     }
     this.requestInput(true);
   }
