@@ -88,6 +88,34 @@ export interface RowRenderEnv {
   boldAsBright: boolean;
   /** true = 逐格出 TextRun（letterSpacing ≠ 0 时组件置位，保字间距对齐） */
   perGlyphText: boolean;
+  /**
+   * 设备像素比（px/vp）。> 0 时所有矩形边与文本起点吸附到物理像素网格：
+   * 分数 vp 行高下相邻行背景不再出现 1px 缝/叠色，光标与选区边缘清晰。
+   * 缺省/≤0 = 不吸附（单测旧口径）。
+   */
+  pixelRatio?: number;
+}
+
+/** 吸附到物理像素网格（ratio ≤ 0 时原样返回） */
+export function snapToPixel(v: number, ratio: number): number {
+  if (!(ratio > 0)) {
+    return v;
+  }
+  return Math.round(v * ratio) / ratio;
+}
+
+function envRatio(env: RowRenderEnv): number {
+  return env.pixelRatio !== undefined && env.pixelRatio > 0 ? env.pixelRatio : 0;
+}
+
+/** 第 col 列左边界（已吸附） */
+export function cellLeftX(env: RowRenderEnv, col: number): number {
+  return snapToPixel(env.originX + col * env.cellWidth, envRatio(env));
+}
+
+/** 第 row 行上边界（已吸附） */
+export function cellTopY(env: RowRenderEnv, row: number): number {
+  return snapToPixel(env.originY + row * env.cellHeight, envRatio(env));
 }
 
 /** 单元格属性管线的最终样式（fg/bg 已按 reverse/bold-as-bright/dim 结算） */
@@ -138,7 +166,8 @@ export function generateRowsCommands(view: DataView, startRow: number, rowCount:
     return result;
   }
   for (let r = 0; r < rowCount; r++) {
-    const rowY = env.originY + (startRow + r) * env.cellHeight;
+    const rowY = cellTopY(env, startRow + r);
+    const rowBottom = cellTopY(env, startRow + r + 1);
     let bgStart = -1;
     let bgArgb = 0;
     let run: TextRun | null = null;
@@ -148,14 +177,14 @@ export function generateRowsCommands(view: DataView, startRow: number, rowCount:
       // ---- 背景合并：默认背景段不出指令（整行已由组件清底）----
       if (style.bg === env.defaultBgArgb) {
         if (bgStart >= 0) {
-          result.backgrounds.push(makeBgRun(bgStart, c, rowY, bgArgb, env));
+          result.backgrounds.push(makeBgRun(bgStart, c, rowY, rowBottom, bgArgb, env));
           bgStart = -1;
         }
       } else if (bgStart < 0) {
         bgStart = c;
         bgArgb = style.bg;
       } else if (style.bg !== bgArgb) {
-        result.backgrounds.push(makeBgRun(bgStart, c, rowY, bgArgb, env));
+        result.backgrounds.push(makeBgRun(bgStart, c, rowY, rowBottom, bgArgb, env));
         bgStart = c;
         bgArgb = style.bg;
       }
@@ -165,15 +194,19 @@ export function generateRowsCommands(view: DataView, startRow: number, rowCount:
         continue;
       }
       // 宽字符占 2 格：字形画在首格，续格只有背景（上面的背景循环已覆盖）
-      const span = (cell.attrs & ATTR_WIDE) !== 0 && c + 1 < cols ? 2 : 1;
-      if (!env.perGlyphText && run !== null && sameTextStyle(run, style)) {
+      const wide: boolean = (cell.attrs & ATTR_WIDE) !== 0;
+      const span = wide && c + 1 < cols ? 2 : 1;
+      // 宽字符（CJK/emoji）的实际字形宽度不一定恰好 = 2×ASCII 格宽（回退字体度量不同），
+      // 与相邻字符合并成一条 fillText 会让后续字形累计漂移出格子；宽字符一律独占一条，
+      // 并且打断前后段，每个宽字形都从自己的格子左缘起笔。
+      if (!env.perGlyphText && !wide && run !== null && sameTextStyle(run, style)) {
         run.text += String.fromCodePoint(cell.codepoint);
         run.cellSpan += span;
       } else {
         run = {
           text: String.fromCodePoint(cell.codepoint),
-          x: env.originX + c * env.cellWidth,
-          y: rowY + env.cellHeight / 2,
+          x: cellLeftX(env, c),
+          y: rowY + (rowBottom - rowY) / 2,
           cellSpan: span,
           fgArgb: style.fg,
           bgArgb: style.bg,
@@ -183,22 +216,27 @@ export function generateRowsCommands(view: DataView, startRow: number, rowCount:
           strike: style.strike
         };
         result.texts.push(run);
+        if (wide) {
+          run = null;
+        }
       }
     }
     if (bgStart >= 0) {
-      result.backgrounds.push(makeBgRun(bgStart, cols, rowY, bgArgb, env));
+      result.backgrounds.push(makeBgRun(bgStart, cols, rowY, rowBottom, bgArgb, env));
     }
   }
   return result;
 }
 
-function makeBgRun(startCol: number, endCol: number, rowY: number, argb: number,
+function makeBgRun(startCol: number, endCol: number, rowY: number, rowBottom: number, argb: number,
   env: RowRenderEnv): BgRun {
+  const x0: number = cellLeftX(env, startCol);
+  const x1: number = cellLeftX(env, endCol);
   return {
-    x: env.originX + startCol * env.cellWidth,
+    x: x0,
     y: rowY,
-    width: (endCol - startCol) * env.cellWidth,
-    height: env.cellHeight,
+    width: x1 - x0,
+    height: rowBottom - rowY,
     argb: argb
   };
 }
@@ -255,19 +293,22 @@ export function generateCursorCommands(style: CursorStyle, view: DataView | null
   if (col < 0 || col >= cols || row < 0 || env.cellWidth <= 0 || env.cellHeight <= 0) {
     return result;
   }
-  const x = env.originX + col * env.cellWidth;
-  const rowY = env.originY + row * env.cellHeight;
+  const ratio: number = envRatio(env);
+  const x = cellLeftX(env, col);
+  const rowY = cellTopY(env, row);
+  const rowH = cellTopY(env, row + 1) - rowY;
   if (style === 'bar') {
-    const w = Math.max(CURSOR_BAR_MIN_WIDTH_VP, env.cellWidth * CURSOR_BAR_WIDTH_FRACTION);
-    result.backgrounds.push({ x: x, y: rowY, width: w, height: env.cellHeight, argb: cursorArgb });
+    const w = Math.max(CURSOR_BAR_MIN_WIDTH_VP, snapToPixel(env.cellWidth * CURSOR_BAR_WIDTH_FRACTION, ratio));
+    result.backgrounds.push({ x: x, y: rowY, width: w, height: rowH, argb: cursorArgb });
     return result;
   }
   if (style === 'underline') {
-    const h = Math.max(CURSOR_UNDERLINE_MIN_HEIGHT_VP, env.cellHeight * CURSOR_UNDERLINE_HEIGHT_FRACTION);
+    const h = Math.max(CURSOR_UNDERLINE_MIN_HEIGHT_VP,
+      snapToPixel(env.cellHeight * CURSOR_UNDERLINE_HEIGHT_FRACTION, ratio));
     result.backgrounds.push({
       x: x,
-      y: rowY + env.cellHeight - h,
-      width: env.cellWidth,
+      y: rowY + rowH - h,
+      width: cellLeftX(env, col + 1) - x,
       height: h,
       argb: cursorArgb
     });
@@ -297,15 +338,15 @@ export function generateCursorCommands(style: CursorStyle, view: DataView | null
   result.backgrounds.push({
     x: x,
     y: rowY,
-    width: cellSpan * env.cellWidth,
-    height: env.cellHeight,
+    width: cellLeftX(env, col + cellSpan) - x,
+    height: rowH,
     argb: fg // 反色：原前景当块色
   });
   if (glyph.length > 0) {
     result.texts.push({
       text: glyph,
       x: x,
-      y: rowY + env.cellHeight / 2,
+      y: rowY + rowH / 2,
       cellSpan: cellSpan,
       fgArgb: bg, // 反色：原背景当字形色
       bgArgb: fg,
