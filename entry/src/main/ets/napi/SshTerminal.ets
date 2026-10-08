@@ -107,6 +107,32 @@ export function collectDirtyRanges(dirty: ArrayBuffer, rows: number): DirtyRange
 }
 
 /**
+ * 把行 row 并入有序不相交的区间序列（原地修改并返回）：光标闪烁相位翻转时只需重绘光标行。
+ * 已被覆盖则不变；与相邻区间接壤则合并；越界忽略。
+ */
+export function addCursorRowRange(ranges: DirtyRange[], row: number, rows: number): DirtyRange[] {
+  if (row < 0 || row >= rows) {
+    return ranges;
+  }
+  let i = 0;
+  while (i < ranges.length && ranges[i].end < row) {
+    i++;
+  }
+  if (i < ranges.length && ranges[i].start <= row + 1) {
+    // 与 ranges[i] 重叠或接壤
+    ranges[i].start = Math.min(ranges[i].start, row);
+    ranges[i].end = Math.max(ranges[i].end, row + 1);
+    if (i + 1 < ranges.length && ranges[i + 1].start <= ranges[i].end) {
+      ranges[i].end = Math.max(ranges[i].end, ranges[i + 1].end);
+      ranges.splice(i + 1, 1);
+    }
+    return ranges;
+  }
+  ranges.splice(i, 0, { start: row, end: row + 1 });
+  return ranges;
+}
+
+/**
  * R-9 自检模式（32 字节，与 native terminal_bridge.cpp MakeSelfTestPattern
  * 逐字节一致，改一侧必须同步另一侧）：
  *   0-7 "SSHTGRID"；8-11 u32 LE 0x01020304；12-15 u32 LE 0xA5A55A5A；16-31 递增 0..15
