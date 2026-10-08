@@ -19,6 +19,7 @@ import daoTest from './Dao.test';
 import credentialStoreTest from './CredentialStore.test';
 import sessionManagerTest from './SessionManager.test';
 import hostListViewModelTest from './HostListViewModel.test';
+import miniTerminalModelTest from './MiniTerminalModel.test';
 import hostEditViewModelTest from './HostEditViewModel.test';
 import terminalViewModelTest from './TerminalViewModel.test';
 import paneTreeTest from './PaneTree.test';
@@ -60,6 +61,7 @@ export default function testsuite() {
   credentialStoreTest();
   sessionManagerTest();
   hostListViewModelTest();
+  miniTerminalModelTest();
   hostEditViewModelTest();
   terminalViewModelTest();
   paneTreeTest();
