@@ -168,6 +168,7 @@ import {
   SelectionHandleId,
   SGR_BUTTON_NONE,
   ScrollLineAccumulator,
+  WheelLineAccumulator,
   buildAltScrollSequences,
   clampScrollOffset,
   encodeSgrMouseEvent,
@@ -179,6 +180,7 @@ import {
   selectionHandleHitRects,
   sgrButtonFromOhosButton,
   shouldForwardMouseEvent,
+  wheelSgrSequences,
   wordSelectAt
 } from './terminal/TerminalGestures';
 import {
@@ -234,6 +236,8 @@ const BELL_FLASH_OPACITY = 0.18;
 const BELL_FLASH_MS = 140;
 /** 非聚焦窗格空心光标线宽 */
 const HOLLOW_CURSOR_LINE_VP = 1;
+/** 轴事件后这段时间内的鼠标源 pan 视为同一次滚动（不重复处理） */
+const AXIS_PAN_SUPPRESS_MS = 150;
 
 /**
  * CanvasRenderingContext2D → TextMeasureContext 的名义类型适配（U4 修复）：
@@ -602,6 +606,10 @@ export struct TerminalCanvas {
   private readonly scrollAccumulator: ScrollLineAccumulator = new ScrollLineAccumulator();
   /** 上一次 pan 事件的累计位移（算增量用） */
   private panLastOffsetY = 0;
+  /** 鼠标滚轮 / 触控板轴事件换算器（2in1） */
+  private readonly wheelAccumulator: WheelLineAccumulator = new WheelLineAccumulator();
+  /** 最近一次轴事件时间：同一滚动若又被识别成鼠标源 pan，则忽略 pan，避免双倍滚动 */
+  private lastAxisEventMs = 0;
   /** 最近一帧元信息缓存（手势决策用）：alt-screen / 鼠标上报 / 回滚行数 */
   private lastAltScreen = false;
   private lastMouseMode = 0;
@@ -1050,9 +1058,8 @@ export struct TerminalCanvas {
    *
    * ArkUI MouseEvent 接线（本组件 build 中 .onMouse）：
    *   - action=PRESS/RELEASE/MOVE → encodeSgrMouseEvent → sendInputBytes；
-   *   - 滚轮：部分 API 版本 MouseEvent 无 wheel 字段，走触控板/触摸 pan 的
-   *     buildAltScrollSequences('mouse', ...) 已覆盖；若设备侧补上
-   *     event.wheelDelta，可在 onWheel 上调 encodeSgrWheel（TODO 调用点）。
+   *   - 滚轮 / 触控板双指：走 onAxisEvent（API 17+，见 onAxis），按模式转 SGR 滚轮、
+   *     方向键或本地回滚滚动。
    *   - mouseMode=0 时完全不转发（本地选择/滚动语义不变）。
    */
   private onMouseEventReport(action: string, ohosButton: number, localX: number,
@@ -1833,6 +1840,9 @@ export struct TerminalCanvas {
    * （回滚偏移增大 / 发上滚序列），手指上滑看新内容。
    */
   private handleVerticalPan(deltaYPx: number, event: GestureEvent): void {
+    if (event.source === SourceType.Mouse && Date.now() - this.lastAxisEventMs < AXIS_PAN_SUPPRESS_MS) {
+      return; // 滚轮/触控板已由 onAxisEvent 处理
+    }
     const lines = this.scrollAccumulator.push(deltaYPx, this.cellHeightVp);
     if (lines === 0) {
       return;
@@ -1860,6 +1870,48 @@ export struct TerminalCanvas {
     }
     // 主屏：视图滚动回滚缓冲（整窗重绘在 renderFrame 的 paintScrolledWindow）
     this.setScrollOffset(this.scrollOffsetLines + lines);
+  }
+
+  /**
+   * 鼠标滚轮 / 触控板双指（2in1，onAxisEvent）：
+   *   - 远端开了鼠标上报 → SGR 滚轮序列（vim/htop/tmux 等自己滚）；
+   *   - alt-screen 且非 view 模式 → 方向键 / SGR（同触摸拖动语义）；
+   *   - 否则滚本地回滚缓冲。
+   */
+  private onAxis(event: AxisEvent): void {
+    const value: number = event.getVerticalAxisValue();
+    if (value === 0) {
+      return;
+    }
+    this.lastAxisEventMs = Date.now();
+    this.fling.stop();
+    const isWheel: boolean = event.scrollStep !== undefined && event.scrollStep > 0;
+    const step: number = event.scrollStep !== undefined ? event.scrollStep : 0;
+    const downLines: number = this.wheelAccumulator.push(value, step, isWheel, this.cellHeightVp);
+    if (downLines === 0) {
+      return;
+    }
+    const pos = this.gridPosFromPoint(event.x, event.y);
+    if (this.mouseReportingActive && this.isInputTarget()) {
+      for (const seq of wheelSgrSequences(downLines, pos.col + 1, pos.row + 1)) {
+        this.sendScrollSequence(seq);
+      }
+      return;
+    }
+    // 与触摸拖动同号约定：正 = 看更旧的内容
+    const olderLines: number = -downLines;
+    if (this.lastAltScreen && this.altScrollMode !== 'view') {
+      if (!this.isInputTarget()) {
+        return;
+      }
+      const seqs = buildAltScrollSequences(this.altScrollMode, this.lastMouseMode, olderLines,
+        pos.col + 1, pos.row + 1, this.appCursorKeys());
+      for (const seq of seqs) {
+        this.sendScrollSequence(seq);
+      }
+      return;
+    }
+    this.setScrollOffset(this.scrollOffsetLines + olderLines);
   }
 
   /** alt-screen 滚动序列：写终端但不算「用户输入」（不触发回到底部/回调） */
@@ -2823,6 +2875,9 @@ export struct TerminalCanvas {
           })
       )
     )
+    .onAxisEvent((event: AxisEvent): void => {
+      this.onAxis(event);
+    })
     .onMouse((event: MouseEvent): void => {
       // T11：鼠标/触控板（2in1）。frame.mouseMode≠0 时按 SGR 1006 转发；
       // mouseMode=0 时只更新最近格子（双击选词定位用），不改变触摸语义。

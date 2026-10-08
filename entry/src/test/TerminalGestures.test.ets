@@ -53,7 +53,10 @@ import {
   selectionHandleHitRects,
   sgrButtonFromOhosButton,
   shouldForwardMouseEvent,
-  wordSelectAt
+  wordSelectAt,
+  WheelLineAccumulator,
+  WHEEL_MAX_LINES_PER_EVENT,
+  wheelSgrSequences
 } from '../main/ets/view/terminal/TerminalGestures';
 import {
   containsLineBreak,
@@ -132,6 +135,14 @@ function fillAsciiLine(grid: LineGrid, row: number, text: string, startCol: numb
       col++;
     }
   }
+}
+
+function bytesToAscii(bytes: Uint8Array): string {
+  let out: string = '';
+  for (let i = 0; i < bytes.length; i++) {
+    out += String.fromCharCode(bytes[i]);
+  }
+  return out;
 }
 
 export default function terminalGesturesTest() {
@@ -439,6 +450,27 @@ export default function terminalGesturesTest() {
       expect(geo.start.y).assertEqual(16);
       expect(geo.end.x).assertEqual((1 + 1) * 8);
       expect(geo.end.y).assertEqual(0);
+    });
+    it('滚轮轴事件_鼠标按格换算_触控板按行高累计_单次上限_SGR序列', 0, () => {
+      const acc: WheelLineAccumulator = new WheelLineAccumulator();
+      // 鼠标一格 15°，scrollStep=3 → 3 行；向上为负
+      expect(acc.push(15, 3, true, 20)).assertEqual(3);
+      expect(acc.push(-15, 0, true, 20)).assertEqual(-3);
+      // 高精度滚轮：半格累计
+      expect(acc.push(7.5, 2, true, 20)).assertEqual(1);
+      expect(acc.push(7.5, 2, true, 20)).assertEqual(1);
+      acc.reset();
+      // 触控板：按行高累计余量
+      expect(acc.push(10, 0, false, 20)).assertEqual(0);
+      expect(acc.push(10, 0, false, 20)).assertEqual(1);
+      expect(acc.push(-1000, 0, false, 20)).assertEqual(-WHEEL_MAX_LINES_PER_EVENT);
+      expect(acc.push(0, 0, false, 20)).assertEqual(0);
+      const up: Uint8Array[] = wheelSgrSequences(-2, 5, 7);
+      expect(up.length).assertEqual(2);
+      expect(bytesToAscii(up[0])).assertEqual('\x1b[<64;5;7M');
+      const down: Uint8Array[] = wheelSgrSequences(1, 1, 1);
+      expect(bytesToAscii(down[0])).assertEqual('\x1b[<65;1;1M');
+      expect(wheelSgrSequences(100, 1, 1).length).assertEqual(WHEEL_MAX_LINES_PER_EVENT);
     });
   });
 }

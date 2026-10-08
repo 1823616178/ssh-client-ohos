@@ -576,3 +576,62 @@ export function selectionHandleAnchor(which: SelectionHandleId,
   const cx = originX + col * cellWidth + cellWidth / 2;
   return { x: cx, y: cy };
 }
+
+// ---------------------------------------------------------------- 鼠标滚轮 / 触控板轴事件（2in1）
+
+/** 鼠标滚轮一格对应的轴值（OHOS 以角度计，一格 15°） */
+export const WHEEL_NOTCH_AXIS_VALUE: number = 15;
+/** 系统未给 scrollStep 时，鼠标滚轮一格滚动的行数 */
+export const WHEEL_DEFAULT_STEP_LINES: number = 3;
+/** 单个轴事件最多换算的行数（防止高精度滚轮一次甩出几百行 / 几百个方向键） */
+export const WHEEL_MAX_LINES_PER_EVENT: number = 12;
+
+/**
+ * 轴事件 → 整行换算（余量跨事件累计）。
+ * 返回值符号：正 = 向下滚（看更新的内容），负 = 向上滚（看更旧的内容）。
+ *   - 鼠标滚轮（scrollStep > 0 或明确是鼠标）：value / 15 × step 行；
+ *   - 触控板双指（无 scrollStep）：value 视作 vp 位移，按行高换算。
+ */
+export class WheelLineAccumulator {
+  private residual: number = 0;
+
+  push(axisValue: number, scrollStep: number, isMouseWheel: boolean, cellHeightVp: number): number {
+    if (!Number.isFinite(axisValue) || axisValue === 0) {
+      return 0;
+    }
+    if (isMouseWheel) {
+      const step: number = scrollStep > 0 ? scrollStep : WHEEL_DEFAULT_STEP_LINES;
+      this.residual += axisValue / WHEEL_NOTCH_AXIS_VALUE * step;
+    } else {
+      this.residual += axisValue / Math.max(1, cellHeightVp);
+    }
+    let lines: number = Math.trunc(this.residual);
+    this.residual -= lines;
+    if (lines > WHEEL_MAX_LINES_PER_EVENT) {
+      lines = WHEEL_MAX_LINES_PER_EVENT;
+    } else if (lines < -WHEEL_MAX_LINES_PER_EVENT) {
+      lines = -WHEEL_MAX_LINES_PER_EVENT;
+    }
+    return lines;
+  }
+
+  reset(): void {
+    this.residual = 0;
+  }
+}
+
+/**
+ * 滚轮在 alt-screen / 鼠标上报模式下要发给远端的 SGR 滚轮序列（每行一条）。
+ * @param downLines 正 = 向下，负 = 向上
+ */
+export function wheelSgrSequences(downLines: number, col1: number, row1: number): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  const count: number = Math.min(Math.abs(Math.trunc(downLines)), WHEEL_MAX_LINES_PER_EVENT);
+  for (let i = 0; i < count; i++) {
+    const seq: Uint8Array | null = encodeSgrWheel(downLines < 0, col1, row1);
+    if (seq !== null) {
+      out.push(seq);
+    }
+  }
+  return out;
+}
