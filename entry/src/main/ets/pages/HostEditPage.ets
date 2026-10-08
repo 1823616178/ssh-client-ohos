@@ -21,7 +21,6 @@
  * aboutToDisappear 兜底再清一次。VM 与日志绝不接触明文（见 HostEditViewModel 头注）。
  */
 
-import { router } from '@kit.ArkUI';
 import { AuthType, PortForwardType } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
 import { Tokens } from '../theme/Tokens';
@@ -95,7 +94,7 @@ struct HostEditPage {
   /** 路由参数读取（编辑模式由 HostListPage 传入 hostId；缺省/非法 = 新建） */
   private readHostIdParam(): string {
     try {
-      const params: Object | undefined = router.getParams();
+      const params: Object | undefined = this.getUIContext().getRouter().getParams();
       if (params === undefined || params === null) {
         return '';
       }
@@ -180,7 +179,7 @@ struct HostEditPage {
       this.clearCredentialStates();
       if (outcome === 'ok') {
         this.toast('已保存');
-        router.back();
+        this.getUIContext().getRouter().back();
       } else if (outcome === 'invalid') {
         this.toast('请修正表单中标红的错误');
       } else {
@@ -464,7 +463,7 @@ struct HostEditPage {
           .borderRadius(Tokens.radius.sm)
           .margin({ top: Tokens.space.xs })
           .onClick(() => {
-            router.pushUrl({ url: 'pages/KeyManagerPage' });
+            this.getUIContext().getRouter().pushUrl({ url: 'pages/KeyManagerPage' });
           })
       }
     }

@@ -12,7 +12,6 @@
  * 支持全文搜索、分类查看、增删管理，并清晰标识「云端同步」与「本机专有」属性。
  */
 
-import { router } from '@kit.ArkUI';
 import {
   AppearanceProfile,
   HostGroup,
@@ -226,7 +225,7 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.sm)
           .height(ACTION_BTN_HEIGHT_VP)
           .onClick(() => {
-            router.pushUrl({ url: 'pages/HostEditPage' });
+            this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage' });
           })
       }
       .width('100%')
@@ -299,7 +298,7 @@ struct ConfigManagerPage {
                 .onClick(() => {
                   const params: Record<string, Object> = {};
                   params['hostId'] = host.id;
-                  router.pushUrl({ url: 'pages/HostEditPage', params: params });
+                  this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage', params: params });
                 })
 
               Button('删除')
@@ -559,7 +558,7 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.sm)
           .height(ACTION_BTN_HEIGHT_VP)
           .onClick(() => {
-            router.pushUrl({ url: 'pages/AppearancePage' });
+            this.getUIContext().getRouter().pushUrl({ url: 'pages/AppearancePage' });
           })
       }
       .width('100%')

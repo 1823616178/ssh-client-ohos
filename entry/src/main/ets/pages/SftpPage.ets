@@ -9,7 +9,6 @@
  * Design Tokens only。
  */
 
-import { router } from '@kit.ArkUI';
 import { SessionManager, SessionInfo } from '../service/SessionManager';
 import { Tokens } from '../theme/Tokens';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
@@ -148,7 +147,7 @@ struct SftpPage {
   }
 
   private readRouteParams(): SftpRouteParams {
-    const raw: object | null = router.getParams() as object | null;
+    const raw: object | null = this.getUIContext().getRouter().getParams() as object | null;
     if (raw === null) {
       return {};
     }

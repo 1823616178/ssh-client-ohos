@@ -7,7 +7,6 @@
  * 右侧动作建议 ≤2 个；主操作 primary=true（accent 底 + onAccent 字）。
  */
 
-import { router } from '@kit.ArkUI';
 import { Tokens } from '../theme/Tokens';
 
 /** 顶栏右侧动作（最多建议 2 个） */
@@ -50,7 +49,7 @@ export struct PageHeader {
           .height(36)
           .accessibilityText(this.backLabel)
           .onClick(() => {
-            router.back();
+            this.getUIContext().getRouter().back();
           })
           .margin({ right: Tokens.space.sm })
         }
