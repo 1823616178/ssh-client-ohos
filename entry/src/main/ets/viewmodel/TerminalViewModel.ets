@@ -620,6 +620,11 @@ export interface TerminalViewModelDeps {
   onBell?: (paneId: string) => void;
   /** 时钟（响铃节流用；单测注入） */
   now?: () => number;
+  /**
+   * 首叶 paneId（缺省 TERMINAL_MAIN_PANE_ID）。Index 侧栏嵌入终端用自己的 id，
+   * 既与画布 focusId 一致（焦点 / 光标形态正确），也不与全页终端的首叶抢绑定。
+   */
+  mainPaneId?: string;
 }
 
 /** 已 attach 终端的缓存条目：终端 + 绑定的 native 句柄（重连换柄检测依据） */
@@ -689,6 +694,7 @@ export class TerminalViewModel {
   private readonly injectedParking: TerminalParkingLike | null;
   private readonly bellHook: (paneId: string) => void;
   private readonly nowFn: () => number;
+  private readonly mainPaneId: string;
   /** 等待密码补录的主机（补录成功后按它重新拨号；非补录期为 null） */
   private pendingPasswordHost: HostProfile | null = null;
   /** 补录成功后的落点；页面初次进入等价 replace，连接面板可指定标签或分屏。 */
@@ -740,6 +746,7 @@ export class TerminalViewModel {
     this.injectedParking = deps?.parking ?? null;
     this.bellHook = deps?.onBell ?? ((_paneId: string): void => {});
     this.nowFn = deps?.now ?? ((): number => Date.now());
+    this.mainPaneId = deps?.mainPaneId ?? TERMINAL_MAIN_PANE_ID;
     this.unsubFocus = this.focusHost.addListener((id: string): void => {
       this.onExternalFocus(id);
     });
@@ -975,7 +982,7 @@ export class TerminalViewModel {
     const title: string = info.hostName.length > 0 ? info.hostName :
       (host === null ? '终端' : (host.name.length > 0 ? host.name : host.host));
     if (this.tabSet.tabs.length === 0) {
-      const added = this.tabSet.addTab(title, TERMINAL_MAIN_PANE_ID);
+      const added = this.tabSet.addTab(title, this.mainPaneId);
       added.leaf.sessionId = info.sessionId;
       this.focusedPaneId = added.leaf.paneId;
       this.lastFocusByTab.set(added.tab.tabId, added.leaf.paneId);
@@ -998,7 +1005,7 @@ export class TerminalViewModel {
     this.registerListeners();
     // 从主机列表恢复：先取回寄存终端（画面 / 回滚保留，断线期也能看到旧画面）
     this.adoptParked(info.sessionId);
-    const paneId: string = this.focusedPaneId.length > 0 ? this.focusedPaneId : TERMINAL_MAIN_PANE_ID;
+    const paneId: string = this.focusedPaneId.length > 0 ? this.focusedPaneId : this.mainPaneId;
     try {
       this.sessionHost().bindPane(info.sessionId, paneId);
     } catch (err) {

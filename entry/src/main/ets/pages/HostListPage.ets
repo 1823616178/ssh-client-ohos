@@ -25,10 +25,13 @@ import { Tokens } from '../theme/Tokens';
 import { SyncRuntime } from '../service/sync/SyncRuntime';
 import { pushTerminalForHost, pushTerminalForSession } from '../common/utils/TerminalNavigation';
 import {
+  ActiveSessionItem,
+  ActiveSessionLike,
   HostConnStatus,
   HostListRow,
   HostListViewModel,
   QuickConnectTarget,
+  buildActiveSessionItems,
   parseQuickConnectAddress,
   recordHostLastUsed
 } from '../viewmodel/HostListViewModel';
@@ -91,6 +94,8 @@ export struct HostListPage {
   @State private searchText: string = '';
   /** 快速直连展开态：主机列表非空时默认收起，空态保留完整 CTA */
   @State private quickConnectExpanded: boolean = false;
+  /** 后台运行中的会话（终端页返回不断开；点按恢复） */
+  @State private activeSessions: ActiveSessionItem[] = [];
   /** 视图模型：搜索串 / 折叠集合 / 派生行（生产依赖惰性解析 AppDatabase / SettingsRepository） */
   private readonly viewModel: HostListViewModel = new HostListViewModel();
   private readonly dataSource: HostRowDataSource = new HostRowDataSource();
@@ -104,8 +109,14 @@ export struct HostListPage {
       if (event.type === 'stateChange') {
         this.refreshConnStatus();
         this.reloadRows();
+        this.refreshActiveSessions();
       }
     };
+
+  /** 会话增删（连接受理 / 关闭）→ 刷新活动会话 */
+  private readonly sessionCountListener = (): void => {
+    this.refreshActiveSessions();
+  };
 
   aboutToAppear(): void {
     // 首载失败（数据库未就绪）时 VM 已记日志，列表保持空态，不打扰用户
@@ -119,6 +130,8 @@ export struct HostListPage {
     // SyncRuntime.start() 是 fire-and-forget；冷启动补一次 hydrate，避免芯片瞬间误报
     void this.refreshSyncChipAfterHydrate();
     SessionManager.get().addEventListener(this.sessionListener);
+    SessionManager.get().addSessionCountListener(this.sessionCountListener);
+    this.refreshActiveSessions();
   }
 
   private async refreshSyncChipAfterHydrate(): Promise<void> {
@@ -128,6 +141,44 @@ export struct HostListPage {
 
   aboutToDisappear(): void {
     SessionManager.get().removeEventListener(this.sessionListener);
+    SessionManager.get().removeSessionCountListener(this.sessionCountListener);
+  }
+
+  /** 活动会话：未绑定窗格（终端页已返回）且非终态的会话 */
+  private refreshActiveSessions(): void {
+    const names: Map<string, string> = new Map();
+    for (const host of this.viewModel.hosts) {
+      names.set(host.id, host.name.length > 0 ? host.name : host.host);
+    }
+    const sessions: ActiveSessionLike[] = SessionManager.get().listSessions();
+    this.activeSessions = buildActiveSessionItems(sessions, names);
+  }
+
+  private resumeSession(sessionId: string): void {
+    pushTerminalForSession(sessionId);
+  }
+
+  private confirmCloseSession(item: ActiveSessionItem): void {
+    AlertDialog.show({
+      title: '断开会话？',
+      message: `将断开「${item.title}」，未保存的远端工作（非 tmux/screen）会丢失。`,
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '断开',
+        fontColor: Tokens.Color.danger,
+        action: () => {
+          SessionManager.get().close(item.sessionId);
+          this.refreshConnStatus();
+          this.reloadRows();
+          this.refreshActiveSessions();
+        }
+      }
+    });
   }
 
   /** 从 C4 会话列表重派生状态点（SessionInfo[] 结构性满足 HostSessionStateLike） */
@@ -319,6 +370,64 @@ export struct HostListPage {
 
   // ---------------------------------------------------------------- 视图
 
+  @Builder
+  ActiveSessionsSection() {
+    Column() {
+      Text(`活动会话（${this.activeSessions.length}）`)
+        .fontSize(Tokens.fontSize.body)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.Color.text)
+        .margin({ bottom: Tokens.space.xs2 })
+      ForEach(this.activeSessions, (item: ActiveSessionItem) => {
+        Row() {
+          Column()
+            .width(8)
+            .height(8)
+            .borderRadius(4)
+            .backgroundColor(this.connStatusColor(item.status))
+          Column() {
+            Text(item.title)
+              .fontSize(Tokens.fontSize.body)
+              .fontColor(Tokens.Color.text)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(`${item.statusLabel} · 点按恢复`)
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(Tokens.Color.textDim)
+              .maxLines(1)
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+          .margin({ left: Tokens.space.sm })
+          Text('断开')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.danger)
+            .height(40)
+            .constraintSize({ minWidth: 48 })
+            .textAlign(TextAlign.Center)
+            .accessibilityText(`断开会话 ${item.title}`)
+            .onClick(() => {
+              this.confirmCloseSession(item);
+            })
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 48 })
+        .alignItems(VerticalAlign.Center)
+        .accessibilityGroup(true)
+        .accessibilityText(`恢复会话 ${item.title}，${item.statusLabel}`)
+        .onClick(() => {
+          this.resumeSession(item.sessionId);
+        })
+      }, (item: ActiveSessionItem) => `${item.sessionId}|${item.status}|${item.title}`)
+    }
+    .alignItems(HorizontalAlign.Start)
+    .width('100%')
+    .padding({ left: Tokens.space.md, right: Tokens.space.xs, top: Tokens.space.sm, bottom: Tokens.space.xs })
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.md)
+    .margin({ top: Tokens.space.sm })
+  }
+
   build() {
     const emptyList: boolean = this.viewModel.hosts.length === 0;
     Column() {
@@ -375,6 +484,11 @@ export struct HostListPage {
       .width('100%')
       .alignItems(VerticalAlign.Center)
       .margin({ top: Tokens.space.sm })
+
+      // 活动会话：终端页返回后仍在后台运行的连接，点按恢复（画面 / 回滚保留）
+      if (this.activeSessions.length > 0) {
+        this.ActiveSessionsSection()
+      }
 
       // 快速直连：空列表完整展示；有主机时默认收起为轻量入口
       this.QuickConnectSection()
