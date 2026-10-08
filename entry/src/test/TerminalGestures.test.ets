@@ -418,13 +418,16 @@ export default function terminalGesturesTest() {
       expect(selectionHandleAtPoint(-20, 100, geo)).assertEqual('none'); // 垂直越界
     });
 
-    it('selectionHandleAnchor_圆钮中心', 0, () => {
+    it('selectionHandleAnchor_端点格中心_起拖不跳', 0, () => {
       const start = selectionHandleAnchor('start', 12, 8, 10, 20, 0, 2);
-      expect(start.x).assertEqual(12 + 2 * 10 - SELECTION_HANDLE_HIT_WIDTH_VP / 2);
+      expect(start.x).assertEqual(12 + 2 * 10 + 5);
       expect(start.y).assertEqual(8 + 10); // 行高中心
+      // 起拖 offset=0：锚点换算回网格仍是原端点格
+      expect(Math.floor((start.x - 12) / 10)).assertEqual(2);
       const end = selectionHandleAnchor('end', 12, 8, 10, 20, 1, 5);
-      expect(end.x).assertEqual(12 + (5 + 1) * 10 + SELECTION_HANDLE_HIT_WIDTH_VP / 2);
+      expect(end.x).assertEqual(12 + 5 * 10 + 5);
       expect(end.y).assertEqual(8 + 20 + 10);
+      expect(Math.floor((end.x - 12) / 10)).assertEqual(5);
     });
 
     it('手柄几何与SelectionModel范围联动口径', 0, () => {

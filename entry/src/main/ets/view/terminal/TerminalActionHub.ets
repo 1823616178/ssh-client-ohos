@@ -13,8 +13,11 @@
  * paneId 为空串的单窗格场景不注册（execute 找不到执行器时静默返回 false）。
  */
 
-/** 键条可触发的剪贴板动作 */
-export type TerminalClipboardAction = 'copy' | 'paste';
+/**
+ * 页面/键条可触发的画布动作：copy/paste 剪贴板；keyboard = 切换软键盘显隐
+ * （外接键盘模式下也能显式唤出）；scrollBottom = 回到最新输出。
+ */
+export type TerminalClipboardAction = 'copy' | 'paste' | 'keyboard' | 'scrollBottom';
 
 /** 画布侧执行器（TerminalCanvas 实现；复制取当前选区、粘贴写入终端） */
 export interface TerminalActionExecutor {

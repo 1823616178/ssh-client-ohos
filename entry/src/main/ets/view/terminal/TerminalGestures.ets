@@ -80,6 +80,26 @@ export function clampFontSize(size: number): number {
 }
 
 /**
+ * 捏合松手时的最终字号：起始字号 × 倍率 → 取整 → 钳制。
+ * 取整让字号落在整数档（字形度量缓存命中、与设置页步进一致），手势过程中只做
+ * 画面缩放预览，松手才真正重排一次（一次 PTY resize）。
+ */
+export function pinchCommitFontSize(baseFontSize: number, scale: number): number {
+  if (!isFinite(scale) || scale <= 0) {
+    return clampFontSize(baseFontSize);
+  }
+  return clampFontSize(Math.round(baseFontSize * scale));
+}
+
+/** 捏合预览的画面缩放倍率（连续跟手；已按字号上下限钳制，到边界后不再放大/缩小） */
+export function pinchPreviewScale(baseFontSize: number, scale: number): number {
+  if (!(baseFontSize > 0) || !isFinite(scale) || scale <= 0) {
+    return 1;
+  }
+  return clampFontSize(baseFontSize * scale) / baseFontSize;
+}
+
+/**
  * alt-screen 竖滑 → 发送序列集合（每累计一行一条）：
  *   - mode='mouse' 且终端已开鼠标上报（mouseMode ≠ None）→ SGR 滚轮
  *     \e[<64;x;yM（上滚）/ \e[<65;x;yM（下滚），x/y 为 1 起网格坐标；
@@ -541,8 +561,11 @@ export function selectionHandleAtPoint(x: number, y: number,
 }
 
 /**
- * 手柄锚点（圆钮中心）：start 在选区左缘外侧、end 在右缘外侧，
- * 垂直居中于所在行。TerminalCanvas.beginHandleDrag 用此作为拖动 origin。
+ * 手柄拖动锚点：选区端点格的中心（垂直居中于所在行）。
+ * TerminalCanvas.beginHandleDrag 以此为拖动 origin，手指位移叠加在端点格中心上——
+ * 起手 offset=0 时换算回来恰好还是原端点格，选区不会跳。
+ * （旧实现取圆钮中心，start 手柄在左缘外 hitWidth/2≈18vp，起拖瞬间端点就跳左两格。）
+ * hitWidth 参数保留兼容旧调用，不再参与计算。
  */
 export function selectionHandleAnchor(which: SelectionHandleId,
   originX: number, originY: number,
@@ -550,9 +573,6 @@ export function selectionHandleAnchor(which: SelectionHandleId,
   row: number, col: number,
   hitWidth: number = SELECTION_HANDLE_HIT_WIDTH_VP): HandleAnchor {
   const cy = originY + row * cellHeight + cellHeight / 2;
-  if (which === 'start') {
-    return { x: originX + col * cellWidth - hitWidth / 2, y: cy };
-  }
-  // end（或 none 时按 end 兜底，调用方应先 selectionHandleAtPoint）
-  return { x: originX + (col + 1) * cellWidth + hitWidth / 2, y: cy };
+  const cx = originX + col * cellWidth + cellWidth / 2;
+  return { x: cx, y: cy };
 }
