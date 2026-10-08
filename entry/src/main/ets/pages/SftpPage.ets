@@ -175,8 +175,8 @@ struct SftpPage {
     this.vmError = text;
   }
 
-  build() {
-    const headerActions: PageHeaderAction[] = [
+  private getHeaderActions(): PageHeaderAction[] {
+    return [
       {
         label: '上传',
         onClick: (): void => {
@@ -187,11 +187,14 @@ struct SftpPage {
         accessibilityText: '上传文件'
       }
     ];
+  }
+
+  build() {
     Column() {
       PageHeader({
         title: '文件传输',
         subtitle: this.sessionLabel.length > 0 ? this.sessionLabel : '未连接会话',
-        actions: headerActions
+        actions: this.getHeaderActions()
       })
       if (this.nativeUnavailable) {
         this.UnavailableBanner()

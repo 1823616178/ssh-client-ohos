@@ -79,8 +79,8 @@ struct AppearancePage {
     this.toast(`主题模式：${themeModeLabel(this.vm.themeMode)}`);
   }
 
-  build() {
-    const headerActions: PageHeaderAction[] = [
+  private getHeaderActions(): PageHeaderAction[] {
+    return [
       {
         label: '保存',
         onClick: (): void => {
@@ -100,12 +100,15 @@ struct AppearancePage {
         }
       }
     ];
+  }
+
+  build() {
     Stack() {
       Column() {
         PageHeader({
           title: '外观',
           subtitle: '主题、字体与配色',
-          actions: headerActions
+          actions: this.getHeaderActions()
         })
         Scroll() {
           Column() {

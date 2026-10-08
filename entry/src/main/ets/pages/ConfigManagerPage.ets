@@ -85,8 +85,8 @@ struct ConfigManagerPage {
     this.toast(ok ? `已发送「${snippet.name}」到聚焦终端` : '发送失败：终端通道未就绪');
   }
 
-  build() {
-    const headerActions: PageHeaderAction[] = [
+  private getHeaderActions(): PageHeaderAction[] {
+    return [
       {
         label: '刷新',
         onClick: (): void => {
@@ -95,11 +95,14 @@ struct ConfigManagerPage {
         }
       }
     ];
+  }
+
+  build() {
     Column() {
       PageHeader({
         title: '配置中心',
         subtitle: '主机、分组、转发与本机配置',
-        actions: headerActions
+        actions: this.getHeaderActions()
       })
 
       // 同步边界说明条

@@ -429,7 +429,6 @@ export struct HostListPage {
   }
 
   build() {
-    const emptyList: boolean = this.viewModel.hosts.length === 0;
     Column() {
       // 顶栏：中文标题 + 云同步胶囊 + 「+」新增入口
       Row() {
@@ -494,7 +493,7 @@ export struct HostListPage {
       this.QuickConnectSection()
 
       // 列表区：空状态 / 搜索无结果 / 分组懒加载列表
-      if (emptyList) {
+      if (this.viewModel.hosts.length === 0) {
         this.EmptyState()
       } else if (this.dataSource.totalCount() === 0) {
         Column() {

@@ -224,8 +224,8 @@ struct PortForwardPage {
     this.error = this.vm.error;
   }
 
-  build() {
-    const headerActions: PageHeaderAction[] = [
+  private getHeaderActions(): PageHeaderAction[] {
+    return [
       {
         label: '编辑规则',
         onClick: (): void => {
@@ -234,11 +234,14 @@ struct PortForwardPage {
         accessibilityText: '编辑转发规则'
       }
     ];
+  }
+
+  build() {
     Column() {
       PageHeader({
         title: '端口转发',
         subtitle: this.hostLabel,
-        actions: headerActions
+        actions: this.getHeaderActions()
       })
 
       if (this.error.length > 0) {
