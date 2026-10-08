@@ -13,10 +13,21 @@
 import { describe, it, expect } from '@ohos/hypium';
 import {
   DEFAULT_KEY_BAR_LAYOUT,
+  KEY_BAR_MAX_KEYS,
   KeyBarKeySpec,
+  addableKnownKeys,
+  addableSuggestedChars,
+  appendKeyBarKey,
+  isRepeatableKey,
   keyBarBytesForKey,
+  keyBarLayoutToStore,
   keyFaceOverlayForBackground,
-  parseKeyBarLayout
+  knownKeySpec,
+  makeKeyBarCharKey,
+  moveKeyBarKey,
+  parseKeyBarLayout,
+  removeKeyBarKey,
+  serializeKeyBarLayout
 } from '../main/ets/view/KeyBarLayout';
 import { KEY_DPAD_UP, KEY_ESCAPE, KEY_TAB } from '../main/ets/view/terminal/KeyMap';
 
@@ -133,6 +144,38 @@ export default function keyBarTest() {
       expect(keyFaceOverlayForBackground('#0E131D')).assertEqual('#26FFFFFF');
       expect(keyFaceOverlayForBackground('#F5F7FA')).assertEqual('#1F000000');
       expect(keyFaceOverlayForBackground('invalid')).assertEqual('#26FFFFFF');
+    });
+    it('键位编辑器_候选去重_增删上限下限_默认存空串_⌨键', 0, () => {
+      const base: KeyBarKeySpec[] = DEFAULT_KEY_BAR_LAYOUT.slice();
+      const known: KeyBarKeySpec[] = addableKnownKeys(base);
+      // 默认布局已有 esc/tab/ctrl/alt/方向/回车/退格/复制/粘贴：候选只剩 home/end/pgup/pgdn/keyboard
+      const ids: string[] = known.map((k: KeyBarKeySpec) => k.id);
+      expect(ids.join(',')).assertEqual('home,end,pgup,pgdn,keyboard');
+      expect(addableSuggestedChars(base).indexOf('-')).assertEqual(-1);
+      expect(addableSuggestedChars(base).indexOf('_') >= 0).assertTrue();
+      expect(keyBarLayoutToStore(base)).assertEqual('');
+      const kb: KeyBarKeySpec | null = knownKeySpec('keyboard');
+      expect(kb !== null && kb.kind === 'keyboard').assertTrue();
+      expect(isRepeatableKey(kb as KeyBarKeySpec)).assertFalse();
+      const added: KeyBarKeySpec[] = appendKeyBarKey(base, kb as KeyBarKeySpec);
+      expect(added.length).assertEqual(base.length + 1);
+      expect(appendKeyBarKey(added, kb as KeyBarKeySpec).length).assertEqual(added.length);
+      const stored: string = keyBarLayoutToStore(added);
+      expect(stored).assertEqual(serializeKeyBarLayout(added));
+      expect(stored.indexOf('"keyboard"') >= 0).assertTrue();
+      const moved: KeyBarKeySpec[] = moveKeyBarKey(added, added.length - 1, 0);
+      expect(moved[0].id).assertEqual('keyboard');
+      let one: KeyBarKeySpec[] = [base[0]];
+      one = removeKeyBarKey(one, 0);
+      expect(one.length).assertEqual(1);
+      expect(removeKeyBarKey(base, 99).length).assertEqual(base.length);
+      expect(removeKeyBarKey(base, 0)[0].id).assertEqual('tab');
+      let many: KeyBarKeySpec[] = [];
+      const chars: string = 'abcdefghijklmnopqrstuvwxyz0123456789';
+      for (let i = 0; i < chars.length; i++) {
+        many = appendKeyBarKey(many, makeKeyBarCharKey(chars.charAt(i)) as KeyBarKeySpec);
+      }
+      expect(many.length).assertEqual(KEY_BAR_MAX_KEYS);
     });
   });
 }

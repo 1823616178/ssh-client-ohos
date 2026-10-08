@@ -317,3 +317,56 @@ export function isRepeatableKey(spec: KeyBarKeySpec): boolean {
 /** 自动连发：按住 REPEAT_DELAY_MS 后开始，每 REPEAT_INTERVAL_MS 一次 */
 export const KEY_REPEAT_DELAY_MS: number = 400;
 export const KEY_REPEAT_INTERVAL_MS: number = 60;
+
+/** 键条最少保留的键数（全删光键条就成了空白条，编辑器禁止） */
+export const KEY_BAR_MIN_KEYS: number = 1;
+/** 键条最多键数（再多横滑找键反而慢） */
+export const KEY_BAR_MAX_KEYS: number = 32;
+
+/** 编辑器「添加内置键」候选：尚未放进布局的内置键 */
+export function addableKnownKeys(specs: KeyBarKeySpec[]): KeyBarKeySpec[] {
+  const out: KeyBarKeySpec[] = [];
+  for (const name of KEY_BAR_KNOWN_KEY_NAMES) {
+    const spec: KeyBarKeySpec | null = knownKeySpec(name);
+    if (spec !== null && !keyBarContains(specs, spec.id)) {
+      out.push(spec);
+    }
+  }
+  return out;
+}
+
+/** 编辑器「添加字符键」候选：尚未放进布局的常用字符 */
+export function addableSuggestedChars(specs: KeyBarKeySpec[]): string[] {
+  const out: string[] = [];
+  for (const ch of KEY_BAR_SUGGESTED_CHARS) {
+    if (!keyBarContains(specs, `char:${ch}`)) {
+      out.push(ch);
+    }
+  }
+  return out;
+}
+
+/** 追加一个键（去重、上限）；不可加时返回原数组副本 */
+export function appendKeyBarKey(specs: KeyBarKeySpec[], spec: KeyBarKeySpec): KeyBarKeySpec[] {
+  const out: KeyBarKeySpec[] = specs.slice();
+  if (out.length >= KEY_BAR_MAX_KEYS || keyBarContains(out, spec.id)) {
+    return out;
+  }
+  out.push(spec);
+  return out;
+}
+
+/** 删除一个键（保底 KEY_BAR_MIN_KEYS）；越界返回原数组副本 */
+export function removeKeyBarKey(specs: KeyBarKeySpec[], index: number): KeyBarKeySpec[] {
+  const out: KeyBarKeySpec[] = specs.slice();
+  if (index < 0 || index >= out.length || out.length <= KEY_BAR_MIN_KEYS) {
+    return out;
+  }
+  out.splice(index, 1);
+  return out;
+}
+
+/** 编辑器保存：等同内置默认写空串（日后默认布局升级能自动跟上），否则写 JSON */
+export function keyBarLayoutToStore(specs: KeyBarKeySpec[]): string {
+  return isDefaultKeyBarLayout(specs) ? '' : serializeKeyBarLayout(specs);
+}

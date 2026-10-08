@@ -192,6 +192,7 @@ struct SettingsPage {
         .margin({ bottom: Tokens.space.xs2 })
       this.NavRow('密钥管理', '导入/导出私钥、解锁进应用内 Agent', 'pages/KeyManagerPage')
       this.NavRow('终端外观', '主题预设、20 色取色、配色导入', 'pages/AppearancePage')
+      this.NavRow('功能键条', '终端底部快捷键的顺序与增删', 'pages/KeyBarEditorPage')
       this.NavRow('配置中心', '主机/分组/片段/转发集中管理', 'pages/ConfigManagerPage')
     }
     .alignItems(HorizontalAlign.Start)
