@@ -102,14 +102,6 @@ export interface ActiveSessionLike {
   readonly paneId: string | null;
 }
 
-/** 主机列表「活动会话」一行 */
-export interface ActiveSessionItem {
-  readonly sessionId: string;
-  readonly title: string;
-  readonly status: HostConnStatus;
-  readonly statusLabel: string;
-}
-
 export function hostConnStatusLabel(status: HostConnStatus): string {
   switch (status) {
     case 'connecting':
@@ -123,34 +115,6 @@ export function hostConnStatusLabel(status: HostConnStatus): string {
     default:
       return '';
   }
-}
-
-/**
- * 活动会话列表：终端页返回后仍在后台运行（未绑窗格）且非终态的会话，
- * 点按即可恢复（画面与回滚由终端寄存处保留）。标题优先用已保存主机名。
- */
-export function buildActiveSessionItems(sessions: ActiveSessionLike[],
-  hostNames: Map<string, string>): ActiveSessionItem[] {
-  const items: ActiveSessionItem[] = [];
-  for (const session of sessions) {
-    if (session.paneId !== null) {
-      continue;
-    }
-    const status: HostConnStatus = sessionStateToStatus(session.state);
-    if (status === 'none') {
-      continue;
-    }
-    const saved: string | undefined = hostNames.get(session.hostId);
-    const title: string = saved !== undefined && saved.length > 0 ? saved :
-      (session.hostName.length > 0 ? session.hostName : '终端');
-    items.push({
-      sessionId: session.sessionId,
-      title: title,
-      status: status,
-      statusLabel: hostConnStatusLabel(status)
-    });
-  }
-  return items;
 }
 
 /** 单主机状态点派生：其全部会话中取最严重状态；无会话 → none */
