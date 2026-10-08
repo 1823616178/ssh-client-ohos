@@ -71,6 +71,7 @@ enum class EventKind {
     kTerminalBell,      // vterm bell（UI 触感）
     kTerminalTitle,     // OSC 标题变更
     kTerminalMouseMode, // 鼠标上报模式变更（DECSET 1000/1002/1003）
+    kTerminalModes,     // DECCKM / DECSET 2004 变更：success=应用光标键，hasHint=括号粘贴
     // ---- N14 SFTP 事件（经 stateTsfn 投递，sftp 字段携带 SFTP 句柄）----
     kSftpOpen,          // sftpOpen 受理后回报（success/error/message）
     kSftpList,          // 目录列表：text1=path，text2=entries JSON 数组，success/error
@@ -236,11 +237,16 @@ ssh::AuthCallback MakeAuthCallback(SessionHandle *sh, const char *method);
 
 // T3：终端输出的轻量 dirty 信号走有界 data TSFN。队列满时可安全丢弃：
 // 队列里已有待消费的数据/dirty 事件，任一到达 ArkTS 都会唤醒帧调度器。
-void SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt);
+// 返回是否成功入队（失败时 evt 已回收；调用方据此清 terminalData 合并闩）。
+bool SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt);
 
 // T3：从终端全局句柄表摘除（幂等）；Teardown 回收终端本体前同步摘掉，
 // 此后 ArkTS 侧的 terminal 句柄调用全部落空（定义在 terminal_bridge.cpp）
 void ForgetTerminal(uint64_t terminalHandle);
+
+// terminalData 事件已到达 ArkTS 线程：清该终端的合并闩（ArkTS 线程调用；
+// 定义在 terminal_bridge.cpp）
+void AckTerminalDataEvent(uint64_t terminalHandle);
 
 // N14：从 SFTP 全局句柄表摘除（幂等）；定义在 sftp_bridge.cpp
 void ForgetSftp(uint64_t sftpHandle);

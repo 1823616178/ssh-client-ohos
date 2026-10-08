@@ -80,6 +80,26 @@ export function clampFontSize(size: number): number {
 }
 
 /**
+ * 捏合松手时的最终字号：起始字号 × 倍率 → 取整 → 钳制。
+ * 取整让字号落在整数档（字形度量缓存命中、与设置页步进一致），手势过程中只做
+ * 画面缩放预览，松手才真正重排一次（一次 PTY resize）。
+ */
+export function pinchCommitFontSize(baseFontSize: number, scale: number): number {
+  if (!isFinite(scale) || scale <= 0) {
+    return clampFontSize(baseFontSize);
+  }
+  return clampFontSize(Math.round(baseFontSize * scale));
+}
+
+/** 捏合预览的画面缩放倍率（连续跟手；已按字号上下限钳制，到边界后不再放大/缩小） */
+export function pinchPreviewScale(baseFontSize: number, scale: number): number {
+  if (!(baseFontSize > 0) || !isFinite(scale) || scale <= 0) {
+    return 1;
+  }
+  return clampFontSize(baseFontSize * scale) / baseFontSize;
+}
+
+/**
  * alt-screen 竖滑 → 发送序列集合（每累计一行一条）：
  *   - mode='mouse' 且终端已开鼠标上报（mouseMode ≠ None）→ SGR 滚轮
  *     \e[<64;x;yM（上滚）/ \e[<65;x;yM（下滚），x/y 为 1 起网格坐标；
@@ -541,8 +561,11 @@ export function selectionHandleAtPoint(x: number, y: number,
 }
 
 /**
- * 手柄锚点（圆钮中心）：start 在选区左缘外侧、end 在右缘外侧，
- * 垂直居中于所在行。TerminalCanvas.beginHandleDrag 用此作为拖动 origin。
+ * 手柄拖动锚点：选区端点格的中心（垂直居中于所在行）。
+ * TerminalCanvas.beginHandleDrag 以此为拖动 origin，手指位移叠加在端点格中心上——
+ * 起手 offset=0 时换算回来恰好还是原端点格，选区不会跳。
+ * （旧实现取圆钮中心，start 手柄在左缘外 hitWidth/2≈18vp，起拖瞬间端点就跳左两格。）
+ * hitWidth 参数保留兼容旧调用，不再参与计算。
  */
 export function selectionHandleAnchor(which: SelectionHandleId,
   originX: number, originY: number,
@@ -550,9 +573,65 @@ export function selectionHandleAnchor(which: SelectionHandleId,
   row: number, col: number,
   hitWidth: number = SELECTION_HANDLE_HIT_WIDTH_VP): HandleAnchor {
   const cy = originY + row * cellHeight + cellHeight / 2;
-  if (which === 'start') {
-    return { x: originX + col * cellWidth - hitWidth / 2, y: cy };
+  const cx = originX + col * cellWidth + cellWidth / 2;
+  return { x: cx, y: cy };
+}
+
+// ---------------------------------------------------------------- 鼠标滚轮 / 触控板轴事件（2in1）
+
+/** 鼠标滚轮一格对应的轴值（OHOS 以角度计，一格 15°） */
+export const WHEEL_NOTCH_AXIS_VALUE: number = 15;
+/** 系统未给 scrollStep 时，鼠标滚轮一格滚动的行数 */
+export const WHEEL_DEFAULT_STEP_LINES: number = 3;
+/** 单个轴事件最多换算的行数（防止高精度滚轮一次甩出几百行 / 几百个方向键） */
+export const WHEEL_MAX_LINES_PER_EVENT: number = 12;
+
+/**
+ * 轴事件 → 整行换算（余量跨事件累计）。
+ * 返回值符号：正 = 向下滚（看更新的内容），负 = 向上滚（看更旧的内容）。
+ *   - 鼠标滚轮（scrollStep > 0 或明确是鼠标）：value / 15 × step 行；
+ *   - 触控板双指（无 scrollStep）：value 视作 vp 位移，按行高换算。
+ */
+export class WheelLineAccumulator {
+  private residual: number = 0;
+
+  push(axisValue: number, scrollStep: number, isMouseWheel: boolean, cellHeightVp: number): number {
+    if (!Number.isFinite(axisValue) || axisValue === 0) {
+      return 0;
+    }
+    if (isMouseWheel) {
+      const step: number = scrollStep > 0 ? scrollStep : WHEEL_DEFAULT_STEP_LINES;
+      this.residual += axisValue / WHEEL_NOTCH_AXIS_VALUE * step;
+    } else {
+      this.residual += axisValue / Math.max(1, cellHeightVp);
+    }
+    let lines: number = Math.trunc(this.residual);
+    this.residual -= lines;
+    if (lines > WHEEL_MAX_LINES_PER_EVENT) {
+      lines = WHEEL_MAX_LINES_PER_EVENT;
+    } else if (lines < -WHEEL_MAX_LINES_PER_EVENT) {
+      lines = -WHEEL_MAX_LINES_PER_EVENT;
+    }
+    return lines;
   }
-  // end（或 none 时按 end 兜底，调用方应先 selectionHandleAtPoint）
-  return { x: originX + (col + 1) * cellWidth + hitWidth / 2, y: cy };
+
+  reset(): void {
+    this.residual = 0;
+  }
+}
+
+/**
+ * 滚轮在 alt-screen / 鼠标上报模式下要发给远端的 SGR 滚轮序列（每行一条）。
+ * @param downLines 正 = 向下，负 = 向上
+ */
+export function wheelSgrSequences(downLines: number, col1: number, row1: number): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  const count: number = Math.min(Math.abs(Math.trunc(downLines)), WHEEL_MAX_LINES_PER_EVENT);
+  for (let i = 0; i < count; i++) {
+    const seq: Uint8Array | null = encodeSgrWheel(downLines < 0, col1, row1);
+    if (seq !== null) {
+      out.push(seq);
+    }
+  }
+  return out;
 }

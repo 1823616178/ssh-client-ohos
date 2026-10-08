@@ -41,8 +41,11 @@ import {
   TerminalSessionHostLike,
   TerminalSessionLike,
   TerminalViewModel,
+  TerminalParkingLot,
+  adaptSplitDirection,
   deriveOverlay,
   isPasswordRetryError,
+  overlayPresentation,
   parseTerminalRouteParams
 } from '../main/ets/viewmodel/TerminalViewModel';
 
@@ -306,20 +309,36 @@ class FakeSecretWriter implements TerminalSecretWriterLike {
 }
 
 class TestEnv {
-  readonly host: FakeSessionHost = new FakeSessionHost();
-  readonly dao: FakeHostDao = new FakeHostDao();
+  readonly host: FakeSessionHost;
+  readonly dao: FakeHostDao;
   readonly secrets: FakeSecretWriter = new FakeSecretWriter();
+  readonly parking: TerminalParkingLot;
   vibrateCount: number = 0;
   dirtyCount: number = 0;
   uiCount: number = 0;
+  clock: number = 1000;
+  readonly bellPanes: string[] = [];
   readonly vm: TerminalViewModel;
 
-  constructor() {
+  /** 可传入上一个页面的宿主 / DAO / 寄存处，模拟「返回后从主机列表恢复」 */
+  constructor(host?: FakeSessionHost, dao?: FakeHostDao, parking?: TerminalParkingLot) {
+    this.host = host ?? new FakeSessionHost();
+    this.dao = dao ?? new FakeHostDao();
+    const sessionHost: FakeSessionHost = this.host;
+    this.parking = parking ?? new TerminalParkingLot((sessionId: string): boolean => {
+      const info: TerminalSessionLike | null = sessionHost.getSession(sessionId);
+      return info !== null && info.state !== 'closed';
+    });
     this.vm = new TerminalViewModel({
       sessionHost: this.host,
       hostDao: this.dao,
       terminalFactory: this.host.factory.factory,
       secretWriter: this.secrets,
+      parking: this.parking,
+      now: (): number => this.clock,
+      onBell: (paneId: string): void => {
+        this.bellPanes.push(paneId);
+      },
       vibrate: (): void => {
         this.vibrateCount++;
       },
@@ -1163,6 +1182,172 @@ export default function terminalViewModelTest() {
       });
       expect(env2.vm.passwordPrompt.visible).assertTrue();
       expect(env2.vm.passwordPrompt.error.indexOf('超时') >= 0).assertTrue();
+    });
+    it('返回detach_会话不断开_终端寄存_恢复时复用画面不重建', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3001);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      const term: FakeTerminal = env.host.factory.terminals[0];
+      env.host.emit('s-1', { type: 'terminalTitle', title: 'htop' });
+      env.host.emit('s-1', { type: 'terminalCursorKeys', applicationCursorKeys: true });
+      expect(env.vm.liveSessionCount()).assertEqual(1);
+      env.vm.detach();
+      env.vm.detach(); // 幂等
+      expect(env.host.ops.indexOf(`unbind:${TERMINAL_MAIN_PANE_ID}:false`) >= 0).assertTrue();
+      expect(env.host.ops.indexOf(`unbind:${TERMINAL_MAIN_PANE_ID}:true`)).assertEqual(-1);
+      expect(env.host.ops.indexOf('close:s-1')).assertEqual(-1);
+      expect(term.detachCount).assertEqual(0);
+      expect(env.parking.has('s-1')).assertTrue();
+      expect(env.vm.terminal).assertNull();
+
+      // 新页面（同一宿主 / 寄存处）按 sessionId 恢复
+      const env2: TestEnv = new TestEnv(env.host, env.dao, env.parking);
+      await env2.vm.start({ hostId: '', sessionId: 's-1' });
+      expect(env.host.factory.terminals.length).assertEqual(1);
+      expect(env2.vm.terminal === term).assertTrue();
+      expect(env2.vm.terminalTitle).assertEqual('htop');
+      expect(env2.vm.applicationCursorKeys).assertTrue();
+      expect(env.parking.has('s-1')).assertFalse();
+      expect(term.detachCount).assertEqual(0);
+    });
+
+    it('返回detach_shell已退出的会话直接关闭_会话关闭后寄存被清理', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.dao.put(sampleHost('h2'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3101);
+      env.host.addSession('s-2', 'h2', '主机h2', 'established', 3102);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      await env.vm.openSession('s-2', 'tab');
+      env.host.emit('s-2', { type: 'terminalClose' });
+      expect(env.vm.liveSessionCount()).assertEqual(1);
+      env.vm.detach();
+      expect(env.host.ops.indexOf('close:s-2') >= 0).assertTrue();
+      expect(env.host.ops.indexOf('close:s-1')).assertEqual(-1);
+      expect(env.parking.has('s-1')).assertTrue();
+      expect(env.parking.has('s-2')).assertFalse();
+      expect(env.host.factory.terminals[1].detachCount).assertEqual(1);
+      // 会话后来在别处被关闭：prune 释放寄存终端
+      env.host.close('s-1');
+      env.parking.prune();
+      expect(env.parking.has('s-1')).assertFalse();
+      expect(env.host.factory.terminals[0].detachCount).assertEqual(1);
+    });
+
+    it('会话级标题与DECCKM_切换聚焦时投影_标签副标题', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3201);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      await env.vm.splitFocused('row');
+      const right: string = env.vm.focusedPaneId;
+      const rightSession: string = env.vm.currentSessionId;
+      env.host.emit(rightSession, stateChange('established'));
+      env.host.emit('s-1', { type: 'terminalTitle', title: 'vim' });
+      env.host.emit('s-1', { type: 'terminalCursorKeys', applicationCursorKeys: true });
+      // 聚焦的是右侧：左侧事件不改投影
+      expect(env.vm.terminalTitle).assertEqual('');
+      expect(env.vm.applicationCursorKeys).assertFalse();
+      env.vm.focusPane(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.terminalTitle).assertEqual('vim');
+      expect(env.vm.applicationCursorKeys).assertTrue();
+      expect(env.vm.tabs[0].subtitle).assertEqual('vim');
+      env.vm.focusPane(right);
+      expect(env.vm.terminalTitle).assertEqual('');
+      expect(env.vm.applicationCursorKeys).assertFalse();
+    });
+
+    it('响铃节流_可见窗格视觉闪_后台标签记徽标_激活即清', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3301);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.host.emit('s-1', { type: 'terminalBell' });
+      expect(env.bellPanes.length).assertEqual(1);
+      expect(env.bellPanes[0]).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vibrateCount).assertEqual(1);
+      // 250ms 内的连响被吞掉
+      env.clock += 100;
+      env.host.emit('s-1', { type: 'terminalBell' });
+      expect(env.bellPanes.length).assertEqual(1);
+      env.clock += 300;
+      env.host.emit('s-1', { type: 'terminalBell' });
+      expect(env.bellPanes.length).assertEqual(2);
+
+      // 新标签后，原标签会话响铃 / 输出 → 徽标
+      await env.vm.newTab();
+      const firstTab: string = env.vm.tabs[0].tabId;
+      env.clock += 1000;
+      env.host.emit('s-1', { type: 'terminalBell' });
+      expect(env.bellPanes.length).assertEqual(2);
+      expect(env.vm.tabs[0].bell).assertTrue();
+      env.host.emitDirty('s-1');
+      expect(env.vm.tabs[0].activity).assertTrue();
+      expect(env.vm.tabs[1].bell).assertFalse();
+      env.vm.activateTab(firstTab);
+      expect(env.vm.tabs[0].bell).assertFalse();
+      expect(env.vm.tabs[0].activity).assertFalse();
+    });
+
+    it('已结束会话可重新连接_shell退出重开_会话关闭按主机重拨回原窗格', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      const sid: string = env.vm.currentSessionId;
+      env.host.emit(sid, stateChange('established'));
+      const first: FakeTerminal = env.host.factory.terminals[0];
+      // shell 退出：closed 蒙层提供「重新连接」
+      env.host.emit(sid, { type: 'terminalClose' });
+      expect(env.vm.overlay.kind).assertEqual('closed');
+      expect(env.vm.overlay.showReconnectNow).assertTrue();
+      expect(overlayPresentation(env.vm.overlay, true)).assertEqual('banner');
+      env.vm.reconnectNow();
+      expect(first.detachCount).assertEqual(1);
+      expect(env.host.factory.terminals.length).assertEqual(2);
+      expect(env.vm.overlay.kind).assertEqual('none');
+      expect(env.host.connectCalls.length).assertEqual(1);
+
+      // 会话整体关闭（native closed）：按主机快照重拨，绑回同一窗格
+      env.host.emit(sid, stateChange('closed'));
+      expect(env.vm.overlay.kind).assertEqual('closed');
+      expect(env.vm.overlay.showReconnectNow).assertTrue();
+      env.vm.reconnectNow();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(env.host.connectCalls.length).assertEqual(2);
+      expect(env.vm.focusedPaneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.currentSessionId !== sid).assertTrue();
+      expect(env.host.ops.indexOf(`bind:${env.vm.currentSessionId}:${TERMINAL_MAIN_PANE_ID}`) >= 0).assertTrue();
+      expect(env.vm.leafCount()).assertEqual(1);
+    });
+
+    it('蒙层呈现_有画面走横幅_无画面整窗格', 0, () => {
+      const closedNoReconnect: OverlayModel = deriveOverlay(overlayInput('closed'));
+      expect(closedNoReconnect.showReconnectNow).assertFalse();
+      expect(overlayPresentation(closedNoReconnect, false)).assertEqual('full');
+      expect(overlayPresentation(deriveOverlay(overlayInput('established')), true)).assertEqual('none');
+      expect(overlayPresentation(deriveOverlay(overlayInput('connecting')), true)).assertEqual('banner');
+      expect(overlayPresentation(deriveOverlay(overlayInput('connecting')), false)).assertEqual('full');
+    });
+    it('窄竖屏左右分屏自动改上下_宽屏与尺寸未知保持', 0, async () => {
+      expect(adaptSplitDirection('row', 390, 800)).assertEqual('column');
+      expect(adaptSplitDirection('row', 900, 600)).assertEqual('row');
+      expect(adaptSplitDirection('row', 0, 0)).assertEqual('row');
+      expect(adaptSplitDirection('column', 390, 800)).assertEqual('column');
+      expect(adaptSplitDirection('tab', 390, 800)).assertEqual('tab');
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3401);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(390);
+      env.vm.setPaneAreaSize(390, 700);
+      await env.vm.splitFocused('row');
+      expect(env.vm.dividers.length).assertEqual(1);
+      expect(env.vm.dividers[0].direction).assertEqual('column');
     });
   });
 }

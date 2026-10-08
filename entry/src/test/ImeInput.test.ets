@@ -15,7 +15,7 @@ import {
   CommittedDelta,
   committedDeltaToInputBytes,
   extractCommittedDelta
-} from '../main/ets/view/terminal/ImeInputHandler';
+} from '../main/ets/view/terminal/ImeInputLogic';
 import { StickySnapshot } from '../main/ets/view/terminal/StickyModifiers';
 
 const NO_STICKY: StickySnapshot = { ctrl: false, alt: false };

@@ -28,6 +28,9 @@ using sshclient::term::CellGrid;
 using sshclient::term::ScrollbackBuffer;
 using sshclient::term::VtermBridge;
 using sshclient::term::kAttrDim;
+using sshclient::term::kAttrWide;
+using sshclient::term::kReservedWrapsNext;
+using sshclient::term::kWideContinuation;
 
 namespace {
 
@@ -486,34 +489,141 @@ TEST(ScrollbackIntegrationTest, EraseInDisplay3ClearsScrollback)
     EXPECT_EQ(dumpLine(b.scrollback().getLine(3), 10), "R3");
 }
 
-TEST(ScrollbackIntegrationTest, ResizeColsTruncatesAndPadsScrollback)
+TEST(ScrollbackIntegrationTest, ResizeColsReflowsScrollbackWithoutLoss)
 {
     VtermBridge b(10, 4);
     for (int i = 0; i < 6; ++i)
-        b.feed("ABCDEFGHI" + std::to_string(i) + "\r\n"); // 行宽 10，J 位列索引 9 是行号
+        b.feed("ABCDEFGHI" + std::to_string(i) + "\r\n"); // 行宽 10，列 9 是行号
     ASSERT_EQ(b.scrollback().totalPushed(), 3u);
     const ScrollbackBuffer &sb = b.scrollback();
     ASSERT_EQ(sb.cols(), 10);
     EXPECT_EQ(sb.getLine(0)[9].codepoint, u'0');
+    const uint64_t epoch0 = sb.epoch();
 
-    b.resize(6, 4); // 列改窄：回滚行截断
+    b.resize(6, 4); // 列改窄：回滚按软换行重新折行，不再截断
     EXPECT_EQ(sb.cols(), 6);
-    const Cell *l0 = sb.getLine(0);
-    ASSERT_NE(l0, nullptr);
-    EXPECT_EQ(l0[0].codepoint, u'A');
-    EXPECT_EQ(l0[5].codepoint, u'F'); // 列 6 起的内容被截掉
+    EXPECT_GT(sb.epoch(), epoch0);
+    // 屏幕 reflow 顶出的行也进回滚；回滚首个逻辑行 = ABCDEF + GHI0
+    const uint64_t oldest = sb.oldestIndex();
+    EXPECT_EQ(dumpLine(sb.getLine(oldest), 6), "ABCDEF");
+    EXPECT_NE(sb.getLine(oldest)[5].reserved & kReservedWrapsNext, 0u);
+    EXPECT_EQ(dumpLine(sb.getLine(oldest + 1), 6), "GHI0");
+    EXPECT_EQ(sb.getLine(oldest + 1)[5].reserved & kReservedWrapsNext, 0u);
+    // 尾部补的是当前默认色空白格
+    EXPECT_EQ(sb.getLine(oldest + 1)[5].bgArgb, kDefaultBg);
 
-    b.resize(10, 4); // 列改宽：补当前默认色空白格
+    b.resize(10, 4); // 列改宽：逻辑行拼回一行，内容完整
     EXPECT_EQ(sb.cols(), 10);
-    l0 = sb.getLine(0);
+    const Cell *l0 = sb.getLine(sb.oldestIndex());
     ASSERT_NE(l0, nullptr);
-    EXPECT_EQ(l0[0].codepoint, u'A');
-    EXPECT_EQ(l0[5].codepoint, u'F');
-    for (int c = 6; c < 10; ++c) {
-        EXPECT_EQ(l0[c].codepoint, 0u) << "col " << c;
-        EXPECT_EQ(l0[c].fgArgb, kDefaultFg) << "col " << c;
-        EXPECT_EQ(l0[c].bgArgb, kDefaultBg) << "col " << c;
+    EXPECT_EQ(dumpLine(l0, 10), "ABCDEFGHI0");
+    EXPECT_EQ(l0[9].reserved & kReservedWrapsNext, 0u);
+}
+
+TEST(ScrollbackIntegrationTest, SoftWrappedLineCarriesWrapFlagIntoScrollback)
+{
+    VtermBridge b(10, 3);
+    b.feed("0123456789abcde\r\n"); // 15 字符：第 0 行软换行续接第 1 行
+    // 网格行末格同步了软换行位
+    EXPECT_NE(b.grid().cellAt(0, 9)->reserved & kReservedWrapsNext, 0u);
+    EXPECT_EQ(b.grid().cellAt(1, 9)->reserved & kReservedWrapsNext, 0u);
+    b.feed("x\r\ny\r\n"); // 再滚两行：两段都被顶进回滚
+    const ScrollbackBuffer &sb = b.scrollback();
+    ASSERT_EQ(sb.totalPushed(), 2u);
+    EXPECT_EQ(dumpLine(sb.getLine(0), 10), "0123456789");
+    EXPECT_NE(sb.getLine(0)[9].reserved & kReservedWrapsNext, 0u);
+    EXPECT_EQ(dumpLine(sb.getLine(1), 10), "abcde");
+    EXPECT_EQ(sb.getLine(1)[9].reserved & kReservedWrapsNext, 0u);
+}
+
+TEST(ScrollbackIntegrationTest, ScreenReflowsLongLineOnWiden)
+{
+    VtermBridge b(10, 4);
+    b.feed("0123456789abcde"); // 软换行到第 1 行
+    b.resize(20, 4);
+    EXPECT_EQ(dumpGridRow(b.grid(), 0), "0123456789abcde");
+    EXPECT_EQ(b.grid().cellAt(0, 19)->reserved & kReservedWrapsNext, 0u);
+    b.resize(8, 4);
+    EXPECT_EQ(dumpGridRow(b.grid(), 0), "01234567");
+    EXPECT_EQ(dumpGridRow(b.grid(), 1), "89abcde");
+    EXPECT_NE(b.grid().cellAt(0, 7)->reserved & kReservedWrapsNext, 0u);
+}
+
+TEST(ScrollbackIntegrationTest, PopLineRefusedWhileColsChange)
+{
+    VtermBridge b(10, 5);
+    for (int i = 0; i < 8; ++i)
+        b.feed("L" + std::to_string(i) + "\r\n"); // 回滚 {L0..L3}
+    ASSERT_EQ(b.scrollback().totalPushed(), 4u);
+    b.resize(12, 8); // 行增 + 列变：不回填（避免旧宽行被截断），回滚 reflow 后仍是 4 行
+    EXPECT_EQ(b.scrollback().size(), 4u);
+    EXPECT_EQ(dumpLine(b.scrollback().getLine(b.scrollback().oldestIndex()), 12), "L0");
+    EXPECT_EQ(dumpGridRow(b.grid(), 0), "L4");
+}
+
+TEST(ScrollbackBufferTest, ReflowKeepsWideCharsWhole)
+{
+    const Cell blank = CellGrid(4, 1, 0xFF111111u, 0xFF222222u).blankCell();
+    ScrollbackBuffer sb(4, 16);
+    // 物理行 "ab中" + 续格（4 列恰好放下），软换行续接 "c"
+    std::vector<Cell> l0(4, Cell{});
+    l0[0].codepoint = 'a';
+    l0[1].codepoint = 'b';
+    l0[2].codepoint = 0x4E2D;
+    l0[2].attrs = kAttrWide;
+    l0[3].codepoint = kWideContinuation;
+    std::vector<Cell> l1(4, Cell{});
+    l1[0].codepoint = 'c';
+    sb.pushLine(l0.data(), 4, true);
+    sb.pushLine(l1.data(), 4, false);
+
+    sb.reflow(3, blank); // 3 列：中 放不下第 3 列 → 行尾留空折行
+    ASSERT_EQ(sb.size(), 2u);
+    const Cell *r0 = sb.getLine(sb.oldestIndex());
+    const Cell *r1 = sb.getLine(sb.oldestIndex() + 1);
+    EXPECT_EQ(r0[0].codepoint, u'a');
+    EXPECT_EQ(r0[1].codepoint, u'b');
+    EXPECT_EQ(r0[2].codepoint, 0u); // 空位
+    EXPECT_NE(r0[2].reserved & kReservedWrapsNext, 0u);
+    EXPECT_EQ(r1[0].codepoint, 0x4E2Du);
+    EXPECT_EQ(r1[1].codepoint, kWideContinuation);
+    EXPECT_EQ(r1[2].codepoint, u'c');
+    EXPECT_EQ(r1[2].reserved & kReservedWrapsNext, 0u);
+
+    sb.reflow(6, blank); // 拼回：行尾空位去掉，"ab中c" 一行
+    ASSERT_EQ(sb.size(), 1u);
+    const Cell *w = sb.getLine(sb.oldestIndex());
+    EXPECT_EQ(w[0].codepoint, u'a');
+    EXPECT_EQ(w[2].codepoint, 0x4E2Du);
+    EXPECT_EQ(w[3].codepoint, kWideContinuation);
+    EXPECT_EQ(w[4].codepoint, u'c');
+    EXPECT_EQ(w[5].codepoint, 0u);
+    EXPECT_EQ(w[5].bgArgb, blank.bgArgb);
+}
+
+TEST(ScrollbackBufferTest, ReflowTrimsToCapacityKeepingNewest)
+{
+    const Cell blank = CellGrid(4, 1, 0xFF111111u, 0xFF222222u).blankCell();
+    ScrollbackBuffer sb(4, 3);
+    for (uint32_t i = 0; i < 3; ++i) {
+        std::vector<Cell> l(4, Cell{});
+        for (int c = 0; c < 4; ++c)
+            l[static_cast<size_t>(c)].codepoint = 'a' + i;
+        sb.pushLine(l.data(), 4, false);
     }
+    sb.reflow(2, blank); // 每行拆两行 → 6 行，容量 3：保留最新 3 行
+    EXPECT_EQ(sb.size(), 3u);
+    EXPECT_EQ(dumpLine(sb.getLine(sb.oldestIndex()), 2), "bb");
+    EXPECT_EQ(dumpLine(sb.getLine(sb.totalPushed() - 1), 2), "cc");
+    EXPECT_EQ(sb.getLine(sb.totalPushed() - 2)[1].reserved & kReservedWrapsNext, kReservedWrapsNext);
+}
+
+TEST(ScrollbackBufferTest, ClearBumpsEpoch)
+{
+    ScrollbackBuffer sb(4, 8);
+    const uint64_t e = sb.epoch();
+    sb.clear();
+    EXPECT_EQ(sb.epoch(), e + 1);
 }
 
 // ---------------------------------------------------------------- T1 审查遗留四项

@@ -24,7 +24,12 @@
  *   - 无物理键事件 / 类型为 none/unknown → 不抑制（移动端原路径不变）。
  */
 
-/** HarmonyOS KeyboardType 数字枚举 → 名称（未知值回退 unknown） */
+/**
+ * inputDevice.KeyboardType 数字枚举 → 名称（以 SDK @ohos.multimodalInput.inputDevice 为准：
+ * NONE=0 UNKNOWN=1 ALPHABETIC_KEYBOARD=2 DIGITAL_KEYBOARD=3 HANDWRITING_PEN=4
+ * REMOTE_CONTROL=5；未知值回退 unknown）。
+ * 旧实现按另一套假想枚举映射，4（手写笔）会被当成外接键盘而误抑制软键盘。
+ */
 export function keyboardTypeToString(ohosKeyboardType: number): string {
   switch (ohosKeyboardType) {
     case 0:
@@ -32,33 +37,65 @@ export function keyboardTypeToString(ohosKeyboardType: number): string {
     case 1:
       return 'unknown';
     case 2:
-      return 'alphabetic_keypad';
+      return 'alphabetic_keyboard';
     case 3:
-      return 'compact';
+      return 'digital_keyboard';
     case 4:
-      return 'extension';
+      return 'handwriting_pen';
     case 5:
-      return 'feature';
-    case 6:
-      return 'full';
-    case 7:
-      return 'mini';
-    case 8:
-      return 'remote';
+      return 'remote_control';
     default:
       return 'unknown';
   }
 }
 
 /**
- * 是否为「外接/物理键盘」类型名（大小写不敏感）。
- * FULL / EXTENSION / ALPHABETIC_KEYPAD / COMPACT / REMOTE / hardware（测试别名）。
- * none / unknown / mini / feature 不算（车载/遥控等不替代终端软键盘输入）。
+ * 是否为「能替代软键盘打字的物理键盘」类型名（大小写不敏感）。
+ * alphabetic_keyboard（SDK 名）；full / alphabetic_keypad / hardware 为历史别名。
+ * 数字小键盘、手写笔、遥控器、none / unknown 不算。
  */
 export function isPhysicalKeyboardTypeName(typeName: string): boolean {
   const n = typeName.toLowerCase();
-  return n === 'full' || n === 'extension' || n === 'alphabetic_keypad' ||
-    n === 'compact' || n === 'remote' || n === 'hardware';
+  return n === 'alphabetic_keyboard' || n === 'full' || n === 'alphabetic_keypad' || n === 'hardware';
+}
+
+/** 设备列表的键盘类型名里是否存在物理字母键盘（外接键盘插拔后重新评估用） */
+export function anyPhysicalKeyboard(typeNames: string[]): boolean {
+  for (const name of typeNames) {
+    if (isPhysicalKeyboardTypeName(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 物理键盘集合变化：added = 新插入（优先于同时发生的移除）/ removed = 有键盘被拔掉 */
+export type KeyboardChange = 'added' | 'removed' | 'none';
+
+/** 前后两次枚举的物理字母键盘 deviceId 集合 → 变化类型 */
+export function diffPhysicalKeyboards(previous: number[], current: number[]): KeyboardChange {
+  for (const id of current) {
+    if (previous.indexOf(id) < 0) {
+      return 'added';
+    }
+  }
+  for (const id of previous) {
+    if (current.indexOf(id) < 0) {
+      return 'removed';
+    }
+  }
+  return 'none';
+}
+
+/** 键盘变化 → 「外接键盘活跃」新值（added 置位、removed 清除、none 保持） */
+export function nextExternalKeyboardActive(current: boolean, change: KeyboardChange): boolean {
+  if (change === 'added') {
+    return true;
+  }
+  if (change === 'removed') {
+    return false;
+  }
+  return current;
 }
 
 /**

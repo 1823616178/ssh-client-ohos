@@ -53,7 +53,10 @@ import {
   selectionHandleHitRects,
   sgrButtonFromOhosButton,
   shouldForwardMouseEvent,
-  wordSelectAt
+  wordSelectAt,
+  WheelLineAccumulator,
+  WHEEL_MAX_LINES_PER_EVENT,
+  wheelSgrSequences
 } from '../main/ets/view/terminal/TerminalGestures';
 import {
   containsLineBreak,
@@ -132,6 +135,14 @@ function fillAsciiLine(grid: LineGrid, row: number, text: string, startCol: numb
       col++;
     }
   }
+}
+
+function bytesToAscii(bytes: Uint8Array): string {
+  let out: string = '';
+  for (let i = 0; i < bytes.length; i++) {
+    out += String.fromCharCode(bytes[i]);
+  }
+  return out;
 }
 
 export default function terminalGesturesTest() {
@@ -418,13 +429,16 @@ export default function terminalGesturesTest() {
       expect(selectionHandleAtPoint(-20, 100, geo)).assertEqual('none'); // 垂直越界
     });
 
-    it('selectionHandleAnchor_圆钮中心', 0, () => {
+    it('selectionHandleAnchor_端点格中心_起拖不跳', 0, () => {
       const start = selectionHandleAnchor('start', 12, 8, 10, 20, 0, 2);
-      expect(start.x).assertEqual(12 + 2 * 10 - SELECTION_HANDLE_HIT_WIDTH_VP / 2);
+      expect(start.x).assertEqual(12 + 2 * 10 + 5);
       expect(start.y).assertEqual(8 + 10); // 行高中心
+      // 起拖 offset=0：锚点换算回网格仍是原端点格
+      expect(Math.floor((start.x - 12) / 10)).assertEqual(2);
       const end = selectionHandleAnchor('end', 12, 8, 10, 20, 1, 5);
-      expect(end.x).assertEqual(12 + (5 + 1) * 10 + SELECTION_HANDLE_HIT_WIDTH_VP / 2);
+      expect(end.x).assertEqual(12 + 5 * 10 + 5);
       expect(end.y).assertEqual(8 + 20 + 10);
+      expect(Math.floor((end.x - 12) / 10)).assertEqual(5);
     });
 
     it('手柄几何与SelectionModel范围联动口径', 0, () => {
@@ -436,6 +450,27 @@ export default function terminalGesturesTest() {
       expect(geo.start.y).assertEqual(16);
       expect(geo.end.x).assertEqual((1 + 1) * 8);
       expect(geo.end.y).assertEqual(0);
+    });
+    it('滚轮轴事件_鼠标按格换算_触控板按行高累计_单次上限_SGR序列', 0, () => {
+      const acc: WheelLineAccumulator = new WheelLineAccumulator();
+      // 鼠标一格 15°，scrollStep=3 → 3 行；向上为负
+      expect(acc.push(15, 3, true, 20)).assertEqual(3);
+      expect(acc.push(-15, 0, true, 20)).assertEqual(-3);
+      // 高精度滚轮：半格累计
+      expect(acc.push(7.5, 2, true, 20)).assertEqual(1);
+      expect(acc.push(7.5, 2, true, 20)).assertEqual(1);
+      acc.reset();
+      // 触控板：按行高累计余量
+      expect(acc.push(10, 0, false, 20)).assertEqual(0);
+      expect(acc.push(10, 0, false, 20)).assertEqual(1);
+      expect(acc.push(-1000, 0, false, 20)).assertEqual(-WHEEL_MAX_LINES_PER_EVENT);
+      expect(acc.push(0, 0, false, 20)).assertEqual(0);
+      const up: Uint8Array[] = wheelSgrSequences(-2, 5, 7);
+      expect(up.length).assertEqual(2);
+      expect(bytesToAscii(up[0])).assertEqual('\x1b[<64;5;7M');
+      const down: Uint8Array[] = wheelSgrSequences(1, 1, 1);
+      expect(bytesToAscii(down[0])).assertEqual('\x1b[<65;1;1M');
+      expect(wheelSgrSequences(100, 1, 1).length).assertEqual(WHEEL_MAX_LINES_PER_EVENT);
     });
   });
 }

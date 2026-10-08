@@ -137,15 +137,19 @@ export interface NativeTerminalFrame {
   cursorVisible: boolean;
   altScreen: boolean;
   mouseMode: number;
-  /**
-   * T10 stub：DECCKM 应用光标键模式（true=方向键 SS3）。native 尚未暴露该位
-   * （对称 mouseMode 的未来扩展）；缺省 undefined 时上层按 false 处理。
-   * native 接入后由帧组包填充，KeyMap 已接受该标志。
-   */
+  /** DECCKM 应用光标键模式（true=方向键 SS3）；native 经 vterm_keyboard_key 探测 */
   applicationCursorKeys?: boolean;
+  /** DECSET 2004 括号粘贴 */
+  bracketedPaste?: boolean;
+  /** DECSCUSR 光标形状覆盖：0=未覆盖 1=块 2=下划线 3=竖线 */
+  cursorShape?: number;
+  /** DECSCUSR 闪烁覆盖：-1=未覆盖 0=不闪 1=闪 */
+  cursorBlink?: number;
   bellCount: number;
   scrollbackOldest: number;
   scrollbackTotal: number;
+  /** 回滚重排代际（reflow / 清空 +1） */
+  scrollbackEpoch?: number;
   dirty?: ArrayBuffer;
 }
 
@@ -210,12 +214,10 @@ export interface SshEvent {
   title?: string;
   /** T3：terminalMouseMode 事件的模式（0=关 1=点击 2=拖动 3=任意移动） */
   mouseMode?: number;
-  /**
-   * T10 stub：terminalCursorKeys 事件的应用光标键模式位（DECCKM，对称
-   * terminalMouseMode）。native 暴露后投递 type='terminalCursorKeys' +
-   * applicationCursorKeys；未暴露前上层维持默认 false。
-   */
+  /** terminalCursorKeys 事件：应用光标键模式位（DECCKM） */
   applicationCursorKeys?: boolean;
+  /** terminalCursorKeys 事件：DECSET 2004 括号粘贴 */
+  bracketedPaste?: boolean;
   /** N14：SFTP 句柄（sftpOpen/sftpList/sftpStat/sftpOpDone/sftp*） */
   sftp?: number;
   /** N14：传输任务 id（sftpProgress/sftpTransferDone） */

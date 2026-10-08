@@ -61,6 +61,11 @@ struct GridFrame {
     uint64_t bellCount = 0;                    // 累计 bell 次数（UI 也可走 terminalBell 事件）
     uint64_t scrollbackOldest = 0;             // 回滚有效窗口 [oldest, total)
     uint64_t scrollbackTotal = 0;
+    uint64_t scrollbackEpoch = 0;              // 回滚重排代际（reflow/clear +1，绝对行号失效判据）
+    bool applicationCursorKeys = false;        // DECCKM（vterm_keyboard_key 探测）
+    bool bracketedPaste = false;               // DECSET 2004
+    int cursorShape = 0;                       // DECSCUSR 覆盖：0 未覆盖 / 1 块 / 2 下划线 / 3 竖线
+    int cursorBlink = -1;                      // DECSCUSR 覆盖：-1 未覆盖 / 0 不闪 / 1 闪
     std::vector<uint64_t> dirty;               // 脏行位图快照（每行 1 bit，同 CellGrid 布局）
 
     // 网格字节数（storage 为空时为 0）

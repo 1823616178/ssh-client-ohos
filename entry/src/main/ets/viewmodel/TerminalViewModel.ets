@@ -17,8 +17,14 @@
  *   - 状态叠加层：deriveOverlay 纯函数；每叶一份，聚焦叶同步到 this.overlay；
  *   - dirty：任一**可见**叶的输出迹象都唤醒帧循环（不可见标签零绘制，D14）。
  *
- * 生命周期：aboutToAppear → start()；返回 / aboutToDisappear → dispose()
- * （注销监听 → detach 全部缓存终端 → 对所有叶 unbindPane(true)）。
+ * 生命周期：aboutToAppear → start()；
+ *   - 返回键 / aboutToDisappear → detach()：注销监听 → 存活会话的终端寄存到
+ *     TerminalParkingLot（不 detach、画面与回滚保留）→ 所有叶 unbindPane(false)。
+ *     会话继续在后台运行，主机列表「活动会话」可恢复（sessionId 进入时先取寄存终端）；
+ *   - dispose()：显式「全部关闭」语义（detach 终端 + unbindPane(true)），单测与关末叶仍用。
+ *
+ * 会话级状态（多会话互不串扰）：OSC 标题 / DECCKM / 响铃节流各按 sessionId 记账，
+ * 聚焦切换时投影到顶栏字段；非可见会话的响铃 / 新输出记为标签徽标，激活标签即清除。
  */
 
 import { HostProfile } from '../common/model/models';
@@ -33,6 +39,7 @@ import { SshTerminal } from '../napi/SshTerminal';
 import { AppDatabase } from '../repository/AppDatabase';
 import { SessionManager } from '../service/SessionManager';
 import { SnippetSendHub } from '../view/terminal/SnippetSendHub';
+import { BellLimiter } from '../view/terminal/TerminalBell';
 import {
   DividerRect,
   PANE_DIVIDER_SIZE_VP,
@@ -137,6 +144,11 @@ export interface OverlayInput {
   readonly terminalClosed: boolean;
   /** 进入阶段（尚无会话）的失败文案；非空时优先于一切会话状态 */
   readonly startError: string;
+  /**
+   * 会话已结束时能否「重新连接」（shell 退出但 SSH 仍在 → 重开 shell；
+   * 会话已关闭但有主机快照 → 原窗格重新拨号）。缺省 false = 旧语义只有「关闭」。
+   */
+  readonly canReconnect?: boolean;
 }
 
 function makeOverlay(kind: OverlayKind, dimmed: boolean, title: string, detail: string,
@@ -185,7 +197,8 @@ export function deriveOverlay(input: OverlayInput): OverlayModel {
     return makeOverlay('error', false, '无法进入终端', input.startError, false, false, true);
   }
   if (input.terminalClosed || input.state === 'closing' || input.state === 'closed') {
-    return makeOverlay('closed', input.hasTerminal, '会话已结束', input.errorMessage, false, false, true);
+    return makeOverlay('closed', input.hasTerminal, '会话已结束', input.errorMessage, false,
+      input.canReconnect === true, true);
   }
   switch (input.state) {
     case 'established':
@@ -210,6 +223,36 @@ export function deriveOverlay(input: OverlayInput): OverlayModel {
   }
 }
 
+/**
+ * 蒙层呈现方式：
+ *   - none：不画；
+ *   - banner：已有终端画面时，状态以窗格顶部的非阻塞横幅呈现（画面仍可滚动 / 选择 / 复制）；
+ *   - full：没有画面可看（首连 / 启动失败）时整窗格居中蒙层。
+ */
+export type OverlayPresentation = 'none' | 'banner' | 'full';
+
+export function overlayPresentation(model: OverlayModel, hasTerminal: boolean): OverlayPresentation {
+  if (model.kind === 'none') {
+    return 'none';
+  }
+  return hasTerminal ? 'banner' : 'full';
+}
+
+/** 窄竖屏判定阈值（vp）：比这窄且竖向时左右分屏每侧不足 40 列，改上下分屏 */
+export const NARROW_SPLIT_WIDTH_VP: number = 600;
+
+/**
+ * 分屏方向自适应：手机竖屏上「左右分屏」两侧都只剩二三十列，几乎没法用，
+ * 自动改为上下分屏；尺寸未知（0）或宽屏时尊重请求。
+ */
+export function adaptSplitDirection(mode: ConnectionOpenMode, widthVp: number,
+  heightVp: number): ConnectionOpenMode {
+  if (mode !== 'row' || widthVp <= 0 || heightVp <= 0) {
+    return mode;
+  }
+  return widthVp < NARROW_SPLIT_WIDTH_VP && widthVp < heightVp ? 'column' : 'row';
+}
+
 // ---------------------------------------------------------------- 渲染快照（页面 ForEach 用）
 
 /** 标签栏一项 */
@@ -217,6 +260,12 @@ export interface TabRenderItem {
   readonly tabId: string;
   readonly title: string;
   readonly active: boolean;
+  /** 该标签聚焦叶的 OSC 标题（空串 = 无；标签芯片第二行 / 无障碍描述） */
+  readonly subtitle: string;
+  /** 非激活标签里有会话响过铃（激活即清） */
+  readonly bell: boolean;
+  /** 非激活标签里有新输出（激活即清） */
+  readonly activity: boolean;
 }
 
 /** 当前可见叶（绝对矩形 + 该叶的终端/蒙层/焦点） */
@@ -456,6 +505,97 @@ const productionTerminalFactory: TerminalFactory =
     return SshTerminal.attach(session as SshNativeSession, termType, cols, rows);
   };
 
+/** 寄存的终端：页面返回时会话仍在后台，终端实例（vterm 画面 + 回滚）原样保留待恢复 */
+export interface ParkedTerminal {
+  terminal: TerminalLike;
+  nativeHandle: number;
+  title: string;
+  applicationCursorKeys: boolean;
+}
+
+/** 终端寄存处窄接口（生产 = TerminalParkingLot.global()；单测注入独立实例） */
+export interface TerminalParkingLike {
+  park(sessionId: string, entry: ParkedTerminal): void;
+  /** 取走寄存（取走即移出；无则 null） */
+  take(sessionId: string): ParkedTerminal | null;
+}
+
+/**
+ * 进程级终端寄存处：TerminalPage 返回时把存活会话的终端寄存在这里，
+ * 下次从主机列表恢复该会话时由新页面的 VM 取回——画面、回滚、DECCKM 状态都不丢。
+ *
+ * 清理：会话被关闭（SessionManager 会话数监听）或 native 进入 closed 后，
+ * prune() 把失主的寄存 detach 掉，避免句柄泄漏。
+ */
+export class TerminalParkingLot implements TerminalParkingLike {
+  private static globalInstance: TerminalParkingLot | null = null;
+  private readonly entries: Map<string, ParkedTerminal> = new Map();
+  private readonly isLive: (sessionId: string) => boolean;
+
+  constructor(isLive: (sessionId: string) => boolean) {
+    this.isLive = isLive;
+  }
+
+  /** 生产单例：存活判定 = SessionManager 仍有该会话且未 closed；会话数变化时自动清理 */
+  static global(): TerminalParkingLot {
+    if (TerminalParkingLot.globalInstance === null) {
+      const lot: TerminalParkingLot = new TerminalParkingLot((sessionId: string): boolean => {
+        // 走 C4 适配器（SessionInfo → TerminalSessionLike 的显式桥），避免结构性类型
+        const info: TerminalSessionLike | null = new C4SessionHost().getSession(sessionId);
+        return info !== null && info.state !== 'closed';
+      });
+      SessionManager.get().addSessionCountListener((): void => {
+        lot.prune();
+      });
+      TerminalParkingLot.globalInstance = lot;
+    }
+    return TerminalParkingLot.globalInstance;
+  }
+
+  park(sessionId: string, entry: ParkedTerminal): void {
+    const previous: ParkedTerminal | undefined = this.entries.get(sessionId);
+    if (previous !== undefined && previous.terminal !== entry.terminal) {
+      previous.terminal.detach();
+    }
+    this.entries.set(sessionId, entry);
+    this.prune();
+  }
+
+  take(sessionId: string): ParkedTerminal | null {
+    const entry: ParkedTerminal | undefined = this.entries.get(sessionId);
+    if (entry === undefined) {
+      return null;
+    }
+    this.entries.delete(sessionId);
+    return entry;
+  }
+
+  has(sessionId: string): boolean {
+    return this.entries.has(sessionId);
+  }
+
+  size(): number {
+    return this.entries.size;
+  }
+
+  /** 失主寄存一律 detach 并移除 */
+  prune(): void {
+    const dead: string[] = [];
+    this.entries.forEach((entry: ParkedTerminal, sessionId: string) => {
+      if (!this.isLive(sessionId)) {
+        dead.push(sessionId);
+      }
+    });
+    for (const sessionId of dead) {
+      const entry: ParkedTerminal | undefined = this.entries.get(sessionId);
+      this.entries.delete(sessionId);
+      if (entry !== undefined) {
+        entry.terminal.detach();
+      }
+    }
+  }
+}
+
 /** 可选依赖集：缺省项走生产实现；单测全部注入 fake */
 export interface TerminalViewModelDeps {
   sessionHost?: TerminalSessionHostLike;
@@ -474,6 +614,17 @@ export interface TerminalViewModelDeps {
   focusHost?: TerminalFocusHostLike;
   /** 凭据写入（生产 = CredentialStore；单测注入内存 fake，不碰 ASSET） */
   secretWriter?: TerminalSecretWriterLike;
+  /** 终端寄存处（返回不断开；缺省 = 进程级 TerminalParkingLot.global()） */
+  parking?: TerminalParkingLike;
+  /** 视觉响铃出口：已节流的响铃投递到可见窗格（页面 → TerminalActionHub 'bell'） */
+  onBell?: (paneId: string) => void;
+  /** 时钟（响铃节流用；单测注入） */
+  now?: () => number;
+  /**
+   * 首叶 paneId（缺省 TERMINAL_MAIN_PANE_ID）。Index 侧栏嵌入终端用自己的 id，
+   * 既与画布 focusId 一致（焦点 / 光标形态正确），也不与全页终端的首叶抢绑定。
+   */
+  mainPaneId?: string;
 }
 
 /** 已 attach 终端的缓存条目：终端 + 绑定的 native 句柄（重连换柄检测依据） */
@@ -540,6 +691,10 @@ export class TerminalViewModel {
   private readonly uiHook: () => void;
   private readonly focusHost: TerminalFocusHostLike;
   private readonly secretWriter: TerminalSecretWriterLike;
+  private readonly injectedParking: TerminalParkingLike | null;
+  private readonly bellHook: (paneId: string) => void;
+  private readonly nowFn: () => number;
+  private readonly mainPaneId: string;
   /** 等待密码补录的主机（补录成功后按它重新拨号；非补录期为 null） */
   private pendingPasswordHost: HostProfile | null = null;
   /** 补录成功后的落点；页面初次进入等价 replace，连接面板可指定标签或分屏。 */
@@ -555,6 +710,17 @@ export class TerminalViewModel {
   private readonly termTypes: Map<string, string> = new Map();
   /** sessionId → terminalClose 标记 */
   private readonly closedBySession: Map<string, boolean> = new Map();
+  /** sessionId → 最近 OSC 标题（聚焦切换时投影到 terminalTitle，标签副标题也读它） */
+  private readonly titleBySession: Map<string, string> = new Map();
+  /** sessionId → DECCKM（聚焦投影到 applicationCursorKeys，避免多会话串扰） */
+  private readonly appCursorBySession: Map<string, boolean> = new Map();
+  /** sessionId → 响铃节流器（bell 风暴不连震、不连闪） */
+  private readonly bellLimiters: Map<string, BellLimiter> = new Map();
+  /** 不可见会话的响铃 / 新输出徽标（激活其标签即清） */
+  private readonly bellBadges: Set<string> = new Set();
+  private readonly activityBadges: Set<string> = new Set();
+  /** sessionId → 主机快照（会话被关闭后 hostOf 取不到，重新连接靠这份） */
+  private readonly hostSnapshots: Map<string, HostProfile> = new Map();
   /** 标签 → 上次聚焦叶（切回标签时恢复） */
   private readonly lastFocusByTab: Map<string, string> = new Map();
   private hostCache: TerminalSessionHostLike | null = null;
@@ -577,6 +743,10 @@ export class TerminalViewModel {
     this.uiHook = deps?.onUiChange ?? ((): void => {});
     this.focusHost = deps?.focusHost ?? new NoopFocusHost();
     this.secretWriter = deps?.secretWriter ?? new CredentialStoreSecretWriter();
+    this.injectedParking = deps?.parking ?? null;
+    this.bellHook = deps?.onBell ?? ((_paneId: string): void => {});
+    this.nowFn = deps?.now ?? ((): number => Date.now());
+    this.mainPaneId = deps?.mainPaneId ?? TERMINAL_MAIN_PANE_ID;
     this.unsubFocus = this.focusHost.addListener((id: string): void => {
       this.onExternalFocus(id);
     });
@@ -588,11 +758,16 @@ export class TerminalViewModel {
       this.onSessionEvent(session, event);
     };
 
-  /** dirty 唤醒入口：任一可见叶的输出迹象唤醒本页帧循环 */
+  /** dirty 唤醒入口：任一可见叶的输出迹象唤醒本页帧循环；不可见标签记「新输出」徽标 */
   private readonly dirtyListener: TerminalDirtyListener = (sessionId: string): void => {
-    if (!this.disposed && this.isSessionVisible(sessionId)) {
-      this.dirtyHook();
+    if (this.disposed) {
+      return;
     }
+    if (this.isSessionVisible(sessionId)) {
+      this.dirtyHook();
+      return;
+    }
+    this.markActivity(sessionId);
   };
 
   // ---------------------------------------------------------------- 进入编排
@@ -807,7 +982,7 @@ export class TerminalViewModel {
     const title: string = info.hostName.length > 0 ? info.hostName :
       (host === null ? '终端' : (host.name.length > 0 ? host.name : host.host));
     if (this.tabSet.tabs.length === 0) {
-      const added = this.tabSet.addTab(title, TERMINAL_MAIN_PANE_ID);
+      const added = this.tabSet.addTab(title, this.mainPaneId);
       added.leaf.sessionId = info.sessionId;
       this.focusedPaneId = added.leaf.paneId;
       this.lastFocusByTab.set(added.tab.tabId, added.leaf.paneId);
@@ -821,11 +996,16 @@ export class TerminalViewModel {
     }
     this.currentSessionId = info.sessionId;
     this.termTypes.set(info.sessionId, host === null ? DEFAULT_TERM_TYPE : host.termType);
+    if (host !== null) {
+      this.hostSnapshots.set(info.sessionId, host);
+    }
     if (this.hostName.length === 0) {
       this.hostName = title;
     }
     this.registerListeners();
-    const paneId: string = this.focusedPaneId.length > 0 ? this.focusedPaneId : TERMINAL_MAIN_PANE_ID;
+    // 从主机列表恢复：先取回寄存终端（画面 / 回滚保留，断线期也能看到旧画面）
+    this.adoptParked(info.sessionId);
+    const paneId: string = this.focusedPaneId.length > 0 ? this.focusedPaneId : this.mainPaneId;
     try {
       this.sessionHost().bindPane(info.sessionId, paneId);
     } catch (err) {
@@ -909,14 +1089,16 @@ export class TerminalViewModel {
     focused.sessionId = sessionId;
     this.currentSessionId = sessionId;
     this.hostName = info.hostName.length > 0 ? info.hostName : this.hostName;
-    this.terminalTitle = '';
+    this.terminalTitle = this.titleBySession.get(sessionId) ?? '';
     this.closedBySession.set(sessionId, false);
     this.startError = '';
     const host: HostProfile | null = this.hostForSession(sessionId) ?? this.lookupHost(info.hostId);
     if (host !== null) {
       this.termTypes.set(sessionId, host.termType);
+      this.hostSnapshots.set(sessionId, host);
       this.lastHost = host;
     }
+    this.adoptParked(sessionId);
     const paneTab = this.tabSet.tabOfPane(paneId);
     if (paneTab !== null && paneTab.root.kind === 'leaf') {
       paneTab.title = host !== null
@@ -1028,7 +1210,9 @@ export class TerminalViewModel {
     const changed: boolean = this.focusedPaneId !== paneId;
     this.focusedPaneId = paneId;
     this.focusHost.focus(paneId);
-    this.terminalTitle = changed ? '' : this.terminalTitle;
+    if (changed) {
+      this.terminalTitle = '';
+    }
     this.refreshViews();
     this.dirtyHook();
   }
@@ -1210,7 +1394,8 @@ export class TerminalViewModel {
       this.adoptSession(info, host);
       return;
     }
-    const placement: ConnectionOpenMode = this.resolvePlacementMode(mode);
+    const placement: ConnectionOpenMode =
+      adaptSplitDirection(this.resolvePlacementMode(mode), this.areaWidthVp, this.areaHeightVp);
     if (placement === 'replace') {
       this.switchSession(info.sessionId);
       return;
@@ -1421,14 +1606,122 @@ export class TerminalViewModel {
     this.reconnectNowAt(this.currentSessionId);
   }
 
+  /**
+   * 「立即重连 / 重新连接」：
+   *   - disconnected / error → 转发 C4 reconnectNow；
+   *   - shell 已退出但 SSH 仍 established → 在同一连接上重开 shell（新终端，旧画面替换）；
+   *   - 会话已关闭（closed / 已从表里摘除）→ 按主机快照重新拨号，绑回原窗格。
+   */
   reconnectNowAt(sessionId: string): void {
     if (this.disposed || sessionId.length === 0) {
       return;
     }
+    const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
+    if (info !== null && (info.state === 'disconnected' || info.state === 'error')) {
+      if (this.sessionHost().reconnectNow(sessionId)) {
+        this.closedBySession.set(sessionId, false);
+        this.refreshViews();
+      }
+      return;
+    }
+    if (info !== null && info.state === 'established' && this.closedBySession.get(sessionId) === true) {
+      this.restartShell(sessionId);
+      return;
+    }
+    if (info === null || info.state === 'closed' || info.state === 'closing') {
+      const leaf: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
+      if (leaf !== null) {
+        this.redialIntoLeaf(leaf, sessionId).catch((err: Object) => {
+          Logger.error(`重新连接失败: ${JSON.stringify(err)}`, LOG_TAG);
+        });
+      }
+      return;
+    }
+    // 其余（连接中等）沿用旧语义：交给 C4 判定
     if (this.sessionHost().reconnectNow(sessionId)) {
       this.closedBySession.set(sessionId, false);
       this.refreshViews();
     }
+  }
+
+  /** 会话已结束时是否提供「重新连接」 */
+  private canReconnectSession(sessionId: string): boolean {
+    if (sessionId.length === 0) {
+      return false;
+    }
+    const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
+    if (info !== null && info.state === 'established') {
+      return true;
+    }
+    return this.hostSnapshots.has(sessionId) || this.hostForSession(sessionId) !== null;
+  }
+
+  /** shell 退出后在同一 SSH 连接上重开一个 shell */
+  private restartShell(sessionId: string): void {
+    const cached: AttachedTerminal | undefined = this.attachedTerminals.get(sessionId);
+    if (cached !== undefined) {
+      cached.terminal.detach();
+      this.attachedTerminals.delete(sessionId);
+    }
+    this.closedBySession.set(sessionId, false);
+    this.titleBySession.delete(sessionId);
+    this.appCursorBySession.delete(sessionId);
+    this.ensureTerminalAttached(sessionId);
+    Logger.info(`重开 shell（sessionId=${sessionId}）`, LOG_TAG);
+    this.refreshViews();
+    this.dirtyHook();
+  }
+
+  /** 会话已关闭：按主机快照重新拨号，新会话绑回同一窗格（窗格位置 / 标签不变） */
+  private async redialIntoLeaf(leaf: PaneLeaf, oldSessionId: string): Promise<void> {
+    const host: HostProfile | null = this.hostSnapshots.get(oldSessionId) ?? this.hostForSession(oldSessionId);
+    if (host === null) {
+      Logger.warn(`重新连接缺少主机快照（sessionId=${oldSessionId}）`, LOG_TAG);
+      return;
+    }
+    let info: TerminalSessionLike;
+    try {
+      info = await this.sessionHost().connect(host);
+    } catch (err) {
+      const missingCredential: boolean =
+        err instanceof SshError && err.code === SshErrorCode.CREDENTIAL_MISSING;
+      if (missingCredential && host.authType === 'password') {
+        this.showPasswordPrompt(host, 'replace', false, '', '');
+        return;
+      }
+      throw err as Error;
+    }
+    if (this.disposed) {
+      this.sessionHost().close(info.sessionId);
+      return;
+    }
+    if (leaf.sessionId !== oldSessionId || this.tabSet.findLeaf(leaf.paneId) === null) {
+      // 等待期间窗格被关 / 换绑：新会话无处安放，直接关闭
+      this.sessionHost().close(info.sessionId);
+      return;
+    }
+    const cached: AttachedTerminal | undefined = this.attachedTerminals.get(oldSessionId);
+    if (cached !== undefined) {
+      cached.terminal.detach();
+      this.attachedTerminals.delete(oldSessionId);
+    }
+    this.forgetSession(oldSessionId);
+    this.sessionHost().unbindPane(leaf.paneId, false);
+    this.bindLeafSession(leaf, info, host);
+    this.refreshSessionList();
+    this.refreshViews();
+    this.dirtyHook();
+  }
+
+  /** 清掉某会话的全部会话级记账 */
+  private forgetSession(sessionId: string): void {
+    this.closedBySession.delete(sessionId);
+    this.titleBySession.delete(sessionId);
+    this.appCursorBySession.delete(sessionId);
+    this.bellLimiters.delete(sessionId);
+    this.bellBadges.delete(sessionId);
+    this.activityBadges.delete(sessionId);
+    this.hostSnapshots.delete(sessionId);
   }
 
   /** 「取消重连」（倒计时蒙层）：停掉自动重连，会话保持断开待用户抉择 */
@@ -1533,8 +1826,68 @@ export class TerminalViewModel {
   // ---------------------------------------------------------------- 退出
 
   /**
-   * 页面退出（幂等）：注销监听 → detach 全部缓存终端 → 所有叶 unbindPane(true)。
-   * 「返回列表即断连」；会话保留/后台保活归 §7.5。
+   * 页面返回（幂等）：会话**不断开**，终端寄存待恢复。
+   *   - shell 已退出（terminalClose）的会话没有可恢复的东西 → 关闭；
+   *   - 其余存活会话的已装配终端寄存到 TerminalParkingLot（不 detach，后台继续收数据）；
+   *   - 所有叶 unbindPane(false)，下次 sessionId 进入可重新绑定。
+   */
+  detach(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.unsubFocus();
+    this.unregisterListeners();
+    SnippetSendHub.get().unregister(this.snippetHubSender);
+    const ended: string[] = [];
+    for (const leaf of this.tabSet.allLeaves()) {
+      if (leaf.sessionId.length > 0 && this.closedBySession.get(leaf.sessionId) === true) {
+        ended.push(leaf.sessionId);
+      }
+    }
+    const parking: TerminalParkingLike = this.parking();
+    this.attachedTerminals.forEach((entry: AttachedTerminal, sessionId: string) => {
+      const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
+      if (info === null || info.state === 'closed' || ended.indexOf(sessionId) >= 0) {
+        entry.terminal.detach();
+        return;
+      }
+      parking.park(sessionId, {
+        terminal: entry.terminal,
+        nativeHandle: entry.nativeHandle,
+        title: this.titleBySession.get(sessionId) ?? '',
+        applicationCursorKeys: this.appCursorBySession.get(sessionId) === true
+      });
+    });
+    this.attachedTerminals.clear();
+    this.terminal = null;
+    this.releaseAllLeaves(false);
+    for (const sessionId of ended) {
+      this.sessionHost().close(sessionId);
+    }
+    this.tabSet.clear();
+    this.focusedPaneId = '';
+    this.currentSessionId = '';
+    Logger.info(`终端页返回：会话转入后台，已关闭 ${ended.length} 个已结束会话`, LOG_TAG);
+  }
+
+  /** 当前页面绑定且仍存活的会话数（返回时决定是否提示「会话仍在后台」） */
+  liveSessionCount(): number {
+    let count: number = 0;
+    for (const leaf of this.tabSet.allLeaves()) {
+      if (leaf.sessionId.length === 0 || this.closedBySession.get(leaf.sessionId) === true) {
+        continue;
+      }
+      const info: TerminalSessionLike | null = this.sessionHost().getSession(leaf.sessionId);
+      if (info !== null && info.state !== 'closed' && info.state !== 'closing') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 页面退出且关闭全部会话（幂等）：注销监听 → detach 全部缓存终端 → 所有叶 unbindPane(true)。
    */
   dispose(): void {
     if (this.disposed) {
@@ -1609,6 +1962,7 @@ export class TerminalViewModel {
         }
         break;
       case 'terminalTitle':
+        this.titleBySession.set(session.sessionId, event.title ?? '');
         if (focused) {
           this.terminalTitle = event.title ?? '';
         }
@@ -1617,9 +1971,7 @@ export class TerminalViewModel {
         }
         break;
       case 'terminalBell':
-        if (focused) {
-          this.vibrateHook();
-        }
+        this.onBell(session.sessionId, focused, wake);
         break;
       case 'terminalMouseMode':
         // mouseMode 已在 SessionManager DIRTY_EVENT_TYPES；这里只缓存聚焦投影
@@ -1628,8 +1980,11 @@ export class TerminalViewModel {
         }
         break;
       case 'terminalCursorKeys':
-        // T10 stub：native 暴露 DECCKM 后投递本事件；KeyMap/画布已接受该标志
-        this.applicationCursorKeys = event.applicationCursorKeys === true;
+        // DECCKM 按会话记账，聚焦会话投影到顶栏字段（键条 / 画布兜底用）
+        this.appCursorBySession.set(session.sessionId, event.applicationCursorKeys === true);
+        if (focused) {
+          this.applicationCursorKeys = event.applicationCursorKeys === true;
+        }
         if (wake) {
           this.dirtyHook();
         }
@@ -1649,6 +2004,7 @@ export class TerminalViewModel {
     if (native === null) {
       return;
     }
+    this.adoptParked(sessionId);
     const existing: AttachedTerminal | undefined = this.attachedTerminals.get(sessionId);
     if (existing !== undefined && existing.nativeHandle === native.nativeHandle) {
       if (sessionId === this.currentSessionId && this.terminal === null) {
@@ -1672,12 +2028,74 @@ export class TerminalViewModel {
     }
   }
 
+  /** 取回寄存终端（页面返回前留下的画面 / 回滚 / 标题 / DECCKM） */
+  private adoptParked(sessionId: string): void {
+    if (sessionId.length === 0 || this.attachedTerminals.has(sessionId)) {
+      return;
+    }
+    const parked: ParkedTerminal | null = this.parking().take(sessionId);
+    if (parked === null) {
+      return;
+    }
+    this.attachedTerminals.set(sessionId, { terminal: parked.terminal, nativeHandle: parked.nativeHandle });
+    if (parked.title.length > 0) {
+      this.titleBySession.set(sessionId, parked.title);
+    }
+    this.appCursorBySession.set(sessionId, parked.applicationCursorKeys);
+    if (sessionId === this.currentSessionId) {
+      this.terminal = parked.terminal;
+    }
+    Logger.info(`已取回寄存终端（sessionId=${sessionId}）`, LOG_TAG);
+  }
+
+  private parking(): TerminalParkingLike {
+    return this.injectedParking ?? TerminalParkingLot.global();
+  }
+
+  /** 响铃：按会话节流；可见窗格视觉闪 + 聚焦时轻震；不可见标签记徽标 */
+  private onBell(sessionId: string, focused: boolean, visible: boolean): void {
+    let limiter: BellLimiter | undefined = this.bellLimiters.get(sessionId);
+    if (limiter === undefined) {
+      limiter = new BellLimiter();
+      this.bellLimiters.set(sessionId, limiter);
+    }
+    if (!limiter.shouldRing(this.nowFn())) {
+      return;
+    }
+    const leaf: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
+    if (visible && leaf !== null) {
+      this.bellHook(leaf.paneId);
+      if (focused) {
+        this.vibrateHook();
+      }
+      return;
+    }
+    this.bellBadges.add(sessionId);
+  }
+
+  /** 不可见会话有新输出：给其标签记徽标（只在首次置位时刷新 UI，避免每个数据块都重建标签栏） */
+  private markActivity(sessionId: string): void {
+    if (this.activityBadges.has(sessionId)) {
+      return;
+    }
+    const leaf: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
+    const tab = leaf === null ? null : this.tabSet.tabOfPane(leaf.paneId);
+    if (tab === null || tab.tabId === this.tabSet.activeTabId) {
+      return;
+    }
+    this.activityBadges.add(sessionId);
+    this.refreshTabs();
+    this.notifyUi();
+  }
+
   // ---------------------------------------------------------------- 内部：绑定 / 释放 / 投影
 
   private bindLeafSession(leaf: PaneLeaf, info: TerminalSessionLike, host: HostProfile): void {
     leaf.sessionId = info.sessionId;
     this.termTypes.set(info.sessionId, host.termType);
+    this.hostSnapshots.set(info.sessionId, host);
     this.lastHost = host;
+    this.adoptParked(info.sessionId);
     try {
       this.sessionHost().bindPane(info.sessionId, leaf.paneId);
     } catch (err) {
@@ -1707,7 +2125,7 @@ export class TerminalViewModel {
         cached.terminal.detach();
         this.attachedTerminals.delete(leaf.sessionId);
       }
-      this.closedBySession.delete(leaf.sessionId);
+      this.forgetSession(leaf.sessionId);
     }
     this.sessionHost().unbindPane(leaf.paneId, closeSession);
   }
@@ -1768,7 +2186,6 @@ export class TerminalViewModel {
       this.lastFocusByTab.set(tab.tabId, id);
     }
     this.focusedPaneId = id;
-    this.terminalTitle = '';
     this.refreshViews();
   }
 
@@ -1788,10 +2205,34 @@ export class TerminalViewModel {
   private refreshTabs(): void {
     const items: TabRenderItem[] = [];
     for (const tab of this.tabSet.tabs) {
+      const active: boolean = tab.tabId === this.tabSet.activeTabId;
+      const leaves: PaneLeaf[] = leavesOf(tab.root);
+      let bell: boolean = false;
+      let activity: boolean = false;
+      for (const leaf of leaves) {
+        if (leaf.sessionId.length === 0) {
+          continue;
+        }
+        if (active) {
+          this.bellBadges.delete(leaf.sessionId);
+          this.activityBadges.delete(leaf.sessionId);
+          continue;
+        }
+        bell = bell || this.bellBadges.has(leaf.sessionId);
+        activity = activity || this.activityBadges.has(leaf.sessionId);
+      }
+      const remembered: string | undefined = this.lastFocusByTab.get(tab.tabId);
+      const titleLeaf: PaneLeaf | null = remembered !== undefined ? this.tabSet.findLeaf(remembered) :
+        (leaves.length > 0 ? leaves[0] : null);
+      const subtitle: string = titleLeaf === null || titleLeaf.sessionId.length === 0 ? '' :
+        (this.titleBySession.get(titleLeaf.sessionId) ?? '');
       const item: TabRenderItem = {
         tabId: tab.tabId,
         title: tab.title.length > 0 ? tab.title : '终端',
-        active: tab.tabId === this.tabSet.activeTabId
+        active: active,
+        subtitle: subtitle,
+        bell: bell,
+        activity: activity
       };
       items.push(item);
     }
@@ -1825,6 +2266,8 @@ export class TerminalViewModel {
     if (info !== null && info.hostName.length > 0) {
       this.hostName = info.hostName;
     }
+    this.terminalTitle = this.titleBySession.get(leaf.sessionId) ?? '';
+    this.applicationCursorKeys = this.appCursorBySession.get(leaf.sessionId) === true;
     this.refreshOverlay();
   }
 
@@ -1993,7 +2436,8 @@ export class TerminalViewModel {
       errorMessage: info === null ? '' : info.errorMessage,
       hasTerminal: hasTerminal,
       terminalClosed: closed,
-      startError: ''
+      startError: '',
+      canReconnect: this.canReconnectSession(sessionId)
     });
   }
 
@@ -2010,7 +2454,8 @@ export class TerminalViewModel {
       errorMessage: info === null ? '' : info.errorMessage,
       hasTerminal: this.terminal !== null,
       terminalClosed: closed,
-      startError: this.startError
+      startError: this.startError,
+      canReconnect: this.canReconnectSession(this.currentSessionId)
     });
   }
 

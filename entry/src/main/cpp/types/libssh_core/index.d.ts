@@ -51,8 +51,10 @@ export const getArgon2Version: () => string;
  *   terminalBell：terminal（vterm bell，UI 触感）
  *   terminalTitle：terminal / title（OSC 标题变更）
  *   terminalMouseMode：terminal / mouseMode（0=关 1=点击 2=拖动 3=任意移动）
- *   terminalCursorKeys（T10 stub，native 未实现）：terminal / applicationCursorKeys
- *     （true=DECCKM 应用光标键，方向键发 SS3；对称 mouseMode 的会话级标志）
+ *   terminalCursorKeys：terminal / applicationCursorKeys / bracketedPaste
+ *     （DECCKM 应用光标键或 DECSET 2004 括号粘贴任一变化时投递；native 每次 feed 后
+ *     经 vterm_keyboard_key / vterm_keyboard_start_paste 探测）
+ *   terminalData 已合并：同一终端最多一条在途，ArkTS 收到后才会投递下一条
  *
  * 注意：channelData 与 channelClose 走两条独立 TSFN 队列（背压隔离），
  * 最后的 channelData 与 channelClose 之间不保证到达顺序——exec 场景以
@@ -93,8 +95,10 @@ export interface SshNativeEvent {
   title?: string;
   /** T3：terminalMouseMode 事件的模式（0=关 1=点击 2=拖动 3=任意移动） */
   mouseMode?: number;
-  /** T10 stub：terminalCursorKeys 事件的 DECCKM 标志（native 未实现前缺省） */
+  /** terminalCursorKeys 事件：DECCKM 应用光标键 */
   applicationCursorKeys?: boolean;
+  /** terminalCursorKeys 事件：DECSET 2004 括号粘贴 */
+  bracketedPaste?: boolean;
 }
 
 /**
@@ -281,12 +285,20 @@ export interface TerminalFrameSnapshot {
   altScreen: boolean;
   /** 鼠标上报模式：0=关 1=点击(1000) 2=拖动(1002) 3=任意移动(1003) */
   mouseMode: number;
-  /** T10 stub：DECCKM 应用光标键（native 未暴露前缺省 undefined/false） */
+  /** DECCKM 应用光标键 */
   applicationCursorKeys?: boolean;
+  /** DECSET 2004 括号粘贴 */
+  bracketedPaste?: boolean;
+  /** DECSCUSR 光标形状覆盖：0=未覆盖（用用户偏好）1=块 2=下划线 3=竖线 */
+  cursorShape?: number;
+  /** DECSCUSR 闪烁覆盖：-1=未覆盖 0=不闪 1=闪 */
+  cursorBlink?: number;
   bellCount: number;
   /** 回滚有效窗口 [scrollbackOldest, scrollbackTotal)，getScrollbackWindow 的查询基准 */
   scrollbackOldest: number;
   scrollbackTotal: number;
+  /** 回滚重排代际（改列宽 reflow / ED3 清空时 +1）：变化后绝对行号不再指向原内容 */
+  scrollbackEpoch?: number;
   /** 脏行位图（u64 字数组的 ArrayBuffer 拷贝）；无脏行时仍为非空（全零） */
   dirty?: ArrayBuffer;
 }

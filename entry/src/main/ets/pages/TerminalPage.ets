@@ -12,8 +12,15 @@
  *   - sm：两窗格仍完整显示；仅 3+ 窗格降级聚焦叶，树与会话始终保活。
  *
  * 版面：沉浸式顶栏 + 标签栏 + 铺到页面底部的 PTY 窗格区；侧滑抽屉会话切换。
- * 退出：返回 = VM.dispose（所有叶 unbindPane true）+ router.back；
- * 关末叶 / 末标签 → vm.shouldExit → 同样退出。
+ * 退出：返回键 / ‹ = VM.detach（会话转入后台、终端寄存，主机列表「活动会话」可恢复）
+ * + router.back；关末叶 / 末标签 → vm.shouldExit → VM.dispose 后退出。
+ *
+ * 版面体验：
+ *   - 手机（sm）紧凑外框：单标签时隐藏标签栏；单窗格不再重复画窗格标题栏；
+ *   - 全屏模式：隐藏顶栏 / 标签栏 / 状态栏，只留右上角半透明「退出全屏」；
+ *   - 多窗格聚焦叶画强调色外框；状态（断线 / 重连 / 已结束）在已有画面时以
+ *     窗格顶部横幅呈现，画面仍可滚动、选择、复制；
+ *   - 所有可点控件触控热区 ≥ 40vp，并带无障碍朗读文案。
  */
 
 // KeyboardAvoidMode 必须显式导入：全局作用域里另有一个同名旧枚举（没有 RESIZE），
@@ -62,6 +69,7 @@ import {
   PasswordPromptModel,
   TerminalViewModel,
   deriveOverlay,
+  overlayPresentation,
   parseTerminalRouteParams
 } from '../viewmodel/TerminalViewModel';
 
@@ -83,8 +91,16 @@ const SCRIM_OPACITY: number = 0.72;
 const PANE_HEADER_HEIGHT_VP: number = 32;
 /** 顶栏定高：两行标题占位，切页签时不因 OSC 标题有无而伸缩。 */
 const TOP_BAR_HEIGHT_VP: number = 48;
-/** 标签栏定高：芯片 30 + 上下各 4。 */
-const TAB_BAR_HEIGHT_VP: number = 38;
+/** 标签栏定高：芯片 40 + 上下各 2。 */
+const TAB_BAR_HEIGHT_VP: number = 44;
+/** 最小触控热区（vp）：小图标的视觉尺寸可以更小，热区经 responseRegion 补足 */
+const TOUCH_TARGET_VP: number = 40;
+/** 小号关闭按钮的视觉尺寸（vp），热区仍是 TOUCH_TARGET_VP */
+const SMALL_CLOSE_VISUAL_VP: number = 24;
+/** 横幅模式下的置灰更轻：画面要可读、可选择 */
+const BANNER_DIM_OPACITY: number = 0.28;
+/** 全屏退出按钮不透明度（不挡内容但找得到） */
+const FULLSCREEN_EXIT_OPACITY: number = 0.6;
 /** 标签下拖超过此距离才进入分屏落点。 */
 const TAB_DRAG_SPLIT_THRESHOLD_VP: number = 36;
 /** 量不到芯片宽度时的幽灵标签兜底宽。 */
@@ -93,8 +109,8 @@ const TAB_DRAG_GHOST_WIDTH_VP: number = 148;
 const PANE_JOIN_LINE_VP: number = 1;
 /** 分隔条最小触摸热区；视觉仍只有 1vp，热区向两侧覆盖，手机上更容易抓住。 */
 const PANE_DIVIDER_HIT_SIZE_VP: number = 24;
-/** 顶部图标按钮的可见尺寸，触摸热区由左右 padding 补足。 */
-const TOP_ACTION_SIZE_VP: number = 30;
+/** 顶部图标按钮尺寸 = 最小触控热区。 */
+const TOP_ACTION_SIZE_VP: number = 40;
 
 interface TabChipGeom {
   x: number;
@@ -375,6 +391,12 @@ struct TerminalPage {
   private appliedChromeBackground: string = '';
   /** 全屏布局只沉浸到底部；顶部仍避开系统状态栏。 */
   @State private terminalTopInsetVp: number = 0;
+  /** 页面是否在前台（onPageHide → false：画布停绘、光标不闪） */
+  @State private pageVisible: boolean = true;
+  /** 全屏模式：隐藏顶栏 / 标签栏 / 状态栏 */
+  @State private fullscreen: boolean = false;
+  /** 进入全屏前的状态栏安全区（退出时恢复） */
+  private savedTopInsetVp: number = 0;
   /** 触感总开关（C3 hapticEnabled；aboutToAppear 读取，读取失败保持默认 true） */
   private hapticEnabled: boolean = true;
   /** 功能键条自定义布局 JSON（C3 keyBarLayout；空串 = 内置默认） */
@@ -403,6 +425,10 @@ struct TerminalPage {
     onUiChange: (): void => {
       this.syncFromVm();
     },
+    onBell: (paneId: string): void => {
+      // 已节流的视觉响铃：投递到对应画布闪一下
+      TerminalActionHub.get().execute(paneId, 'bell');
+    },
     focusHost: new PageFocusHost()
   });
 
@@ -429,13 +455,79 @@ struct TerminalPage {
 
   /** 从主机编辑页返回时刷新已保存连接；终端画布与会话本身不重建。 */
   onPageShow(): void {
+    this.pageVisible = true;
     this.vm.reloadConnections();
+    // 从键位编辑页返回：重新读布局
+    try {
+      this.keyBarLayoutJson = SettingsRepository.getKeyBarLayout();
+    } catch (err) {
+      Logger.warn(`键条布局读取失败：${JSON.stringify(err)}`, LOG_TAG);
+    }
     // 常亮只在真正看着终端时生效：跳去主机编辑页那段时间不该压着系统不息屏
     ScreenAwake.get().setTerminalVisible(true);
+    FrameScheduler.get().wakeup();
   }
 
   onPageHide(): void {
+    // 页面被盖住 / 应用退后台：画布停绘（FrameScheduler setVisible false），光标停闪
+    this.pageVisible = false;
     ScreenAwake.get().setTerminalVisible(false);
+  }
+
+  /**
+   * 系统返回：先收起抽屉 / 退出全屏；否则「返回不断开」——会话转后台，
+   * 主机列表可恢复。返回 true 表示已自行处理（不再走默认 router.back）。
+   */
+  onBackPress(): boolean {
+    if (this.colorPickerVisible) {
+      this.onColorPickerCancel();
+      return true;
+    }
+    if (this.showSideBar) {
+      this.closeSidePanel();
+      return true;
+    }
+    if (this.fullscreen) {
+      this.setFullscreen(false);
+      return true;
+    }
+    this.onBack();
+    return true;
+  }
+
+  /** 全屏开关：隐藏顶栏 / 标签栏 / 系统状态栏（键条保留，手机上仍要靠它输入特殊键） */
+  private setFullscreen(on: boolean): void {
+    if (this.fullscreen === on) {
+      return;
+    }
+    this.fullscreen = on;
+    if (on) {
+      this.savedTopInsetVp = this.terminalTopInsetVp;
+      this.terminalTopInsetVp = 0;
+    } else {
+      this.terminalTopInsetVp = this.savedTopInsetVp;
+    }
+    const win: window.Window | null = this.terminalWindow;
+    if (win !== null) {
+      win.setSpecificSystemBarEnabled('status', !on).catch((err: Object) => {
+        Logger.warn(`状态栏显隐切换失败：${JSON.stringify(err)}`, LOG_TAG);
+      });
+    }
+  }
+
+  private toggleSoftKeyboard(): void {
+    const paneId: string = this.vm.focusedPaneId;
+    if (paneId.length > 0) {
+      TerminalActionHub.get().execute(paneId, 'keyboard');
+    }
+  }
+
+  private showToast(message: string): void {
+    try {
+      this.getUIContext().getPromptAction().showToast({ message: message, duration: 2000 });
+    } catch (err) {
+      Logger.warn(`toast 失败：${JSON.stringify(err)}`, LOG_TAG);
+    }
   }
 
   /**
@@ -534,6 +626,11 @@ struct TerminalPage {
     this.terminalWindow = null;
     this.appliedChromeBackground = '';
     if (win !== null) {
+      if (this.fullscreen) {
+        win.setSpecificSystemBarEnabled('status', true).catch((err: Object) => {
+          Logger.warn(`恢复状态栏失败：${JSON.stringify(err)}`, LOG_TAG);
+        });
+      }
       this.restoreWindowChrome(win);
       win.setWindowLayoutFullScreen(false).catch((err: Object) => {
         Logger.warn(`恢复普通窗口布局失败：${JSON.stringify(err)}`, LOG_TAG);
@@ -544,7 +641,9 @@ struct TerminalPage {
     } catch (err) {
       Logger.warn(`恢复键盘避让模式失败：${JSON.stringify(err)}`, LOG_TAG);
     }
-    this.vm.dispose();
+    this.fullscreen = false;
+    // 系统手势返回等未经 onBack 的离开路径：同样只转后台不断开（detach 幂等）
+    this.vm.detach();
   }
 
   /**
@@ -991,19 +1090,35 @@ struct TerminalPage {
     }
     const hostId: string = this.appearanceEditingHostId;
     const appearance: TerminalAppearance = cloneAppearance(this.appearanceForHost(hostId));
-    if (hostId.length === 0) {
-      this.appearanceEditCommitted = true;
+    const result: string = this.persistAppearance(hostId, appearance);
+    if (result === 'failed') {
+      this.appearanceSaveMessage = '保存失败，请稍后重试';
+      return;
+    }
+    this.appearanceEditCommitted = true;
+    if (result === 'temporary') {
       this.appearanceSaveMessage = '临时连接外观已在本次会话生效';
       this.showSideBar = false;
       return;
     }
+    this.appearanceBeforeEdit = cloneAppearance(appearance);
+    this.appearanceSaveMessage = '已保存到当前服务器';
+    this.vm.reloadConnections();
+    this.showSideBar = false;
+  }
+
+  /**
+   * 把外观写入主机的外观配置（Copy-on-write：共享主题先克隆）。
+   * 返回 'saved' / 'temporary'（临时连接，无主机记录）/ 'failed'。
+   */
+  private persistAppearance(hostId: string, appearance: TerminalAppearance): string {
+    if (hostId.length === 0) {
+      return 'temporary';
+    }
     try {
       const host: HostProfile | null = AppDatabase.hosts().getById(hostId);
       if (host === null) {
-        this.appearanceEditCommitted = true;
-        this.appearanceSaveMessage = '临时连接外观已在本次会话生效';
-        this.showSideBar = false;
-        return;
+        return 'temporary';
       }
       const storedProfile: AppearanceProfile | null = host.appearanceId === null
         ? null : AppDatabase.appearances().getById(host.appearanceId);
@@ -1049,23 +1164,30 @@ struct TerminalPage {
         AppDatabase.appearances().update(profile);
       }
       notifyConfigSaved();
-      this.appearanceEditCommitted = true;
-      this.appearanceBeforeEdit = cloneAppearance(appearance);
-      this.appearanceSaveMessage = '已保存到当前服务器';
-      this.vm.reloadConnections();
-      this.showSideBar = false;
+      return 'saved';
     } catch (err) {
       Logger.error(`终端外观保存失败：${JSON.stringify(err)}`, LOG_TAG);
-      this.appearanceSaveMessage = '保存失败，请稍后重试';
+      return 'failed';
     }
   }
 
+  /** 双指缩放松手：只提交一次（画布内部已做预览），并持久化到该服务器的外观 */
   private onPaneFontSizeCommit(hostId: string, fontSize: number): void {
     const appearance: TerminalAppearance = cloneAppearance(this.appearanceForHost(hostId));
-    appearance.fontSize = Math.max(8, Math.min(32, fontSize));
+    const size: number = Math.max(8, Math.min(32, fontSize));
+    if (size === appearance.fontSize) {
+      return;
+    }
+    appearance.fontSize = size;
     const key: string = hostId.length > 0 ? hostId : '__terminal_default__';
     this.appearancesByHost.set(key, appearance);
     this.appearanceRevision++;
+    const result: string = this.persistAppearance(hostId, appearance);
+    if (result === 'saved') {
+      this.showToast(`字号 ${size} 已保存到当前服务器`);
+    } else if (result === 'failed') {
+      this.showToast(`字号 ${size} 仅本次生效（保存失败）`);
+    }
   }
 
   /**
@@ -1091,16 +1213,42 @@ struct TerminalPage {
     return item.terminal as SshTerminal | null;
   }
 
-  /** 返回（关闭全部窗格会话 + 回列表） */
+  /** 返回：会话不断开，转入后台（主机列表「活动会话」可恢复） */
   private onBack(): void {
-    this.vm.dispose();
+    const live: number = this.vm.liveSessionCount();
+    this.vm.detach();
+    if (live > 0) {
+      this.showToast(live > 1 ? `${live} 个会话仍在后台运行，可在主机列表恢复` :
+        '会话仍在后台运行，可在主机列表恢复');
+    }
     router.back();
   }
 
+  /** 关完最后一个窗格 / 标签：会话已全部关闭，直接退出 */
   private exitIfEmpty(): void {
     if (this.vm.shouldExit) {
-      this.onBack();
+      this.vm.dispose();
+      router.back();
     }
+  }
+
+  /** 是否紧凑外框（手机竖屏等窄断点） */
+  private isCompact(): boolean {
+    return this.breakpoint === 'sm';
+  }
+
+  /** 紧凑外框下单标签不显示标签栏（标题已在顶栏） */
+  private showTabBar(): boolean {
+    return !this.isCompact() || this.tabItems.length > 1;
+  }
+
+  private focusedPaneItem(): PaneRenderItem | null {
+    for (const pane of this.panes) {
+      if (pane.focused) {
+        return pane;
+      }
+    }
+    return null;
   }
 
   private onPaneClose(paneId: string): void {
@@ -1167,8 +1315,12 @@ struct TerminalPage {
       // Stack 包一层，好把密码补录框盖在整页之上。
       Stack() {
       Column() {
-        this.TopBar()
-        this.TabBar()
+        if (!this.fullscreen) {
+          this.TopBar()
+          if (this.showTabBar()) {
+            this.TabBar()
+          }
+        }
 
         Stack() {
           // 单窗格（绝大多数场景）不走 ForEach：ForEach 的 key 一旦含几何，
@@ -1199,10 +1351,42 @@ struct TerminalPage {
             }, (item: DividerRect) => this.dividerKey(item))
           }
 
+          // 多窗格：聚焦叶画强调色外框（独立图层，不参与命中，也不触发画布重建）
+          if (this.panes.length > 1 && this.focusedPaneItem() !== null) {
+            Column()
+              .width((this.focusedPaneItem() as PaneRenderItem).w)
+              .height((this.focusedPaneItem() as PaneRenderItem).h)
+              .position({
+                x: (this.focusedPaneItem() as PaneRenderItem).x,
+                y: (this.focusedPaneItem() as PaneRenderItem).y
+              })
+              .border({ width: 2, color: Tokens.Color.accent })
+              .opacity(0.85)
+              .hitTestBehavior(HitTestMode.None)
+          }
+
           // 补录框弹出期间不画蒙层：否则「正在连接」的转圈会盖在输入框后面误导用户
           if (this.panes.length === 0 && this.overlayModel.kind !== 'none'
             && !this.passwordPrompt.visible) {
             this.StatusOverlay({ model: this.overlayModel, sessionId: '', paneId: '' })
+          }
+
+          if (this.fullscreen) {
+            Text('⤡')
+              .fontSize(Tokens.fontSize.title)
+              .fontColor(this.chromeText())
+              .width(TOUCH_TARGET_VP)
+              .height(TOUCH_TARGET_VP)
+              .textAlign(TextAlign.Center)
+              .borderRadius(TOUCH_TARGET_VP / 2)
+              .backgroundColor(this.chromeOverlay())
+              .opacity(FULLSCREEN_EXIT_OPACITY)
+              .position({ x: '100%', y: 0 })
+              .translate({ x: -TOUCH_TARGET_VP - 8, y: 8 })
+              .accessibilityText('退出全屏')
+              .onClick(() => {
+                this.setFullscreen(false);
+              })
           }
 
           if (this.tabDragReady) {
@@ -1400,6 +1584,7 @@ struct TerminalPage {
         .textAlign(TextAlign.Center)
         .borderRadius(Tokens.radius.sm)
         .backgroundColor(this.chromeOverlay())
+        .accessibilityText('返回主机列表，会话保持在后台')
         .onClick(() => {
           this.onBack();
         })
@@ -1430,11 +1615,15 @@ struct TerminalPage {
           .height(Tokens.space.xs)
           .borderRadius(Tokens.space.xs2)
           .backgroundColor(this.statusColorOf(this.sessionState))
-        Text(this.statusLabel())
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(this.chromeTextDim())
-          .margin({ left: Tokens.space.xs2 })
+        if (!this.isCompact()) {
+          Text(this.statusLabel())
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(this.chromeTextDim())
+            .margin({ left: Tokens.space.xs2 })
+        }
       }
+      .accessibilityGroup(true)
+      .accessibilityText(`连接状态：${this.statusLabel()}`)
       .padding({
         left: Tokens.space.xs,
         right: Tokens.space.xs,
@@ -1445,6 +1634,36 @@ struct TerminalPage {
       .borderRadius(Tokens.radius.sm)
       .margin({ left: Tokens.space.xs })
 
+      if (this.currentSessionId.length > 0) {
+        Text('⌨')
+          .fontSize(Tokens.fontSize.title)
+          .fontColor(this.chromeText())
+          .width(TOP_ACTION_SIZE_VP)
+          .height(TOP_ACTION_SIZE_VP)
+          .textAlign(TextAlign.Center)
+          .borderRadius(Tokens.radius.sm)
+          .backgroundColor(this.chromeOverlay())
+          .margin({ left: Tokens.space.xs })
+          .accessibilityText('显示或隐藏软键盘')
+          .onClick(() => {
+            this.toggleSoftKeyboard();
+          })
+      }
+
+      Text('⤢')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(this.chromeText())
+        .width(TOP_ACTION_SIZE_VP)
+        .height(TOP_ACTION_SIZE_VP)
+        .textAlign(TextAlign.Center)
+        .borderRadius(Tokens.radius.sm)
+        .backgroundColor(this.chromeOverlay())
+        .margin({ left: Tokens.space.xs })
+        .accessibilityText('全屏')
+        .onClick(() => {
+          this.setFullscreen(true);
+        })
+
       Text('⚙')
         .fontSize(Tokens.fontSize.title)
         .fontColor(this.chromeText())
@@ -1454,6 +1673,7 @@ struct TerminalPage {
         .borderRadius(Tokens.radius.sm)
         .backgroundColor(this.chromeOverlay())
         .margin({ left: Tokens.space.xs })
+        .accessibilityText('终端外观与功能键设置')
         .onClick(() => {
           this.openAppearancePanel();
         })
@@ -1465,13 +1685,19 @@ struct TerminalPage {
           this.ConnectionGlyphRow()
         }
         .justifyContent(FlexAlign.Center)
-        Text('连接')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(this.chromeText())
-          .margin({ left: Tokens.space.xs2 })
+        if (!this.isCompact()) {
+          Text('连接')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(this.chromeText())
+            .margin({ left: Tokens.space.xs2 })
+        }
       }
       .height(TOP_ACTION_SIZE_VP)
-      .padding({ left: Tokens.space.xs, right: Tokens.space.sm })
+      .constraintSize({ minWidth: TOP_ACTION_SIZE_VP })
+      .justifyContent(FlexAlign.Center)
+      .accessibilityGroup(true)
+      .accessibilityText('连接与会话列表')
+      .padding({ left: Tokens.space.xs, right: this.isCompact() ? Tokens.space.xs : Tokens.space.sm })
       .borderRadius(Tokens.radius.sm)
       .backgroundColor(this.chromeOverlay())
       .margin({ left: Tokens.space.xs })
@@ -1500,7 +1726,8 @@ struct TerminalPage {
           ForEach(this.tabItems, (tab: TabRenderItem) => {
             this.TabChip({ tab: tab })
             // key 含 active/title：否则切标签时高亮与标题不更新（同 paneCanvasKey 的道理）
-          }, (tab: TabRenderItem) => `${tab.tabId}|${tab.active}|${tab.title}`)
+          }, (tab: TabRenderItem) =>
+            `${tab.tabId}|${tab.active}|${tab.title}|${tab.subtitle}|${tab.bell}|${tab.activity}`)
         }
       }
       .scrollable(ScrollDirection.Horizontal)
@@ -1517,6 +1744,7 @@ struct TerminalPage {
         .borderRadius(Tokens.radius.sm)
         .backgroundColor(this.chromeOverlay())
         .margin({ left: Tokens.space.xs2 })
+        .accessibilityText('新建标签')
         .onClick(() => {
           this.closeSidePanel();
           this.vm.openConnectionTab();
@@ -1548,6 +1776,8 @@ struct TerminalPage {
       .borderRadius(Tokens.radius.sm)
       .backgroundColor(this.chromeOverlay())
       .margin({ left: Tokens.space.xs2 })
+      .accessibilityGroup(true)
+      .accessibilityText('分屏打开连接')
       .onClick(() => {
         this.openConnectionsPanel('row');
       })
@@ -1574,28 +1804,65 @@ struct TerminalPage {
         .borderRadius(Tokens.space.xs2)
         .backgroundColor($$.tab.active ? Tokens.Color.accent : Color.Transparent)
         .margin({ right: Tokens.space.xs2 })
-      Text($$.tab.title)
-        .fontSize(Tokens.fontSize.caption)
-        .fontWeight($$.tab.active ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor($$.tab.active ? this.chromeText() : this.chromeTextDim())
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .constraintSize({ maxWidth: TAB_TITLE_MAX_WIDTH_VP })
-        .onClick(() => {
-          this.vm.activateTab($$.tab.tabId);
-        })
+      Column() {
+        Text($$.tab.title)
+          .fontSize(Tokens.fontSize.caption)
+          .fontWeight($$.tab.active ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor($$.tab.active ? this.chromeText() : this.chromeTextDim())
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .constraintSize({ maxWidth: TAB_TITLE_MAX_WIDTH_VP })
+        if ($$.tab.subtitle.length > 0) {
+          // OSC 标题（如 vim 文件名 / 当前目录）作第二行
+          Text($$.tab.subtitle)
+            .fontSize(10)
+            .fontColor(this.chromeTextDim())
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: TAB_TITLE_MAX_WIDTH_VP })
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .justifyContent(FlexAlign.Center)
+      .height('100%')
+      .onClick(() => {
+        this.vm.activateTab($$.tab.tabId);
+      })
+      if ($$.tab.bell) {
+        Text('🔔')
+          .fontSize(10)
+          .margin({ left: Tokens.space.xs2 })
+          .accessibilityText('有响铃')
+      } else if ($$.tab.activity) {
+        Column()
+          .width(6)
+          .height(6)
+          .borderRadius(3)
+          .backgroundColor(Tokens.Color.accent)
+          .margin({ left: Tokens.space.xs2 })
+          .accessibilityText('有新输出')
+      }
       Text('×')
         .fontSize(Tokens.fontSize.caption)
         .fontColor(this.chromeTextDim())
-        .width(Tokens.space.lg)
-        .height(Tokens.space.lg)
+        .width(SMALL_CLOSE_VISUAL_VP)
+        .height(SMALL_CLOSE_VISUAL_VP)
         .textAlign(TextAlign.Center)
         .borderRadius(Tokens.radius.xs)
         .margin({ left: Tokens.space.xs2 })
+        .responseRegion({
+          x: -(TOUCH_TARGET_VP - SMALL_CLOSE_VISUAL_VP) / 2,
+          y: -(TOUCH_TARGET_VP - SMALL_CLOSE_VISUAL_VP) / 2,
+          width: TOUCH_TARGET_VP,
+          height: TOUCH_TARGET_VP
+        })
+        .accessibilityText(`关闭标签 ${$$.tab.title}`)
         .onClick(() => {
           this.onTabClose($$.tab.tabId);
         })
     }
+    .accessibilityText(`${$$.tab.title}${$$.tab.active ? '，当前标签' : ''}` +
+      `${$$.tab.bell ? '，有响铃' : ($$.tab.activity ? '，有新输出' : '')}`)
     .height(TOP_ACTION_SIZE_VP)
     .padding({ left: Tokens.space.xs, right: Tokens.space.xs2 })
     .backgroundColor($$.tab.active ? this.chromeOverlay() : Color.Transparent)
@@ -1628,8 +1895,8 @@ struct TerminalPage {
    */
   @Builder
   SinglePaneSlot($$: PaneSlotParams) {
+    // 单窗格不画窗格标题栏：主机名 / 状态已在顶栏，省下一行给终端
     Column() {
-      this.PaneHeader({ item: $$.item })
       if ($$.item.connectionPicker) {
         this.InlineConnectionPicker({ item: $$.item })
       } else {
@@ -1813,11 +2080,18 @@ struct TerminalPage {
         Text('×')
           .fontSize(Tokens.fontSize.body)
           .fontColor(this.appearanceForHost($$.item.hostId).foreground)
-          .width(Tokens.space.lg)
-          .height(Tokens.space.lg)
+          .width(SMALL_CLOSE_VISUAL_VP)
+          .height(SMALL_CLOSE_VISUAL_VP)
           .textAlign(TextAlign.Center)
           .borderRadius(Tokens.radius.xs)
           .backgroundColor(this.chromeOverlay())
+          .responseRegion({
+            x: -(TOUCH_TARGET_VP - SMALL_CLOSE_VISUAL_VP) / 2,
+            y: -(TOUCH_TARGET_VP - SMALL_CLOSE_VISUAL_VP) / 2,
+            width: TOUCH_TARGET_VP,
+            height: TOUCH_TARGET_VP
+          })
+          .accessibilityText(`关闭窗格 ${$$.item.hostName}`)
           .onClick(() => {
             this.onPaneClose($$.item.paneId);
           })
@@ -1843,7 +2117,7 @@ struct TerminalPage {
         hapticEnabled: this.hapticEnabled,
         focusId: $$.item.paneId,
         autoFocus: $$.item.focused,
-        visible: true,
+        visible: this.pageVisible,
         autoResizeTerminal: !this.dividerDragging,
         shortcutBindingsJson: this.shortcutBindingsJson,
         // T10 DECCKM：会话级应用光标键标志（native 未暴露前恒 false）
@@ -1859,14 +2133,23 @@ struct TerminalPage {
       })
 
       if ($$.item.overlay.dimmed) {
+        // 置灰层不参与命中：横幅模式下画面仍可滚动 / 选择 / 复制
         Column()
           .width('100%')
           .height('100%')
           .backgroundColor(this.appearanceForHost($$.item.hostId).background)
-          .opacity(DIM_OVERLAY_OPACITY)
+          .opacity(overlayPresentation($$.item.overlay, $$.item.terminal !== null) === 'banner'
+            ? BANNER_DIM_OPACITY : DIM_OVERLAY_OPACITY)
+          .hitTestBehavior(HitTestMode.None)
       }
 
-      if ($$.item.overlay.kind !== 'none') {
+      if (overlayPresentation($$.item.overlay, $$.item.terminal !== null) === 'banner') {
+        this.StatusBanner({
+          model: $$.item.overlay,
+          sessionId: $$.item.sessionId,
+          paneId: $$.item.paneId
+        })
+      } else if ($$.item.overlay.kind !== 'none') {
         this.StatusOverlay({
           model: $$.item.overlay,
           sessionId: $$.item.sessionId,
@@ -2032,6 +2315,97 @@ struct TerminalPage {
   }
 
   /** 状态蒙层：连接中 / 重连倒计时 / 错误与操作按钮 / 会话已结束 */
+  /**
+   * 非阻塞状态横幅：已有终端画面时用它替代整窗格蒙层。
+   * 只占窗格顶部一条，画面其余部分照常可滚动 / 选择 / 复制；操作按钮与蒙层一致。
+   */
+  @Builder
+  StatusBanner($$: StatusOverlayParams) {
+    Column() {
+      Row() {
+        if ($$.model.kind === 'connecting' || $$.model.kind === 'reconnecting') {
+          LoadingProgress()
+            .width(20)
+            .height(20)
+            .color(Tokens.Color.accent)
+            .margin({ right: Tokens.space.xs })
+        } else {
+          Column()
+            .width(Tokens.space.xs)
+            .height(Tokens.space.xs)
+            .borderRadius(Tokens.space.xs2)
+            .backgroundColor($$.model.kind === 'closed' ? Tokens.Color.textFaint : Tokens.Color.warn)
+            .margin({ right: Tokens.space.xs })
+        }
+        Column() {
+          Text($$.model.title)
+            .fontSize(Tokens.fontSize.body)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.Color.text)
+            .maxLines(1)
+          if ($$.model.detail.length > 0) {
+            Text($$.model.detail)
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(Tokens.Color.textDim)
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        if ($$.model.showCancelReconnect) {
+          Button('取消')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.text)
+            .backgroundColor(Tokens.Color.surfaceHover)
+            .height(TOUCH_TARGET_VP)
+            .margin({ left: Tokens.space.xs })
+            .accessibilityText('取消自动重连')
+            .onClick(() => {
+              this.vm.cancelAutoReconnectAt($$.sessionId);
+            })
+        }
+        if ($$.model.showReconnectNow) {
+          Button($$.model.kind === 'closed' ? '重新连接' : '重连')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.onAccent)
+            .backgroundColor(Tokens.Color.accent)
+            .height(TOUCH_TARGET_VP)
+            .margin({ left: Tokens.space.xs })
+            .onClick(() => {
+              this.vm.reconnectNowAt($$.sessionId);
+            })
+        }
+        if ($$.model.showClose) {
+          Button('关闭')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.text)
+            .backgroundColor(Tokens.Color.surfaceHover)
+            .height(TOUCH_TARGET_VP)
+            .margin({ left: Tokens.space.xs })
+            .accessibilityText('关闭此窗格')
+            .onClick(() => {
+              this.onPaneClose($$.paneId);
+            })
+        }
+      }
+      .width('100%')
+      .padding({
+        left: Tokens.space.sm,
+        right: Tokens.space.xs,
+        top: Tokens.space.xs,
+        bottom: Tokens.space.xs
+      })
+      .backgroundColor(Tokens.Color.surface)
+      .borderRadius(Tokens.radius.sm)
+      .shadow({ radius: 8, color: '#40000000', offsetY: 2 })
+    }
+    .width('100%')
+    .padding(Tokens.space.xs)
+    .position({ x: 0, y: 0 })
+    .accessibilityGroup(true)
+  }
+
   @Builder
   StatusOverlay($$: StatusOverlayParams) {
     Column() {
@@ -2069,7 +2443,7 @@ struct TerminalPage {
             })
         }
         if ($$.model.showReconnectNow) {
-          Button('立即重连')
+          Button($$.model.kind === 'closed' ? '重新连接' : '立即重连')
             .fontSize(Tokens.fontSize.body)
             .fontColor(Tokens.Color.onAccent)
             .backgroundColor(Tokens.Color.accent)
@@ -2500,19 +2874,32 @@ struct TerminalPage {
       .layoutWeight(1)
       .margin({ top: Tokens.space.md })
 
+      Button('编辑功能键条…')
+        .fontSize(Tokens.fontSize.caption)
+        .fontColor(Tokens.Color.text)
+        .backgroundColor(Tokens.Color.surfaceHover)
+        .height(TOUCH_TARGET_VP)
+        .width('100%')
+        .margin({ top: Tokens.space.sm })
+        .onClick(() => {
+          this.cancelAppearancePreviewIfNeeded();
+          this.showSideBar = false;
+          router.pushUrl({ url: 'pages/KeyBarEditorPage' });
+        })
+
       Row({ space: Tokens.space.xs }) {
         Button('恢复默认')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textDim)
           .backgroundColor(Tokens.Color.surfaceHover)
-          .height(34)
+          .height(TOUCH_TARGET_VP)
           .layoutWeight(1)
           .onClick(() => this.resetAppearanceDraft())
         Button('取消')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.text)
           .backgroundColor(Tokens.Color.surfaceHover)
-          .height(34)
+          .height(TOUCH_TARGET_VP)
           .layoutWeight(1)
           .onClick(() => {
             this.cancelAppearancePreviewIfNeeded();
@@ -2522,7 +2909,7 @@ struct TerminalPage {
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.onAccent)
           .backgroundColor(Tokens.Color.accent)
-          .height(34)
+          .height(TOUCH_TARGET_VP)
           .layoutWeight(1)
           .onClick(() => this.saveAppearanceDraft())
       }

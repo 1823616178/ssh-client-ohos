@@ -94,7 +94,9 @@ export struct TerminalPaneEmbed {
       onUiChange: (): void => {
         this.syncFromVm();
       },
-      focusHost: new EmbedFocusHost()
+      focusHost: new EmbedFocusHost(),
+      // 与画布 focusId 一致，且不与全页终端首叶 terminal-main 抢绑定
+      mainPaneId: EMBED_PANE_ID
     });
     this.vm = vm;
     vm.start({ hostId: hostId, sessionId: '' }).catch((err: Object) => {

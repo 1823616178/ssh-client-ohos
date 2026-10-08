@@ -97,6 +97,13 @@ struct TerminalHandle {
     // detachTerminal/通道终态后置位：onData 丢弃、writeTerminal 拒绝
     std::atomic<bool> closing{false};
 
+    // terminalData 事件合并闩：已有一条在途（未被 ArkTS 消费）时不再投递新事件。
+    // 连续大输出（cat 大文件）时每个 chunk 一条 TSFN 事件会挤占 ArkTS 线程；
+    // UI 只需要「revision 变了」的唤醒，一条在途足够（ArkTS 唤醒后读的是最新快照）。
+    // 清闩：ArkTS 侧 CallJs 收到事件即清（AckTerminalDataEvent）、投递失败即清、
+    // endFrame 时也清（兜底：任何异常路径下闩都不会永久卡住）。
+    std::atomic<bool> dataEventInFlight{false};
+
     // 拿 Core 副本（任意线程）；已销毁返回 nullptr。副本保活到调用方用完——
     // 销毁点（循环线程）reset 后，副本持有处析构 Core：通道已终态前提由编排保证
     std::shared_ptr<Core> coreCopy() const
@@ -186,9 +193,15 @@ ssh::SshChannelCallbacks MakeTerminalCallbacks(SessionHandle *shRaw,
         // 数据面留在 native；只投递轻量 dirty 信号唤醒可能已休眠的 displaySync。
         // 不发此事件时，输入与远端输出虽然都成功，网格却会停在上一帧，表现为
         // 「物理键盘、软键盘、功能键条全部无法输入」。
+        // 合并：已有在途事件时跳过（见 TerminalHandle::dataEventInFlight）
+        if (th->dataEventInFlight.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
         auto *evt = new BridgeEvent{EventKind::kTerminalData};
         evt->terminal = th->handle;
-        SendTerminalDataEvent(shRaw, evt);
+        if (!SendTerminalDataEvent(shRaw, evt)) {
+            th->dataEventInFlight.store(false, std::memory_order_release);
+        }
     };
     cb.onClose = [shRaw, weakTh](const ssh::ChannelCloseInfo &info) {
         auto th = weakTh.lock();
@@ -234,6 +247,30 @@ void WireVtermCallbacks(SessionHandle *shRaw, std::weak_ptr<TerminalHandle> weak
         auto *evt = new BridgeEvent{EventKind::kTerminalMouseMode};
         evt->number = static_cast<long>(mode);
         SendTerminalEvent(shRaw, th->handle, evt);
+    });
+    // DECCKM / 2004 变化：terminalCursorKeys 事件（applicationCursorKeys + bracketedPaste）
+    vterm.setModesCallback([shRaw, weakTh](bool appCursor, bool bracketed) {
+        auto th = weakTh.lock();
+        if (!th) {
+            return;
+        }
+        auto *evt = new BridgeEvent{EventKind::kTerminalModes};
+        evt->success = appCursor;
+        evt->hasHint = bracketed;
+        SendTerminalEvent(shRaw, th->handle, evt);
+    });
+    // 终端应答（DSR 光标位置报告、DA 设备属性等）回写远端：feed 在循环线程同步触发，
+    // channel->write 只入队 post，不会重入 onData。此前没有输出回调，应答全部丢失，
+    // 依赖 DSR 的程序（部分 shell 提示符、fzf、htop 尺寸探测）会卡顿或错位
+    vterm.setOutputCallback([weakTh](const char *data, size_t len) {
+        auto th = weakTh.lock();
+        if (!th || th->closing.load(std::memory_order_relaxed)) {
+            return;
+        }
+        auto &core = th->core; // 循环线程内免锁直读（同 onData）
+        if (core && core->channel) {
+            core->channel->write(data, len);
+        }
     });
 }
 
@@ -404,6 +441,11 @@ napi_value BeginFrame(napi_env env, napi_callback_info info)
     SetNumProp(env, obj, "bellCount", static_cast<double>(frame.bellCount));
     SetNumProp(env, obj, "scrollbackOldest", static_cast<double>(frame.scrollbackOldest));
     SetNumProp(env, obj, "scrollbackTotal", static_cast<double>(frame.scrollbackTotal));
+    SetNumProp(env, obj, "scrollbackEpoch", static_cast<double>(frame.scrollbackEpoch));
+    SetBoolProp(env, obj, "applicationCursorKeys", frame.applicationCursorKeys);
+    SetBoolProp(env, obj, "bracketedPaste", frame.bracketedPaste);
+    SetNumProp(env, obj, "cursorShape", frame.cursorShape);
+    SetNumProp(env, obj, "cursorBlink", frame.cursorBlink);
 
     // 网格主路径：external 零拷贝；失败回落整屏拷贝
     napi_value grid = MakeExternalGridView(env, frame.storage);
@@ -459,6 +501,8 @@ napi_value EndFrame(napi_env env, napi_callback_info info)
         }
         th2->frameSync.endFrame(*core->vterm, seenRevision);
     });
+    // 合并闩兜底：ArkTS 已在渲染（endFrame 说明帧循环活着），清闩保证后续数据必有唤醒
+    th->dataEventInFlight.store(false, std::memory_order_release);
     return MakeBool(env, true);
 }
 
@@ -663,6 +707,13 @@ napi_value SetTerminalDefaultColors(napi_env env, napi_callback_info info)
 void ForgetTerminal(uint64_t terminalHandle)
 {
     g_termTable.erase(terminalHandle);
+}
+
+void AckTerminalDataEvent(uint64_t terminalHandle)
+{
+    if (auto th = LookupTerminal(terminalHandle)) {
+        th->dataEventInFlight.store(false, std::memory_order_release);
+    }
 }
 
 void RegisterTerminalBridge(napi_env env, napi_value exports)

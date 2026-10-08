@@ -18,7 +18,16 @@
  * - resize 行数变化时库直接操作回滚：缩行把放不下的主屏行经 sb_pushline 顶出，
  *   增行经 sb_popline 回填顶部空行（libvterm 只在此时拉 popline，别无路径）；
  *   两个回调发生时本层 onResize 尚未被调，回滚行宽与库传入的 old_cols 一致，
- *   onResize 里再统一 resizeCols 到新宽度。
+ *   onResize 里再统一 reflow 到新宽度。
+ * - reflow（vterm_screen_enable_reflow）：改列宽时库按 lineinfo.continuation 把屏幕
+ *   软换行重排；放不下的旧行以「旧列宽」顶进回滚（顶出前 lineinfo 仍是旧的，
+ *   resize() 里预先快照 continuation 给这些行打软换行标记），onResize 再整体 reflow
+ *   回滚。列宽变化时拒绝 sb_popline：弹回的旧宽行会被库截断到新宽度（丢字），
+ *   且回滚尚未 reflow；拒绝后库把内容上移、底部留空，历史仍在回滚里可翻看。
+ * - 软换行标记：state.c scroll() 先 memmove lineinfo 再触发 scrollrect→sb_pushline，
+ *   故单行上卷顶出时 lineinfo[0] 即「被顶出行的下一行」，其 continuation =
+ *   被顶出行软换行。多行一次性上卷（CSI n S）只有最后一行能拿到准确标记，
+ *   其余按同一值近似（极少见，影响仅限复制时是否插换行）。
  * - dim：libvterm 0.3.3 屏幕层没有 dim 属性，kAttrDim 位预留不设置。
  * - DECSET 1006（SGR 鼠标编码）只进 libvterm 内部 mouse_protocol，不产生
  *   settermprop 事件；mouseMode() 反映的是 1000/1002/1003（VTERM_PROP_MOUSE），
@@ -122,7 +131,12 @@ VtermBridge::VtermBridge(int cols, int rows, uint32_t defaultFgArgb, uint32_t de
     vterm_set_utf8(vt_, 1); // 输入字节流按 UTF-8 解码（中文/emoji 前提）
 
     screen_ = vterm_obtain_screen(vt_);
+    state_ = vterm_obtain_state(vt_);
     vterm_screen_enable_altscreen(screen_, 1); // 允许 DECSET 1047/1049 切备选缓冲
+    // 改列宽按软换行重排（旋转/分屏/捏合字号后长行不再被截断）
+    vterm_screen_enable_reflow(screen_, true);
+    // 终端应答（DSR/DA/DECRQM 等）经回调转写远端；未设回调时库只会堆在内部缓冲
+    vterm_output_set_callback(vt_, &VtermBridge::onOutput, this);
 
     static const VTermScreenCallbacks kCallbacks = {
         /*damage=*/&VtermBridge::onDamage,
@@ -141,6 +155,7 @@ VtermBridge::VtermBridge(int cols, int rows, uint32_t defaultFgArgb, uint32_t de
     vterm_screen_set_damage_merge(screen_, VTERM_DAMAGE_ROW);
 
     vterm_screen_reset(screen_, 1); // hard reset：清空缓冲并把 pen/光标归位
+    // reset 发出的 CURSORBLINK/CURSORSHAPE 落到「闪烁块」= 未覆盖态
 }
 
 VtermBridge::~VtermBridge()
@@ -154,12 +169,100 @@ size_t VtermBridge::feed(const char *data, size_t len)
     const size_t consumed = vterm_input_write(vt_, data, len);
     // DAMAGE_ROW 合并模式下最后一行的 damage 处于挂起态，flush 保证脏行立即可见
     vterm_screen_flush_damage(screen_);
+    syncRowWrapFlags();
+    probeModes();
     return consumed;
 }
 
 void VtermBridge::resize(int cols, int rows)
 {
-    vterm_set_size(vt_, rows, cols); // onResize 回调里完成网格 resize
+    if (cols < 1 || rows < 1) {
+        return;
+    }
+    const int oldRows = grid_.rows();
+    // 快照主屏 continuation：resize_buffer 顶出旧行时 lineinfo 尚未换新，但回调里
+    // 不知道被顶出的是第几行；按顶出顺序（0..k）配合计数还原软换行标记。
+    // alt-screen 激活时公开 API 只能拿到 alt 的 lineinfo，主屏标记一律按 false。
+    resizeWrapSnapshot_.assign(static_cast<size_t>(oldRows), 0);
+    if (!altScreen_) {
+        for (int r = 0; r < oldRows; ++r) {
+            const VTermLineInfo *li = vterm_state_get_lineinfo(state_, r);
+            resizeWrapSnapshot_[static_cast<size_t>(r)] = (li != nullptr && li->continuation) ? 1 : 0;
+        }
+    }
+    resizing_ = true;
+    resizeOldCols_ = grid_.cols();
+    resizeNewCols_ = cols;
+    resizePushIndex_ = 0;
+    vterm_set_size(vt_, rows, cols); // onResize 回调里完成网格 resize 与回滚 reflow
+    resizing_ = false;
+    resizeWrapSnapshot_.clear();
+    syncRowWrapFlags();
+}
+
+int VtermBridge::cursorShapeOverride() const
+{
+    if (cursorShape_ == VTERM_PROP_CURSORSHAPE_BLOCK && cursorBlink_) {
+        return 0;
+    }
+    return cursorShape_;
+}
+
+int VtermBridge::cursorBlinkOverride() const
+{
+    if (cursorShape_ == VTERM_PROP_CURSORSHAPE_BLOCK && cursorBlink_) {
+        return -1;
+    }
+    return cursorBlink_ ? 1 : 0;
+}
+
+void VtermBridge::syncRowWrapFlags()
+{
+    // 行 r 软换行续接 r+1 ⇔ lineinfo[r+1].continuation。只改 reserved 位、不抬 revision：
+    // 该位不影响绘制，只供复制/回滚 reflow 使用；与 ArkTS 并发读的撕裂无害。
+    const int rows = grid_.rows();
+    const int cols = grid_.cols();
+    if (cols <= 0) {
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        bool wraps = false;
+        if (r + 1 < rows) {
+            const VTermLineInfo *li = vterm_state_get_lineinfo(state_, r + 1);
+            wraps = li != nullptr && li->continuation;
+        }
+        Cell *last = grid_.cellAt(r, cols - 1);
+        last->reserved = static_cast<uint16_t>((last->reserved & ~kReservedWrapsNext) |
+                                               (wraps ? kReservedWrapsNext : 0));
+    }
+}
+
+void VtermBridge::probeModes()
+{
+    // vterm_keyboard_key / start_paste 只读 state 模式位生成序列、不改状态；
+    // 探测期间输出改道 probeBuf_，绝不发往远端
+    probing_ = true;
+    probeBuf_.clear();
+    vterm_keyboard_key(vt_, VTERM_KEY_UP, VTERM_MOD_NONE);
+    // 普通模式 = CSI A（ESC [ A 或 8-bit 0x9B A）；应用模式 = SS3 A
+    const bool app = !probeBuf_.empty() &&
+                     !(static_cast<unsigned char>(probeBuf_[0]) == 0x9B ||
+                       (probeBuf_.size() >= 2 && probeBuf_[1] == '['));
+    probeBuf_.clear();
+    vterm_keyboard_start_paste(vt_);
+    const bool bracketed = !probeBuf_.empty();
+    if (bracketed) {
+        vterm_keyboard_end_paste(vt_);
+    }
+    probeBuf_.clear();
+    probing_ = false;
+    if (app != appCursorKeys_ || bracketed != bracketedPaste_) {
+        appCursorKeys_ = app;
+        bracketedPaste_ = bracketed;
+        if (modesCallback_) {
+            modesCallback_(appCursorKeys_, bracketedPaste_);
+        }
+    }
 }
 
 void VtermBridge::setDefaultColors(uint32_t fgArgb, uint32_t bgArgb)
@@ -172,6 +275,7 @@ void VtermBridge::setDefaultColors(uint32_t fgArgb, uint32_t bgArgb)
     // 随后 convertRect 逐格 putCell 让 revision 从旧值继续增长——内容全变了必须重绘
     grid_.raiseRevisionFloor(oldRevision);
     convertRect(0, 0, grid_.rows(), grid_.cols());
+    syncRowWrapFlags();
 }
 
 // ---------------------------------------------------------------- 回调
@@ -239,8 +343,21 @@ int VtermBridge::onSetTermProp(VTermProp prop, VTermValue *val, void *user)
     case VTERM_PROP_FOCUSREPORT:
         b->focusReport_ = val->boolean != 0;
         return 1;
+    case VTERM_PROP_CURSORBLINK:
+        // DECSCUSR 总是「先 BLINK 后 SHAPE」成对到达（state.c），这里只暂存；
+        // 单独的 DECSET 12（如 vim 的 t_ve = ESC[?12l）不改变形状覆盖，
+        // 否则用户偏好的竖线光标会被 vim 退出时永久改成不闪的块
+        b->pendingCursorBlink_ = val->boolean != 0;
+        return 1;
+    case VTERM_PROP_CURSORSHAPE:
+        b->cursorShape_ = val->number;
+        b->cursorBlink_ = b->pendingCursorBlink_;
+        if (b->cursorRow_ >= 0 && b->cursorRow_ < b->grid_.rows())
+            b->grid_.setDirty(b->cursorRow_);
+        b->grid_.bumpRevision(); // 光标外观变化需要重绘
+        return 1;
     default:
-        return 1; // CURSORBLINK/CURSORSHAPE/REVERSE 等：暂只吞掉，UI 需要时再记录
+        return 1; // REVERSE 等：暂只吞掉
     }
 }
 
@@ -261,10 +378,11 @@ int VtermBridge::onResize(int rows, int cols, void *user)
     // 防御性裁剪会把新增行列丢掉；行数增大时库还可能刚经 sb_popline 回填了顶部行。
     // 网格就位后整屏重读一遍，保证与 vterm 缓冲严格一致（resize 低频，代价可忽略）。
     b->convertRect(0, 0, rows, cols);
-    // 回滚行宽跟随新 cols：宽改窄截断、窄改宽补空白格。resize_buffer 期间的
-    // sb_pushline/sb_popline 以旧 cols 与本缓冲交互（本回调晚于它们触发），
-    // 故 resizeCols 在这里、即「下一次 sb 回调之前」完成即可保持宽度一致。
-    b->scrollback_.resizeCols(cols, b->grid_.blankCell());
+    // 回滚行宽跟随新 cols：按软换行标记 reflow（长行重新折行而非截断）。resize_buffer
+    // 期间的 sb_pushline/sb_popline 以旧 cols 与本缓冲交互（本回调晚于它们触发），
+    // 故 reflow 在这里、即「下一次 sb 回调之前」完成即可保持宽度一致。
+    if (cols != b->scrollback_.cols())
+        b->scrollback_.reflow(cols, b->grid_.blankCell());
     b->sbScratch_.assign(static_cast<size_t>(cols), Cell{});
     if (b->cursorRow_ >= rows)
         b->cursorRow_ = rows - 1;
@@ -281,13 +399,24 @@ int VtermBridge::onSbPushLine(int cols, const VTermScreenCell *cells, void *user
     const int n = std::min(cols, b->scrollback_.cols());
     for (int c = 0; c < n; ++c)
         b->sbScratch_[static_cast<size_t>(c)] = b->convertCell(cells[c]);
-    b->scrollback_.pushLine(b->sbScratch_.data(), static_cast<size_t>(n));
+    bool wraps = false;
+    if (b->resizing_) {
+        const size_t i = b->resizePushIndex_++;
+        wraps = i + 1 < b->resizeWrapSnapshot_.size() && b->resizeWrapSnapshot_[i + 1] != 0;
+    } else {
+        const VTermLineInfo *li = vterm_state_get_lineinfo(b->state_, 0);
+        wraps = li != nullptr && li->continuation;
+    }
+    b->scrollback_.pushLine(b->sbScratch_.data(), static_cast<size_t>(n), wraps);
     return 1;
 }
 
 int VtermBridge::onSbPopLine(int cols, VTermScreenCell *cells, void *user)
 {
     VtermBridge *b = self(user);
+    // 列宽变化中拒绝回填：库会把旧宽行截断到新宽度（丢字），且回滚 reflow 尚未进行
+    if (b->resizing_ && b->resizeNewCols_ != b->resizeOldCols_)
+        return 0;
     // libvterm 0.3.3 只在「resize 行数增大」时经本回调回填屏幕顶部空行，
     // cols 为旧列宽（与回滚当前行宽一致，resizeCols 尚未走）；库按我们填的
     // cell.width 步进拷贝（width 必须 ≥1），宽字符续格由库自行置 (uint32_t)-1。
@@ -298,6 +427,17 @@ int VtermBridge::onSbPopLine(int cols, VTermScreenCell *cells, void *user)
     for (size_t c = 0; c < line.size(); ++c)
         storeVtermCell(line[c], &cells[c]);
     return 1;
+}
+
+void VtermBridge::onOutput(const char *s, size_t len, void *user)
+{
+    VtermBridge *b = self(user);
+    if (b->probing_) {
+        b->probeBuf_.append(s, len);
+        return;
+    }
+    if (b->outputCallback_ && len > 0)
+        b->outputCallback_(s, len);
 }
 
 int VtermBridge::onSbClear(void *user)

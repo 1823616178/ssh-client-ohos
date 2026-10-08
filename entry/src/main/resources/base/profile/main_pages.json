@@ -10,6 +10,7 @@
     "pages/AppearancePage",
     "pages/OpenSourceLicensesPage",
     "pages/SftpPage",
-    "pages/PortForwardPage"
+    "pages/PortForwardPage",
+    "pages/KeyBarEditorPage"
   ]
 }

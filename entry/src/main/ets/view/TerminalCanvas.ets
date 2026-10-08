@@ -31,11 +31,14 @@
  *
  * 本组件由 U4 TerminalPage 整合使用（单窗格：固定 paneId 绑一个会话）。
  *
- * 输入通路（任务 T6 接线，详见 KeyMap/StickyModifiers/ImeInputHandler/FocusManager 头注）：
- *  - 隐藏 TextInput（ImeInputSink）承接软键盘 IME：onChange 增量 → 字节 →
- *    terminal.write()；中文候选期（previewText 非空）不发送；
- *  - 物理键盘：onKeyPreIme（IME 前拦截方向/功能/Ctrl 组合，可打印键放行给 IME）
- *    + onKeyEvent（容器自身获焦时的全量通路）→ mapKeyEvent → write()；
+ * 输入通路（详见 TerminalImeEditor/ImeInputLogic/KeyMap/StickyModifiers/FocusManager 头注）：
+ *  - 主通路：inputMethod 自绘编辑器（TerminalImeEditor）——insertText/deleteLeft/
+ *    sendFunctionKey/moveCursor 语义事件直接转字节；容器 Stack 自身可获焦；
+ *  - 兜底：自绘编辑器 attach 失败时挂载隐藏 TextInput（ImeInputSink，零宽哨兵 +
+ *    onSubmit 回车）；
+ *  - 物理键盘：onKeyPreIme 只截 Ctrl/Alt 组合（兜底通路另截非可打印键），其余先给
+ *    输入法，输入法不消费的键到 onKeyEvent → mapKeyEvent → write()；
+ *  - DECCKM / bracketed paste / DECSCUSR 以 native 帧上报为准（frame.* 字段）；
  *  - 焦点路由：focusId 非空时按 FocusManager 判定，非聚焦窗格不投任何输入；
  *    点击窗格 = 聚焦 + 弹软键盘（焦点边框高亮归 U4b）；
  *  - 粘滞修饰：stickyModifiers 实例公开给 T7 功能键条（tap/lock），
@@ -47,30 +50,29 @@
  * 移动端交互（T7/T8/T9，DESIGN §4.4「移动端专属交互」表）：
  *  - T7：sendExternalInput() 是功能键条/片段等外部字节源的统一出口
  *    （按 FocusManager 焦点路由投递；粘滞修饰由 KeyBar 侧在出字节前并入）；
- *  - T8：长按（LongPressGesture）进入选择模式 → 选区框 + 两端拖拽手柄
- *    → 拖动手柄改起点/终点，或在画布上拖更新活动端
- *    → 气泡菜单「复制/全选」（粘贴/分享归 U4）；选区高亮为 selectionColor
- *    半透明叠加层，随帧重绘；跨行拼接/宽字符边界等纯逻辑在
- *    terminal/SelectionModel.ets；**手柄 hit 区几何为纯函数**（
- *    terminal/TerminalGestures.ets：selectionHandleHitRects/AtPoint/Anchor，
- *    hypium 可测）；**首版只支持主屏选择**——回滚区
- *    （scrollOffset>0）下长按不进入选择，回滚区选择登记后续；
- *    **残留缺口（见 docs/QUALITY-GATES.md §3b）**：放大镜 loupe 未做
- *    （任务书允许省略）；气泡菜单仅复制/全选，粘贴/分享归 U4；
- *  - T9：单指竖滑——主屏 = 视图滚动回滚缓冲（scrollOffsetLines；滚动时
- *    整窗重绘「回滚+主屏」拼接窗口，**首版简化：不做增量，性能待 T0/Q2 实测**；
- *    滚动中不 endFrame、不画光标，回到底部后下帧全量自愈）；alt-screen
- *    （vim/less）= 按 altScrollMode 发方向键或 SGR 滚轮序列（每累计一行一条，
- *    纯逻辑在 terminal/TerminalGestures.ets）；双指捏合实时改字号（8–32
- *    钳制），松手经 onFontSizeCommit 回调通知外部落库（组件不写库）；
- *  - 「跳回最新」悬浮按钮不做（T9 任务书登记为可选），回滚时下滑到底即回。
+ *  - T8：长按进入选择模式（落在链接上则直接选中整条链接）→ 选区框 + 两端手柄
+ *    → 拖手柄/在画布上拖更新端点，贴上下边缘自动滚动 → 气泡菜单
+ *    「复制/粘贴/全选/打开链接」。选区用**绝对行**（回滚区 + 主屏统一编号），
+ *    可以跨越回滚区，远端继续输出时选区不漂移；复制按软换行标记拼接逻辑行；
+ *  - T9：单指竖滑——主屏 = 视图滚动回滚缓冲（松手惯性 FlingAnimator）；回滚中远端
+ *    输出时视口锚定（不被推走）并显示「新输出」角标 +「回到底部」按钮，任何输入
+ *    自动回到底部；alt-screen（vim/less）= 按 altScrollMode 发方向键或 SGR 滚轮；
+ *    双指捏合 = 画面缩放预览 + 字号标签，松手只重排一次并经 onFontSizeCommit 落库；
+ *  - 光标：DECSCUSR 形状/闪烁覆盖外观设置；闪烁定时器只在可见且聚焦时运行，
+ *    输入后重置相位（打字时光标常亮）；非聚焦窗格画空心框；
+ *  - 响铃：页面经 TerminalActionHub 投递 'bell' 动作时闪一下（视觉响铃，节流由 VM 负责；
+ *    不走 @Prop 计数器——ForEach 同 key 复用节点时 item 快照不会刷新）。
  */
+import { common } from '@kit.AbilityKit';
 import { NativeTerminalFrame } from '../napi/SshNative';
 import {
+  CELL_BYTES,
+  DecodedCell,
   DirtyRange,
   SshTerminal,
   addCursorRowRange,
-  collectDirtyRanges
+  collectDirtyRanges,
+  decodeCellAt
 } from '../napi/SshTerminal';
 import { Logger } from '../common/utils/Logger';
 import { FrameScheduler } from './FrameScheduler';
@@ -82,10 +84,13 @@ import {
   CURSOR_BLINK_PERIOD_MS,
   RowDrawCommands,
   RowRenderEnv,
+  cellLeftX,
+  cellTopY,
   cursorVisibleAt,
   generateCursorCommands,
   generateRowsCommands
 } from './terminal/TerminalDrawCommands';
+import { CursorStyle } from '../common/model/models';
 import {
   TextMeasureContext,
   TextMeasureResult,
@@ -112,19 +117,39 @@ import {
 } from './terminal/TerminalActionHub';
 import { isModifierKeyCode, isPrintableKeyCode, mapKeyEvent } from './terminal/KeyMap';
 import { StickyModifiers } from './terminal/StickyModifiers';
+import { ImeInputSink } from './terminal/ImeInputHandler';
 import {
   CommittedDelta,
-  ImeInputSink,
-  committedDeltaToInputBytes
-} from './terminal/ImeInputHandler';
+  ImeEchoContext,
+  committedDeltaToInputBytes,
+  imeDeleteLeftToBytes,
+  imeDeleteRightToBytes,
+  imeEnterBytes,
+  imeInsertToBytes,
+  imeMoveCursorToBytes,
+  shouldInterceptBeforeIme
+} from './terminal/ImeInputLogic';
+import { TerminalImeClient, TerminalImeEditor } from './terminal/TerminalImeEditor';
 import {
   CellPos,
+  LogicalLine,
+  SelectionGridReader,
   SelectionModel,
   SelectionRange,
   adjustWideCharBoundary,
-  dataViewGridReader
+  dataViewRowWrapsNext,
+  extractRangeText,
+  logicalLineAt
 } from './terminal/SelectionModel';
 import { copyTextToPasteboard, pasteFromPasteboard } from './terminal/Pasteboard';
+import { UrlMatch, openableUrl, singleUrlIn, urlAt } from './terminal/UrlDetector';
+import {
+  FlingAnimator,
+  anchorScrollOffset,
+  edgeAutoScrollLines
+} from './terminal/ScrollPhysics';
+import { ExternalKeyboardMonitor } from './terminal/ExternalKeyboardMonitor';
+import { KeyboardChange, nextExternalKeyboardActive } from './terminal/PhysicalKeyboard';
 import {
   ShortcutAction,
   ShortcutBinding,
@@ -143,16 +168,19 @@ import {
   SelectionHandleId,
   SGR_BUTTON_NONE,
   ScrollLineAccumulator,
+  WheelLineAccumulator,
   buildAltScrollSequences,
-  clampFontSize,
   clampScrollOffset,
   encodeSgrMouseEvent,
   lineSelectAt,
+  pinchCommitFontSize,
+  pinchPreviewScale,
   selectionHandleAnchor,
   selectionHandleAtPoint,
   selectionHandleHitRects,
   sgrButtonFromOhosButton,
   shouldForwardMouseEvent,
+  wheelSgrSequences,
   wordSelectAt
 } from './terminal/TerminalGestures';
 import {
@@ -177,12 +205,14 @@ const MIN_GRID_TOP_INSET_VP = 12;
 /** underline/strike 线宽 = 字号 × 该系数（下限 1vp） */
 const TEXT_DECO_THICKNESS_FRACTION = 0.06;
 /** 进入选择模式的长按时长（ms） */
-const LONG_PRESS_DURATION_MS = 500;
+const LONG_PRESS_DURATION_MS = 450;
 /** 选区叠加层不透明度（盖在字形之上，需保持可读） */
 const SELECTION_OVERLAY_OPACITY = 0.5;
-/** 气泡菜单几何（vp）：高约一行菜单、宽约两枚按钮 */
-const MENU_HEIGHT_VP = 36;
-const MENU_WIDTH_VP = 152;
+/** 气泡菜单几何（vp）：≥40vp 触摸目标，单项宽 56 */
+const MENU_HEIGHT_VP = 40;
+const MENU_ITEM_WIDTH_VP = 56;
+/** 气泡菜单左右内边距（vp） */
+const MENU_SIDE_PADDING_VP = 4;
 /** 气泡菜单与选区起点行的垂直间距（vp） */
 const MENU_GAP_VP = 4;
 /** 选区两端手柄圆钮直径（Token 表无「手柄」项；默认值与 TerminalGestures 纯函数常量对齐） */
@@ -193,6 +223,21 @@ const HANDLE_BAR_WIDTH_VP = 4;
 const HANDLE_HIT_WIDTH_VP = SELECTION_HANDLE_HIT_WIDTH_VP;
 /** 选区边框线宽 */
 const SELECTION_BORDER_VP = 2;
+/** 回滚区一次批量读取的行数（选区/复制/链接识别的绝对行读取器） */
+const SB_READ_BATCH = 256;
+/** 选择拖动贴边自动滚动：边缘带宽（vp）、每拍最多行数、节拍（ms） */
+const EDGE_SCROLL_BAND_VP = 36;
+const EDGE_SCROLL_MAX_LINES = 3;
+const EDGE_SCROLL_INTERVAL_MS = 60;
+/** 「回到底部」按钮直径（≥40vp 触摸目标） */
+const JUMP_BUTTON_VP = 44;
+/** 视觉响铃闪烁峰值不透明度与时长 */
+const BELL_FLASH_OPACITY = 0.18;
+const BELL_FLASH_MS = 140;
+/** 非聚焦窗格空心光标线宽 */
+const HOLLOW_CURSOR_LINE_VP = 1;
+/** 轴事件后这段时间内的鼠标源 pan 视为同一次滚动（不重复处理） */
+const AXIS_PAN_SUPPRESS_MS = 150;
 
 /**
  * CanvasRenderingContext2D → TextMeasureContext 的名义类型适配（U4 修复）：
@@ -260,6 +305,151 @@ class SnapshotClickGrid implements ClickSelectGrid {
   }
 }
 
+/**
+ * 绝对行读取器：abs ∈ [scrollbackOldest, scrollbackTotal) 读回滚区，
+ * abs ∈ [scrollbackTotal, scrollbackTotal + rows) 读主屏第 abs − total 行。
+ * 回滚区按 SB_READ_BATCH 行批量读取并缓存一个窗口，顺序读取（复制大选区）
+ * 不会逐行跨 NAPI。帧快照只读：beginFrame 后不 endFrame。
+ */
+class TerminalAbsReader implements SelectionGridReader {
+  readonly rows: number;
+  readonly cols: number;
+  readonly minRow: number;
+  private readonly terminal: SshTerminal;
+  private readonly frame: NativeTerminalFrame;
+  private readonly total: number;
+  private screen: DataView | null = null;
+  private screenLoaded: boolean = false;
+  private sb: DataView | null = null;
+  private sbStart: number = 0;
+  private sbCount: number = 0;
+  private curView: DataView | null = null;
+  private curRow: number = 0;
+
+  constructor(terminal: SshTerminal, frame: NativeTerminalFrame) {
+    this.terminal = terminal;
+    this.frame = frame;
+    this.total = frame.scrollbackTotal;
+    this.minRow = Math.min(frame.scrollbackOldest, frame.scrollbackTotal);
+    this.rows = frame.scrollbackTotal + frame.rows;
+    this.cols = frame.cols;
+  }
+
+  private locate(abs: number): boolean {
+    if (abs < this.minRow || abs >= this.rows || this.cols <= 0) {
+      return false;
+    }
+    if (abs >= this.total) {
+      if (!this.screenLoaded) {
+        this.screenLoaded = true;
+        this.screen = this.terminal.readRows(this.frame, 0, this.frame.rows);
+      }
+      if (this.screen === null) {
+        return false;
+      }
+      this.curView = this.screen;
+      this.curRow = abs - this.total;
+      return true;
+    }
+    if (this.sb === null || abs < this.sbStart || abs >= this.sbStart + this.sbCount) {
+      const start: number = Math.max(this.minRow, abs - SB_READ_BATCH / 2);
+      const count: number = Math.min(SB_READ_BATCH, this.total - start);
+      if (count <= 0) {
+        return false;
+      }
+      const buf: ArrayBuffer | null = this.terminal.readScrollbackWindow(start, count);
+      if (buf === null) {
+        return false;
+      }
+      this.sb = new DataView(buf);
+      this.sbStart = start;
+      this.sbCount = Math.floor(buf.byteLength / (CELL_BYTES * this.cols));
+      if (abs >= start + this.sbCount) {
+        return false;
+      }
+    }
+    this.curView = this.sb;
+    this.curRow = abs - this.sbStart;
+    return true;
+  }
+
+  rowCells(row: number): DecodedCell[] | null {
+    if (!this.locate(row) || this.curView === null) {
+      return null;
+    }
+    const view: DataView = this.curView;
+    const cells: DecodedCell[] = [];
+    const base: number = this.curRow * this.cols;
+    for (let c = 0; c < this.cols; c++) {
+      cells.push(decodeCellAt(view, base + c));
+    }
+    return cells;
+  }
+
+  rowWrapsNext(row: number): boolean {
+    if (!this.locate(row) || this.curView === null) {
+      return false;
+    }
+    return dataViewRowWrapsNext(this.curView, this.curRow, this.cols);
+  }
+}
+
+/** 自绘编辑器事件（CanvasImeClient → 画布单一入口） */
+type ImeEventKind = 'insert' | 'deleteLeft' | 'deleteRight' | 'enter' | 'move' | 'selectAll' |
+  'copy' | 'paste' | 'keyboard';
+
+/** TerminalImeClient 适配（struct 不能 implements 接口，与 CanvasClipboardExecutor 同理） */
+class CanvasImeClient implements TerminalImeClient {
+  private readonly dispatch: (kind: ImeEventKind, text: string, value: number) => void;
+  private readonly left: (length: number) => string;
+
+  constructor(dispatch: (kind: ImeEventKind, text: string, value: number) => void,
+    left: (length: number) => string) {
+    this.dispatch = dispatch;
+    this.left = left;
+  }
+
+  onInsertText(text: string): void {
+    this.dispatch('insert', text, 0);
+  }
+
+  onDeleteLeft(length: number): void {
+    this.dispatch('deleteLeft', '', length);
+  }
+
+  onDeleteRight(length: number): void {
+    this.dispatch('deleteRight', '', length);
+  }
+
+  onEnter(): void {
+    this.dispatch('enter', '', 0);
+  }
+
+  onMoveCursor(direction: number): void {
+    this.dispatch('move', '', direction);
+  }
+
+  onSelectAll(): void {
+    this.dispatch('selectAll', '', 0);
+  }
+
+  onCopy(): void {
+    this.dispatch('copy', '', 0);
+  }
+
+  onPaste(): void {
+    this.dispatch('paste', '', 0);
+  }
+
+  onKeyboardShown(shown: boolean): void {
+    this.dispatch('keyboard', '', shown ? 1 : 0);
+  }
+
+  leftText(length: number): string {
+    return this.left(length);
+  }
+}
+
 @Component
 export struct TerminalCanvas {
   /**
@@ -289,8 +479,8 @@ export struct TerminalCanvas {
   /** 页面首次进入时，聚焦窗格把系统输入焦点直接交给隐藏 IME 承接框。 */
   @Prop @Watch('onAutoFocusChanged') autoFocus: boolean = false;
   /**
-   * 终端应用光标模式（DECCKM）：native 尚未暴露该模式位（T1 未加），
-   * 先参数化透传给 mapKeyEvent；native 暴露后由 U4 接线（KeyMap 头注）
+   * 终端应用光标模式（DECCKM）兜底值：native 帧带 applicationCursorKeys 时以帧为准
+   * （每个终端各自的模式，多窗格不串）；旧 native 无该字段时用本参数。
    */
   @Prop applicationCursorKeys: boolean = false;
   /**
@@ -318,14 +508,33 @@ export struct TerminalCanvas {
   @Prop @Watch('onShortcutJsonChanged') shortcutBindingsJson: string = '';
   /** 标签/分屏/切焦点等应用动作（复制粘贴不走这里） */
   onAppShortcut: (action: ShortcutAction) => boolean = (_action: ShortcutAction) => false;
+  /** 用户产生输入（键盘/IME/键条/粘贴）回调：页面据此清除「新输出」类提示等 */
+  onUserInput: () => void = () => {};
 
   private shortcutBindings: ShortcutBinding[] = parseShortcutLayout('');
 
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private context: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private readonly schedulerId: string = `terminal-canvas-${++nextCanvasId}`;
-  /** 隐藏 IME 承接框的全局唯一 id（focusControl.requestFocus 用） */
+  /** 隐藏 IME 承接框的全局唯一 id（兜底通路 focusControl.requestFocus 用） */
   private readonly imeSinkId: string = `terminal-ime-${++nextCanvasId}`;
+  /** 容器 Stack 的 id（自绘编辑器通路：Stack 自身获焦承接物理键） */
+  private readonly hostId: string = `terminal-host-${nextCanvasId}`;
+  /** 自绘编辑器事件适配 */
+  private readonly imeClient: CanvasImeClient = new CanvasImeClient(
+    (kind: ImeEventKind, text: string, value: number): void => {
+      this.onImeEvent(kind, text, value);
+    },
+    (length: number): string => this.imeEcho.leftText(length));
+  /** IME 联想用本地回显上下文 */
+  private readonly imeEcho: ImeEchoContext = new ImeEchoContext();
+  /** true = 自绘编辑器通路；false = 隐藏 TextInput 兜底（attach 失败后切换） */
+  @State private useCustomIme: boolean = TerminalImeEditor.get().isAvailable();
+  private unsubscribeImeAvailability: () => void = () => {};
+  private unsubscribeFocus: () => void = () => {};
+  private unsubscribeKeyboardMonitor: () => void = () => {};
+  /** 本窗格是否为输入目标（FocusManager 监听维护；非聚焦画空心光标、不闪烁） */
+  private paneFocused: boolean = true;
   /** struct 不能 implements 接口，故用适配器把剪贴板动作转回本实例 */
   private readonly clipboardExecutor: TerminalActionExecutor =
     new CanvasClipboardExecutor((action: TerminalClipboardAction): void => {
@@ -333,6 +542,8 @@ export struct TerminalCanvas {
     });
 
   private canvasReady = false;
+  /** 物理像素/vp（绘制坐标吸附用；onReady 时读取） */
+  private pixelRatio: number = 0;
   private inputFocusTimer: number = -1;
   private areaWidthVp = 0;
   private areaHeightVp = 0;
@@ -395,6 +606,10 @@ export struct TerminalCanvas {
   private readonly scrollAccumulator: ScrollLineAccumulator = new ScrollLineAccumulator();
   /** 上一次 pan 事件的累计位移（算增量用） */
   private panLastOffsetY = 0;
+  /** 鼠标滚轮 / 触控板轴事件换算器（2in1） */
+  private readonly wheelAccumulator: WheelLineAccumulator = new WheelLineAccumulator();
+  /** 最近一次轴事件时间：同一滚动若又被识别成鼠标源 pan，则忽略 pan，避免双倍滚动 */
+  private lastAxisEventMs = 0;
   /** 最近一帧元信息缓存（手势决策用）：alt-screen / 鼠标上报 / 回滚行数 */
   private lastAltScreen = false;
   private lastMouseMode = 0;
@@ -436,26 +651,91 @@ export struct TerminalCanvas {
   private selAdjusted: SelectionRange | null = null;
   /** 半周期唤醒定时器（闪烁开启时防 FrameScheduler 自动休眠吞掉相位翻转） */
   private blinkWakeTimer: number = -1;
+  /** 闪烁相位起点：输入后重置，打字期间光标常亮 */
+  private blinkEpoch: number = 0;
+  /** 最近一帧的光标可见（DECTCEM）；不可见时闪烁不触发重绘 */
+  private lastFrameCursorVisible: boolean = true;
+  /** native DECSCUSR 覆盖：形状 0=未覆盖 1 block 2 underline 3 bar；闪烁 -1 未覆盖 */
+  private frameCursorShape: number = 0;
+  private frameCursorBlink: number = -1;
+  /** native 帧上报的 DECCKM / bracketed paste（undefined 字段时退回 @Prop） */
+  private frameAppCursor: boolean = false;
+  private frameAppCursorKnown: boolean = false;
+  private frameBracketedPaste: boolean = false;
+  // ---- 回滚视口锚定 / 新输出提示 / 惯性 ----
+  private lastScrollbackTotal: number = -1;
+  private lastScrollbackOldest: number = 0;
+  private lastScrollbackEpoch: number = 0;
+  @State private scrolledBack: boolean = false;
+  @State private newOutputBadge: boolean = false;
+  private readonly fling: FlingAnimator = new FlingAnimator();
+  private readonly flingAccumulator: ScrollLineAccumulator = new ScrollLineAccumulator();
+  // ---- 选择拖动贴边滚动 ----
+  private edgeScrollTimer: number = -1;
+  private edgeScrollLines: number = 0;
+  /** 贴边滚动时要跟随的端：extend（画布拖选）/ start / end（手柄） */
+  private edgeDragTarget: string = '';
+  private edgeDragX: number = 0;
+  private edgeDragY: number = 0;
+  /** 当前选区对应的可打开链接（'' = 无） */
+  @State private selectionUrl: string = '';
+  // ---- 捏合预览 ----
+  @State private pinchScale: number = 1;
+  @State private pinchLabel: string = '';
+  private pinchLastScale: number = 1;
+  // ---- 视觉响铃 ----
+  @State private bellFlashOpacity: number = 0;
+  private bellFlashTimer: number = -1;
 
   aboutToAppear(): void {
     this.shortcutBindings = parseShortcutLayout(this.shortcutBindingsJson);
+    this.paneFocused = this.isInputTarget();
     this.applyAppearance();
     FrameScheduler.get().register(this.schedulerId, this.renderFrame);
     FrameScheduler.get().setVisible(this.schedulerId, this.visible);
     // 键条「复制/粘贴」按 paneId 路由到本实例（页面拿不到画布引用，见 Hub 头注）
     TerminalActionHub.get().register(this.focusId, this.clipboardExecutor);
+    this.unsubscribeImeAvailability = TerminalImeEditor.get().addAvailabilityListener(
+      (available: boolean): void => {
+        if (!available && this.useCustomIme) {
+          // 自绘编辑器不可用：切到隐藏 TextInput 兜底，挂载后补一次焦点
+          this.useCustomIme = false;
+          if (this.paneFocused) {
+            this.scheduleInputFocus(true);
+          }
+        }
+      });
+    this.unsubscribeFocus = FocusManager.get().addListener((_id: string): void => {
+      this.onPaneFocusChanged();
+    });
+    this.unsubscribeKeyboardMonitor = ExternalKeyboardMonitor.get().subscribe(
+      (change: KeyboardChange): void => {
+        this.externalKeyboardActive = nextExternalKeyboardActive(this.externalKeyboardActive, change);
+      });
     this.syncBlinkWakeTimer();
   }
 
-  /** TerminalActionHub 执行器：键条剪贴板动作复用与快捷键完全相同的实现 */
+  /** TerminalActionHub 执行器：键条/页面动作复用与快捷键完全相同的实现 */
   executeClipboardAction(action: TerminalClipboardAction): void {
     if (action === 'copy') {
       this.copySelection();
       return;
     }
-    pasteFromPasteboard(this.terminal).catch((err: Object) => {
-      Logger.warn(`键条粘贴失败：${JSON.stringify(err)}`, 'Terminal');
-    });
+    if (action === 'paste') {
+      this.pasteClipboard();
+      return;
+    }
+    if (action === 'keyboard') {
+      this.toggleSoftKeyboard();
+      return;
+    }
+    if (action === 'scrollBottom') {
+      this.scrollToBottom();
+      return;
+    }
+    if (action === 'bell') {
+      this.flashBell();
+    }
   }
 
   private onShortcutJsonChanged(): void {
@@ -467,8 +747,45 @@ export struct TerminalCanvas {
       clearTimeout(this.inputFocusTimer);
       this.inputFocusTimer = -1;
     }
+    if (this.bellFlashTimer >= 0) {
+      clearTimeout(this.bellFlashTimer);
+      this.bellFlashTimer = -1;
+    }
+    this.stopEdgeScroll();
+    this.fling.stop();
     this.clearBlinkWakeTimer();
+    this.unsubscribeImeAvailability();
+    this.unsubscribeFocus();
+    this.unsubscribeKeyboardMonitor();
+    TerminalImeEditor.get().release(this.schedulerId);
+    TerminalActionHub.get().unregister(this.focusId, this.clipboardExecutor);
     FrameScheduler.get().unregister(this.schedulerId);
+  }
+
+  /** 焦点变化：空心/实心光标切换、闪烁定时器、软键盘跟随新聚焦窗格 */
+  private onPaneFocusChanged(): void {
+    const focused: boolean = this.isInputTarget();
+    if (focused === this.paneFocused) {
+      return;
+    }
+    this.paneFocused = focused;
+    this.needsFullRedraw = true;
+    this.syncBlinkWakeTimer();
+    if (focused && this.visible) {
+      if (this.useCustomIme) {
+        // 物理键事件跟随 ArkUI 焦点：快捷键切窗格时把焦点移到本窗格的宿主 Stack
+        focusControl.requestFocus(this.hostId);
+        // 软键盘正开着时让输入跟到新聚焦窗格（不改变键盘显隐）
+        const ime: TerminalImeEditor = TerminalImeEditor.get();
+        if (ime.isKeyboardShown()) {
+          ime.attach(this.schedulerId, this.imeClient, true);
+        }
+      } else {
+        // 兜底路径：键盘/IME 都经隐藏 TextInput 进来，焦点要跟到本窗格
+        focusControl.requestFocus(this.imeSinkId);
+      }
+    }
+    FrameScheduler.get().wakeup();
   }
 
   // ---------------------------------------------------------------- 对外入口
@@ -538,18 +855,17 @@ export struct TerminalCanvas {
   }
 
   /**
-   * 点击窗格（build 中由 TapGesture 驱动）：选择模式下点击 = 退出选择
-   * （不弹软键盘，避免打断复制后查看）；否则聚焦本窗格（U4b 边框高亮经
-   * FocusManager 监听器）+ 弹软键盘承接 IME。
+   * 点击窗格（TapGesture，带手指坐标）：选择模式下点击 = 退出选择（不弹软键盘，
+   * 避免打断复制后查看）；否则聚焦本窗格 + 弹软键盘。惯性滚动中的点按只停住滚动。
    *
-   * T10：外接键盘活跃时**不** requestFocus 拉起软键盘（PhysicalKeyboard
-   * 策略；触摸仍可聚焦窗格路由物理键）。显式要软键盘时功能键条应先
-   * clearExternalKeyboardActive() 再 requestFocus。
-   *
-   * T11：双击/三击连点在同一网格邻域内递增——word=选词、line=选行
-   * （纯逻辑 wordSelectAt/lineSelectAt）；单击保持原聚焦语义。
+   * T10：外接键盘活跃时只聚焦不弹软键盘（物理键仍可路由）。
+   * T11：双击/三击（按手指落点）选词/选行。
    */
-  private onPaneClick(): void {
+  private onPaneClick(event: GestureEvent): void {
+    if (this.fling.running) {
+      this.fling.stop();
+      return;
+    }
     if (this.selection.selecting) {
       this.exitSelectionMode();
       if (this.focusId.length > 0) {
@@ -560,7 +876,12 @@ export struct TerminalCanvas {
     if (this.focusId.length > 0) {
       FocusManager.get().focus(this.focusId);
     }
-    // 连点选词/选行（坐标缺省取最近鼠标格；纯触控无鼠标时 tracker 不误触发双击）
+    if (event.fingerList.length > 0) {
+      const finger = event.fingerList[0];
+      const pos = this.gridPosFromPoint(finger.localX, finger.localY);
+      this.lastMouseCol1 = pos.col + 1;
+      this.lastMouseRow1 = pos.row + 1;
+    }
     const mode = this.clickTracker.tap(this.lastMouseRow1 - 1, this.lastMouseCol1 - 1, Date.now());
     if (mode !== 'none' && this.applyClickSelect(mode)) {
       return;
@@ -568,17 +889,55 @@ export struct TerminalCanvas {
     if (!this.isInputTarget()) {
       return;
     }
-    if (!shouldShowSoftKeyboardOnTouch(this.externalKeyboardActive)) {
-      // T10：外接键盘在用，不弹软键盘；焦点仍在 IME 承接框上，物理键照常进
-      focusControl.requestFocus(this.imeSinkId);
+    this.requestInput(shouldShowSoftKeyboardOnTouch(this.externalKeyboardActive));
+  }
+
+  /**
+   * 把输入焦点交给本窗格。自绘编辑器通路：Stack 获焦（物理键）+ attach/show IME；
+   * 兜底通路：先把焦点挪到 Stack 再交回隐藏 TextInput——同一输入框重复
+   * requestFocus 不会重新弹出用户手动收起的软键盘，挪一次焦点才会。
+   */
+  private requestInput(showKeyboard: boolean): void {
+    if (this.useCustomIme) {
+      focusControl.requestFocus(this.hostId);
+      const ime: TerminalImeEditor = TerminalImeEditor.get();
+      const done: Promise<boolean> = showKeyboard
+        ? ime.show(this.schedulerId, this.imeClient)
+        : ime.attach(this.schedulerId, this.imeClient, false);
+      done.then((ok: boolean) => {
+        if (!ok) {
+          Logger.warn('自绘编辑器不可用，已切换隐藏输入框兜底', 'Terminal');
+        }
+      });
       return;
     }
-    focusControl.requestFocus(this.imeSinkId);
+    if (showKeyboard) {
+      focusControl.requestFocus(this.hostId);
+      setTimeout((): void => {
+        focusControl.requestFocus(this.imeSinkId);
+      }, 0);
+    } else {
+      focusControl.requestFocus(this.imeSinkId);
+    }
+  }
+
+  /** 切换软键盘显隐（页面/键条「键盘」按钮）：外接键盘模式下也能显式唤出 */
+  private toggleSoftKeyboard(): void {
+    if (this.useCustomIme && TerminalImeEditor.get().isKeyboardShown() &&
+      TerminalImeEditor.get().isOwner(this.schedulerId)) {
+      TerminalImeEditor.get().hide(this.schedulerId);
+      return;
+    }
+    this.externalKeyboardActive = false;
+    if (this.focusId.length > 0) {
+      FocusManager.get().focus(this.focusId);
+    }
+    this.requestInput(true);
   }
 
   /**
    * 双击/三击 → 应用选区。成功返回 true（消费本次点击，不再走软键盘聚焦）。
-   * 网格抽象由最近一帧的 terminal.readRows 构造（见 makeClickGrid）。
+   * 网格为当前视口（可能处于回滚中），结果换算回绝对行。
    */
   private applyClickSelect(mode: ClickSelectionMode): boolean {
     const grid = this.makeClickGrid();
@@ -591,8 +950,11 @@ export struct TerminalCanvas {
     if (range === null) {
       return false;
     }
-    this.selection.begin({ row: range.startRow, col: range.startCol });
-    this.selection.extend({ row: range.endRow, col: range.endCol });
+    const top: number = this.viewTopAbs();
+    this.selection.setRange({ row: top + range.startRow, col: range.startCol },
+      { row: top + range.endRow, col: range.endCol });
+    this.selectionUrl = '';
+    this.refreshSelectionUrl();
     this.updateSelectionChrome();
     this.forceFullRedraw();
     vibrateLight(this.hapticEnabled);
@@ -600,36 +962,48 @@ export struct TerminalCanvas {
   }
 
   /**
-   * 连点选区网格适配：从终端只读快照构造 ClickSelectGrid。
-   * beginFrame 后不 endFrame（与 copySelection 同口径：不消费脏位图）。
+   * 连点选区网格适配：从当前视口（回滚区 + 主屏拼接）构造 ClickSelectGrid。
    * 宽字符首格 wide=true；续格 codepoint=CLICK_WIDE_CONTINUATION。
    */
   private makeClickGrid(): ClickSelectGrid | null {
+    const reader: TerminalAbsReader | null = this.absReader();
+    if (reader === null) {
+      return null;
+    }
+    const cols = reader.cols;
+    const rows = this.lastGridRows > 0 ? this.lastGridRows : this.layout.rows;
+    const top: number = this.viewTopAbs();
+    const decoded: ClickSelectCell[] = new Array<ClickSelectCell>(rows * cols);
+    for (let r = 0; r < rows; r++) {
+      const cells: DecodedCell[] | null = reader.rowCells(top + r);
+      for (let c = 0; c < cols; c++) {
+        const cell: DecodedCell | null = cells !== null && c < cells.length ? cells[c] : null;
+        decoded[r * cols + c] = {
+          codepoint: cell === null ? 0 : cell.codepoint,
+          wide: cell !== null && (cell.attrs & (1 << 7)) !== 0 // ATTR_WIDE
+        };
+      }
+    }
+    return new SnapshotClickGrid(decoded, rows, cols);
+  }
+
+  /** 当前帧的绝对行读取器（只读快照；终端未就绪返回 null） */
+  private absReader(): TerminalAbsReader | null {
     const terminal = this.terminal;
     if (terminal === null) {
       return null;
     }
     const frame = terminal.beginFrame();
-    if (frame === null) {
+    if (frame === null || frame.cols <= 0) {
       return null;
     }
-    const view = terminal.readRows(frame, 0, frame.rows);
-    if (view === null) {
-      return null;
-    }
-    const cols = frame.cols;
-    const rows = frame.rows;
-    const decoded: ClickSelectCell[] = new Array<ClickSelectCell>(rows * cols);
-    for (let i = 0; i < rows * cols; i++) {
-      const off = i * 16; // CELL_BYTES=16，与 SshTerminal 布局一致
-      const cp = view.getUint32(off, true);
-      const attrs = view.getUint16(off + 12, true);
-      decoded[i] = {
-        codepoint: cp,
-        wide: (attrs & (1 << 7)) !== 0 // ATTR_WIDE
-      };
-    }
-    return new SnapshotClickGrid(decoded, rows, cols);
+    return new TerminalAbsReader(terminal, frame);
+  }
+
+  /** 视口第 0 行的绝对行号（= scrollbackTotal − scrollOffset） */
+  private viewTopAbs(): number {
+    const total: number = this.lastScrollbackTotal >= 0 ? this.lastScrollbackTotal : 0;
+    return total - this.scrollOffsetLines;
   }
 
   /**
@@ -684,9 +1058,8 @@ export struct TerminalCanvas {
    *
    * ArkUI MouseEvent 接线（本组件 build 中 .onMouse）：
    *   - action=PRESS/RELEASE/MOVE → encodeSgrMouseEvent → sendInputBytes；
-   *   - 滚轮：部分 API 版本 MouseEvent 无 wheel 字段，走触控板/触摸 pan 的
-   *     buildAltScrollSequences('mouse', ...) 已覆盖；若设备侧补上
-   *     event.wheelDelta，可在 onWheel 上调 encodeSgrWheel（TODO 调用点）。
+   *   - 滚轮 / 触控板双指：走 onAxisEvent（API 17+，见 onAxis），按模式转 SGR 滚轮、
+   *     方向键或本地回滚滚动。
    *   - mouseMode=0 时完全不转发（本地选择/滚动语义不变）。
    */
   private onMouseEventReport(action: string, ohosButton: number, localX: number,
@@ -732,9 +1105,7 @@ export struct TerminalCanvas {
     if (terminal === null || bytes.length === 0) {
       return;
     }
-    // 输入发出前先预热 displaySync：远端回显到达时可直接赶上下一帧，避免从
-    // 自动休眠状态启动 ticker 所产生的额外可感知等待。
-    FrameScheduler.get().wakeup();
+    this.noteUserInput();
     const accepted: boolean =
       terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
     if (!accepted) {
@@ -742,12 +1113,55 @@ export struct TerminalCanvas {
     }
   }
 
+  /** 写终端文本（粘贴出口；已由 preparePasteText 处理换行与 2004 包裹） */
+  private sendInputText(text: string): void {
+    const terminal = this.terminal;
+    if (terminal === null || text.length === 0) {
+      return;
+    }
+    this.noteUserInput();
+    if (!terminal.write(text)) {
+      Logger.warn(`粘贴内容未被通道受理（chars=${text.length}）`, 'Terminal');
+    }
+  }
+
+  /**
+   * 任何用户输入的共同副作用：回到底部（看得到回显）、闪烁相位归零（打字时光标
+   * 常亮）、预热 displaySync（回显到达时直接赶上下一帧，避免从休眠启动的迟滞）。
+   */
+  private noteUserInput(): void {
+    if (this.scrollOffsetLines > 0) {
+      this.scrollToBottom();
+    }
+    this.fling.stop();
+    this.blinkEpoch = Date.now();
+    FrameScheduler.get().wakeup();
+    this.onUserInput();
+  }
+
+  /** 粘贴系统剪贴板：远端开了 bracketed paste 自动包裹，未开且多行时先确认 */
+  private pasteClipboard(): void {
+    if (this.terminal === null) {
+      return;
+    }
+    pasteFromPasteboard((text: string): void => {
+      this.sendInputText(text);
+    }, this.frameBracketedPaste).catch((err: Object) => {
+      Logger.warn(`粘贴失败：${JSON.stringify(err)}`, 'Terminal');
+    });
+  }
+
+  /** 当前终端的 DECCKM（以 native 帧为准；旧 native 无该字段时退回 @Prop） */
+  private appCursorKeys(): boolean {
+    return this.frameAppCursorKnown ? this.frameAppCursor : this.applicationCursorKeys;
+  }
+
   /**
    * 物理键盘统一出口（onKeyEvent 与 onKeyPreIme 共用；T10 扩展点，勿开旁路）。
    *
-   * @param preIme true = TextInput 的 IME 前拦截（onKeyPreIme）：无 Ctrl/Alt 的
-   *   可打印键必须放行（返回 false），让 IME 走 onChange 增量路径——否则中文
-   *   候选会被拦断、可打印字符与 IME 双发；false = 容器自身获焦的全量通路。
+   * @param preIme true = IME 前拦截（onKeyPreIme）：按 shouldInterceptBeforeIme
+   *   决定是否截获（候选中一律放行；Ctrl/Alt 组合截获；自绘编辑器通路其余键先给
+   *   输入法；兜底 TextInput 通路截非可打印键）；false = 输入法不消费后的全量通路。
    * @returns true = 已消费（不再进 IME/不再冒泡）
    */
   private handleKeyInput(event: KeyEvent, preIme: boolean): boolean {
@@ -763,7 +1177,8 @@ export struct TerminalCanvas {
     const alt = this.queryModifierState(event, 'alt');
     const shift = this.queryModifierState(event, 'shift');
     const meta = this.queryModifierState(event, 'meta');
-    if (preIme && !ctrl && !alt && isPrintableKeyCode(event.keyCode)) {
+    if (preIme && !shouldInterceptBeforeIme(this.useCustomIme, false, ctrl, alt,
+      isPrintableKeyCode(event.keyCode))) {
       return false;
     }
     if (!this.isInputTarget()) {
@@ -776,7 +1191,7 @@ export struct TerminalCanvas {
     }
     const snap = this.stickyModifiers.snapshot();
     const mapped = mapKeyEvent(event.keyCode, shift,
-      alt || snap.alt, ctrl || snap.ctrl, false, this.applicationCursorKeys);
+      alt || snap.alt, ctrl || snap.ctrl, false, this.appCursorKeys());
     if (mapped === null) {
       return false; // 未映射键放行系统默认处理
     }
@@ -792,9 +1207,7 @@ export struct TerminalCanvas {
       return true;
     }
     if (action === 'paste') {
-      pasteFromPasteboard(this.terminal).catch((err: Object) => {
-        Logger.warn(`快捷键粘贴失败：${JSON.stringify(err)}`, 'Terminal');
-      });
+      this.pasteClipboard();
       return true;
     }
     return this.onAppShortcut(action);
@@ -832,8 +1245,8 @@ export struct TerminalCanvas {
   }
 
   /**
-   * IME 提交出口：增量 + 粘滞快照 → 字节 → write()；每次提交都消费一次性粘滞
-   * （「下一个按键带修饰」以按键/提交计，见 StickyModifiers 头注）。
+   * 兜底通路（隐藏 TextInput）提交出口：增量 + 粘滞快照 → 字节 → write()；每次提交
+   * 都消费一次性粘滞（「下一个按键带修饰」以按键/提交计，见 StickyModifiers 头注）。
    */
   private onImeDelta = (delta: CommittedDelta): void => {
     if (!this.isInputTarget()) {
@@ -847,16 +1260,74 @@ export struct TerminalCanvas {
     }
   }
 
+  /** 兜底通路软键盘回车 */
+  private onImeEnter = (): void => {
+    if (!this.isInputTarget()) {
+      return;
+    }
+    this.stickyModifiers.consume();
+    this.sendInputBytes(imeEnterBytes());
+  }
+
   private onImeInterceptKey = (event: KeyEvent): boolean => {
     return this.handleKeyInput(event, true);
   }
 
+  /** 自绘编辑器事件入口（CanvasImeClient 统一投递） */
+  private onImeEvent(kind: ImeEventKind, text: string, value: number): void {
+    if (kind === 'keyboard') {
+      return; // 软键盘显隐：目前无需额外处理（状态由 TerminalImeEditor 记录）
+    }
+    if (kind === 'selectAll') {
+      this.selectAllBuffer();
+      return;
+    }
+    if (kind === 'copy') {
+      this.copySelection();
+      return;
+    }
+    if (kind === 'paste') {
+      this.pasteClipboard();
+      return;
+    }
+    if (!this.isInputTarget()) {
+      return;
+    }
+    const snap = this.stickyModifiers.snapshot();
+    let bytes: Uint8Array | null = null;
+    switch (kind) {
+      case 'insert':
+        bytes = imeInsertToBytes(text, snap);
+        this.imeEcho.insert(text);
+        break;
+      case 'deleteLeft':
+        bytes = imeDeleteLeftToBytes(value, snap);
+        this.imeEcho.deleteLeft(value);
+        break;
+      case 'deleteRight':
+        bytes = imeDeleteRightToBytes(value);
+        break;
+      case 'enter':
+        bytes = imeEnterBytes();
+        this.imeEcho.clear();
+        break;
+      case 'move':
+        bytes = imeMoveCursorToBytes(value, this.appCursorKeys());
+        break;
+      default:
+        break;
+    }
+    this.stickyModifiers.consume();
+    if (bytes !== null) {
+      this.sendInputBytes(bytes);
+    }
+  }
+
   /**
-   * T9 回滚视图整窗重绘（scrollOffsetLines > 0 时；首版简化方案，性能待
-   * T0/Q2 实测）：视口 = 绝对行 [scrollbackTotal - scrollOffset, +rows)，
-   * 回滚段经 readScrollbackWindow 取历史行拼在视口上方，主屏段取主屏
-   * [0, rows-sbCount) 拼在下方。远端新输出会推动 scrollbackTotal 增长，
-   * 视口内容随之移动（与桌面终端「锚定底部」惯例一致）。
+   * T9 回滚视图整窗重绘（scrollOffsetLines > 0 时）：视口 = 绝对行
+   * [scrollbackTotal − scrollOffset, +rows)，回滚段经 readScrollbackWindow 取历史行
+   * 拼在视口上方，主屏段取主屏 [0, rows − sbCount) 拼在下方。远端新输出时
+   * renderFrame 先按 anchorScrollOffset 同步增大 offset，视口内容保持不动。
    */
   private paintScrolledWindow(frame: NativeTerminalFrame): void {
     const ctx = this.context;
@@ -886,9 +1357,9 @@ export struct TerminalCanvas {
   }
 
   /**
-   * T8 选区高亮：selectionColor 半透明叠加层（画在行内容之后）。
-   * 范围与取文本同一口径（宽字符边界修正复用 adjustWideCharBoundary，
-   * 不高亮半个宽字符）；行区间越界（选择期间 resize）按帧尺寸钳制。
+   * T8 选区高亮：selectionColor 半透明叠加层（画在行内容之后）。选区是绝对行，
+   * 这里只画落在当前视口内的部分；宽字符边界修正复用 adjustWideCharBoundary
+   * （只读取起止两行），选区/revision/视口不变时复用上次结果。
    */
   private paintSelectionOverlay(frame: NativeTerminalFrame): void {
     const raw = this.selection.range();
@@ -896,38 +1367,37 @@ export struct TerminalCanvas {
     if (raw === null || terminal === null) {
       return;
     }
-    // 宽字符边界修正只依赖选区端点与网格内容：选区/revision/尺寸不变时复用上次结果
     const key = `${raw.startRow},${raw.startCol},${raw.endRow},${raw.endCol}|${frame.revision}|` +
-      `${frame.rows}x${frame.cols}`;
+      `${frame.rows}x${frame.cols}|${frame.scrollbackTotal}`;
     let range = this.selAdjusted;
     if (key !== this.selAdjustKey || range === null) {
-      const view = terminal.readRows(frame, 0, frame.rows);
-      if (view === null) {
-        return;
-      }
-      range = adjustWideCharBoundary(dataViewGridReader(view, frame.rows, frame.cols), raw);
+      range = adjustWideCharBoundary(new TerminalAbsReader(terminal, frame), raw);
       this.selAdjustKey = key;
       this.selAdjusted = range;
     }
+    const topAbs: number = frame.scrollbackTotal - this.scrollOffsetLines;
+    const firstAbs: number = Math.max(range.startRow, topAbs);
+    const lastAbs: number = Math.min(range.endRow, topAbs + frame.rows - 1);
+    if (firstAbs > lastAbs) {
+      return;
+    }
     const ctx = this.context;
-    const ox = this.layout.originX;
-    const oy = this.layout.originY;
-    const cw = this.cellWidthVp;
-    const ch = this.cellHeightVp;
-    const firstRow = Math.max(0, range.startRow);
-    const lastRow = Math.min(range.endRow, frame.rows - 1);
+    const env = this.renderEnv();
     // 一次遍历：填充各行，同时收集每行 [lo, hi] 供外轮廓描边
     const los: number[] = [];
     const his: number[] = [];
     this.invalidateCtxStyleCache();
     ctx.fillStyle = withOpacity(this.selectionArgb, SELECTION_OVERLAY_OPACITY);
-    for (let r = firstRow; r <= lastRow; r++) {
-      const lo = r === range.startRow ? range.startCol : 0;
-      const hi = Math.min(r === range.endRow ? range.endCol : frame.cols - 1, frame.cols - 1);
+    for (let abs = firstAbs; abs <= lastAbs; abs++) {
+      const r: number = abs - topAbs;
+      const lo = abs === range.startRow ? range.startCol : 0;
+      const hi = Math.min(abs === range.endRow ? range.endCol : frame.cols - 1, frame.cols - 1);
       los.push(lo);
       his.push(hi);
       if (hi >= lo) {
-        ctx.fillRect(ox + lo * cw, oy + r * ch, (hi - lo + 1) * cw, ch);
+        const x0: number = cellLeftX(env, lo);
+        const y0: number = cellTopY(env, r);
+        ctx.fillRect(x0, y0, cellLeftX(env, hi + 1) - x0, cellTopY(env, r + 1) - y0);
       }
     }
     // 只描整体外轮廓：每行左右竖边 + 与上/下一行不重叠部分的横边
@@ -935,50 +1405,49 @@ export struct TerminalCanvas {
     ctx.lineWidth = SELECTION_BORDER_VP;
     ctx.beginPath();
     const n = los.length;
+    const firstRow: number = firstAbs - topAbs;
     for (let i = 0; i < n; i++) {
       const lo = los[i];
       const hi = his[i];
       if (hi < lo) {
         continue;
       }
-      const y0 = oy + (firstRow + i) * ch;
-      const y1 = y0 + ch;
-      const x0 = ox + lo * cw;
-      const x1 = ox + (hi + 1) * cw;
+      const y0 = cellTopY(env, firstRow + i);
+      const y1 = cellTopY(env, firstRow + i + 1);
+      const x0 = cellLeftX(env, lo);
+      const x1 = cellLeftX(env, hi + 1);
       ctx.moveTo(x0, y0);
       ctx.lineTo(x0, y1);
       ctx.moveTo(x1, y0);
       ctx.lineTo(x1, y1);
-      this.strokeEdgeOutside(i > 0 ? los[i - 1] : 0, i > 0 ? his[i - 1] : -1, lo, hi, y0);
-      this.strokeEdgeOutside(i + 1 < n ? los[i + 1] : 0, i + 1 < n ? his[i + 1] : -1, lo, hi, y1);
+      this.strokeEdgeOutside(i > 0 ? los[i - 1] : 0, i > 0 ? his[i - 1] : -1, lo, hi, y0, env);
+      this.strokeEdgeOutside(i + 1 < n ? los[i + 1] : 0, i + 1 < n ? his[i + 1] : -1, lo, hi, y1, env);
     }
     ctx.stroke();
   }
 
   /** 横边：本行 [lo,hi] 中不被相邻行 [nlo,nhi] 覆盖的区段（nhi<nlo 表示无相邻行） */
-  private strokeEdgeOutside(nlo: number, nhi: number, lo: number, hi: number, y: number): void {
+  private strokeEdgeOutside(nlo: number, nhi: number, lo: number, hi: number, y: number,
+    env: RowRenderEnv): void {
     const ctx = this.context;
-    const ox = this.layout.originX;
-    const cw = this.cellWidthVp;
     if (nhi < nlo || nhi < lo || nlo > hi) {
-      ctx.moveTo(ox + lo * cw, y);
-      ctx.lineTo(ox + (hi + 1) * cw, y);
+      ctx.moveTo(cellLeftX(env, lo), y);
+      ctx.lineTo(cellLeftX(env, hi + 1), y);
       return;
     }
     if (nlo > lo) {
-      ctx.moveTo(ox + lo * cw, y);
-      ctx.lineTo(ox + nlo * cw, y);
+      ctx.moveTo(cellLeftX(env, lo), y);
+      ctx.lineTo(cellLeftX(env, nlo), y);
     }
     if (nhi < hi) {
-      ctx.moveTo(ox + (nhi + 1) * cw, y);
-      ctx.lineTo(ox + (hi + 1) * cw, y);
+      ctx.moveTo(cellLeftX(env, nhi + 1), y);
+      ctx.lineTo(cellLeftX(env, hi + 1), y);
     }
   }
 
-
   // ---------------------------------------------------------------- T8 选择模式
 
-  /** 像素点 → 网格坐标（钳到当前帧网格内；度量未完成时给 (0,0)） */
+  /** 像素点 → 视口网格坐标（钳到当前帧网格内；度量未完成时给 (0,0)） */
   private gridPosFromPoint(x: number, y: number): CellPos {
     const cols = this.lastGridCols > 0 ? this.lastGridCols : this.layout.cols;
     const rows = this.lastGridRows > 0 ? this.lastGridRows : this.layout.rows;
@@ -993,47 +1462,99 @@ export struct TerminalCanvas {
     };
   }
 
-  /** 长按进入选择模式（首版仅主屏：回滚视图中忽略，见头注「T8」） */
+  /** 像素点 → 绝对行坐标（选区坐标系：回滚区 + 主屏统一编号） */
+  private absPosFromPoint(x: number, y: number): CellPos {
+    const pos: CellPos = this.gridPosFromPoint(x, y);
+    return { row: this.viewTopAbs() + pos.row, col: pos.col };
+  }
+
+  /** 长按进入选择模式（回滚中同样可用）；落在链接上直接选中整条链接 */
   private onLongPressSelect(event: GestureEvent): void {
-    if (this.terminal === null || this.scrollOffsetLines > 0 || event.fingerList.length === 0) {
+    if (this.terminal === null || event.fingerList.length === 0) {
       return;
     }
+    this.fling.stop();
     const finger = event.fingerList[0];
-    this.selection.begin(this.gridPosFromPoint(finger.localX, finger.localY));
+    const pos: CellPos = this.absPosFromPoint(finger.localX, finger.localY);
+    if (!this.trySelectUrlAt(pos)) {
+      this.selection.begin(pos);
+      this.selectionUrl = '';
+    }
     this.updateSelectionChrome();
     this.forceFullRedraw();
     vibrateLight(this.hapticEnabled);
   }
 
+  /** pos 处若是链接（含软换行折到下一行的长链接）则选中整条，返回是否命中 */
+  private trySelectUrlAt(pos: CellPos): boolean {
+    const reader: TerminalAbsReader | null = this.absReader();
+    if (reader === null) {
+      return false;
+    }
+    const line: LogicalLine = logicalLineAt(reader, pos.row, reader.minRow);
+    let index: number = -1;
+    for (let i = 0; i < line.positions.length; i++) {
+      const p: CellPos = line.positions[i];
+      // 宽字符续格没有对应文本单元：落在续格时匹配其首格（col − 1）
+      if (p.row === pos.row && (p.col === pos.col || p.col === pos.col - 1)) {
+        index = i;
+        if (p.col === pos.col) {
+          break;
+        }
+      }
+    }
+    if (index < 0) {
+      return false;
+    }
+    const url: UrlMatch | null = urlAt(line.text, index);
+    if (url === null || url.end - 1 >= line.positions.length) {
+      return false;
+    }
+    this.selection.setRange(line.positions[url.start], line.positions[url.end - 1]);
+    this.selectionUrl = openableUrl(url.text);
+    return true;
+  }
+
+  /** 选区变化后（拖动结束/连点）判断选中内容是否恰好是一个链接（只看 ≤3 行的小选区） */
+  private refreshSelectionUrl(): void {
+    const range: SelectionRange | null = this.selection.range();
+    if (range === null || range.endRow - range.startRow > 2) {
+      this.selectionUrl = '';
+      return;
+    }
+    const reader: TerminalAbsReader | null = this.absReader();
+    if (reader === null) {
+      this.selectionUrl = '';
+      return;
+    }
+    this.selectionUrl = singleUrlIn(extractRangeText(reader, adjustWideCharBoundary(reader, range)));
+  }
+
   /** 退出选择模式并清掉高亮/菜单（复制完成、点击他处、换绑终端时调用） */
   private exitSelectionMode(): void {
+    this.stopEdgeScroll();
     if (!this.selection.selecting && !this.selectionMenuVisible) {
       return;
     }
     this.selection.cancel();
     this.selectionMenuVisible = false;
     this.selectionHandlesVisible = false;
+    this.selectionUrl = '';
     this.lastHandleGeo = null;
     this.draggingHandle = '';
+    this.selAdjusted = null;
+    this.selAdjustKey = '';
     this.forceFullRedraw(); // 重绘覆盖掉高亮叠加层
   }
 
-  /** 气泡菜单「复制」：取选区文本 → 写系统剪贴板 → 轻震 → 退出选择模式 */
+  /** 气泡菜单「复制」：取选区文本（软换行感知）→ 写系统剪贴板 → 轻震 + 提示 → 退出选择 */
   private copySelection(): void {
-    const terminal = this.terminal;
-    if (terminal === null) {
+    const range: SelectionRange | null = this.selection.range();
+    const reader: TerminalAbsReader | null = this.absReader();
+    if (range === null || reader === null) {
       return;
     }
-    // 只读快照：beginFrame 后不 endFrame——不消费脏位图，帧流程不受影响
-    const frame = terminal.beginFrame();
-    if (frame === null) {
-      return;
-    }
-    const view = terminal.readRows(frame, 0, frame.rows);
-    if (view === null) {
-      return;
-    }
-    const text = this.selection.extractText(dataViewGridReader(view, frame.rows, frame.cols));
+    const text = extractRangeText(reader, adjustWideCharBoundary(reader, range));
     this.exitSelectionMode();
     if (text.length === 0) {
       return;
@@ -1042,6 +1563,9 @@ export struct TerminalCanvas {
       .then((ok) => {
         if (ok) {
           vibrateLight(this.hapticEnabled);
+          this.showToast(text.length > 1 ? `已复制 ${text.length} 个字符` : '已复制');
+        } else {
+          this.showToast('复制失败');
         }
       })
       .catch((err: Object) => {
@@ -1049,38 +1573,95 @@ export struct TerminalCanvas {
       });
   }
 
-  /** 气泡菜单「全选」：选中当前主屏全部内容 */
-  private selectAllOnScreen(): void {
+  private showToast(message: string): void {
+    try {
+      this.getUIContext().getPromptAction().showToast({ message: message, duration: 1500 });
+    } catch (err) {
+      Logger.warn(`Toast 显示失败：${JSON.stringify(err)}`, 'Terminal');
+    }
+  }
+
+  /** 气泡菜单「打开链接」：交给系统浏览器 */
+  private openSelectionUrl(): void {
+    const url: string = this.selectionUrl;
+    this.exitSelectionMode();
+    if (url.length === 0) {
+      return;
+    }
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      ctx.openLink(url).catch((err: Object) => {
+        Logger.warn(`打开链接失败：${JSON.stringify(err)}`, 'Terminal');
+        this.showToast('无法打开链接');
+      });
+    } catch (err) {
+      Logger.warn(`打开链接异常：${JSON.stringify(err)}`, 'Terminal');
+      this.showToast('无法打开链接');
+    }
+  }
+
+  /** 气泡菜单「粘贴」：退出选择后粘贴 */
+  private pasteFromMenu(): void {
+    this.exitSelectionMode();
+    this.pasteClipboard();
+  }
+
+  /** 「全选」：整个缓冲（最旧回滚行 → 主屏末行） */
+  private selectAllBuffer(): void {
     const rows = this.lastGridRows > 0 ? this.lastGridRows : this.layout.rows;
     const cols = this.lastGridCols > 0 ? this.lastGridCols : this.layout.cols;
-    this.selection.selectAll(rows, cols);
+    const total: number = Math.max(0, this.lastScrollbackTotal);
+    const oldest: number = Math.min(this.lastScrollbackOldest, total);
+    this.selection.selectAll(total - oldest + rows, cols, oldest);
+    this.selectionUrl = '';
     this.updateSelectionChrome();
     this.forceFullRedraw();
   }
 
-  /** 气泡菜单 + 两端手柄一起刷新。 */
+  /** 气泡菜单 + 两端手柄一起刷新（视口滚动后也要调：位置是视口坐标）。 */
   private updateSelectionChrome(): void {
     this.updateSelectionMenuPosition();
     this.updateSelectionHandles();
   }
 
-  /** 气泡菜单位置：选区起点上方，顶部放不下时贴顶（底部溢出由钳制兜底） */
+  /** 菜单项个数（宽度计算用）：复制/粘贴/全选 + 可选「打开链接」 */
+  private menuItemCount(): number {
+    return this.selectionUrl.length > 0 ? 4 : 3;
+  }
+
+  /**
+   * 气泡菜单位置：选区起点上方；起点不在视口内或顶部放不下时放到选区下方，
+   * 仍放不下则贴视口顶部（钳制在视口内）。
+   */
   private updateSelectionMenuPosition(): void {
     const range: SelectionRange | null = this.selection.range();
     if (range === null) {
       this.selectionMenuVisible = false;
       return;
     }
-    const x = this.layout.originX + range.startCol * this.cellWidthVp;
-    const maxX = Math.max(0, this.areaWidthVp - MENU_WIDTH_VP);
+    const top: number = this.viewTopAbs();
+    const rows: number = this.lastGridRows > 0 ? this.lastGridRows : this.layout.rows;
+    const menuWidth: number = this.menuItemCount() * MENU_ITEM_WIDTH_VP + MENU_SIDE_PADDING_VP * 2;
+    const startView: number = range.startRow - top;
+    const endView: number = range.endRow - top;
+    const x = this.layout.originX + Math.max(0, startView >= 0 ? range.startCol : 0) * this.cellWidthVp;
+    const maxX = Math.max(0, this.areaWidthVp - menuWidth);
     this.selectionMenuX = Math.min(Math.max(x, 0), maxX);
-    const y = this.layout.originY + range.startRow * this.cellHeightVp - MENU_HEIGHT_VP - MENU_GAP_VP;
-    this.selectionMenuY = Math.max(y, 0);
+    let y: number = this.layout.originY + startView * this.cellHeightVp - MENU_HEIGHT_VP - MENU_GAP_VP -
+      HANDLE_KNOB_VP / 2;
+    if (startView < 0 || y < 0) {
+      const below: number = this.layout.originY + (Math.min(endView, rows - 1) + 1) * this.cellHeightVp +
+        MENU_GAP_VP + HANDLE_KNOB_VP;
+      y = below + MENU_HEIGHT_VP <= this.areaHeightVp ? below : 0;
+    }
+    this.selectionMenuY = Math.min(Math.max(y, 0), Math.max(0, this.areaHeightVp - MENU_HEIGHT_VP));
     this.selectionMenuVisible = true;
   }
 
-  /** 起点手柄贴第一格左边、终点手柄贴末格右边，竖条与行等高。
-   *  几何由 TerminalGestures.selectionHandleHitRects 纯函数计算（T8 打磨）。 */
+  /**
+   * 起点手柄贴第一格左边、终点手柄贴末格右边，竖条与行等高；端点滚出视口时
+   * 对应手柄移到视口外（不可见也不可拖）。几何由纯函数 selectionHandleHitRects 计算。
+   */
   private updateSelectionHandles(): void {
     const range: SelectionRange | null = this.selection.range();
     if (range === null || this.cellWidthVp <= 0 || this.cellHeightVp <= 0) {
@@ -1088,13 +1669,25 @@ export struct TerminalCanvas {
       this.lastHandleGeo = null;
       return;
     }
+    const top: number = this.viewTopAbs();
+    const rows: number = this.lastGridRows > 0 ? this.lastGridRows : this.layout.rows;
     const barH: number = this.cellHeightVp;
     this.handleBarHeight = barH;
     const geo = selectionHandleHitRects(
       this.layout.originX, this.layout.originY,
       this.cellWidthVp, this.cellHeightVp,
-      range.startRow, range.startCol, range.endRow, range.endCol,
+      range.startRow - top, range.startCol, range.endRow - top, range.endCol,
       barH, HANDLE_HIT_WIDTH_VP, HANDLE_KNOB_VP);
+    const startInView: boolean = range.startRow - top >= 0 && range.startRow - top < rows;
+    const endInView: boolean = range.endRow - top >= 0 && range.endRow - top < rows;
+    if (!startInView) {
+      geo.start.x = -10000;
+      geo.start.y = -10000;
+    }
+    if (!endInView) {
+      geo.end.x = -10000;
+      geo.end.y = -10000;
+    }
     this.lastHandleGeo = geo;
     this.startHandleX = geo.start.x;
     this.startHandleY = geo.start.y;
@@ -1117,12 +1710,13 @@ export struct TerminalCanvas {
       return;
     }
     this.draggingHandle = which;
-    // 拖动 origin = 手柄圆钮中心（纯函数 selectionHandleAnchor）
+    // 拖动 origin = 端点格中心（纯函数 selectionHandleAnchor）：起拖瞬间端点不跳
+    const top: number = this.viewTopAbs();
     const anchor = selectionHandleAnchor(
       which === 'start' ? 'start' : 'end',
       this.layout.originX, this.layout.originY,
       this.cellWidthVp, this.cellHeightVp,
-      which === 'start' ? range.startRow : range.endRow,
+      (which === 'start' ? range.startRow : range.endRow) - top,
       which === 'start' ? range.startCol : range.endCol,
       HANDLE_HIT_WIDTH_VP);
     this.handleDragOriginX = anchor.x;
@@ -1133,28 +1727,79 @@ export struct TerminalCanvas {
     if (this.draggingHandle.length === 0) {
       return;
     }
-    const pos: CellPos = this.gridPosFromPoint(
-      this.handleDragOriginX + event.offsetX, this.handleDragOriginY + event.offsetY);
-    if (this.draggingHandle === 'start') {
+    const x: number = this.handleDragOriginX + event.offsetX;
+    const y: number = this.handleDragOriginY + event.offsetY;
+    this.applyDragPoint(this.draggingHandle, x, y);
+    this.updateEdgeScroll(this.draggingHandle, x, y);
+  }
+
+  private endHandleDrag(): void {
+    this.draggingHandle = '';
+    this.stopEdgeScroll();
+    this.refreshSelectionUrl();
+    this.updateSelectionChrome();
+  }
+
+  /** 拖动点 → 选区端点（target：extend 活动端 / start / end 手柄） */
+  private applyDragPoint(target: string, x: number, y: number): void {
+    const pos: CellPos = this.absPosFromPoint(x, y);
+    if (target === 'start') {
       this.selection.moveStart(pos);
-    } else {
+      // moveStart 会把锚点换成原终点：之后继续拖动的是新的活动端
+    } else if (target === 'end') {
       this.selection.moveEnd(pos);
+    } else {
+      this.selection.extend(pos);
     }
     this.updateSelectionChrome();
     this.forceFullRedraw();
   }
 
-  private endHandleDrag(): void {
-    this.draggingHandle = '';
+  /** 拖动点贴近视口上/下边缘时启动自动滚动，离开边缘停止 */
+  private updateEdgeScroll(target: string, x: number, y: number): void {
+    this.edgeDragTarget = target;
+    this.edgeDragX = x;
+    this.edgeDragY = y;
+    this.edgeScrollLines = edgeAutoScrollLines(y, 0, this.areaHeightVp, EDGE_SCROLL_BAND_VP,
+      EDGE_SCROLL_MAX_LINES);
+    if (this.edgeScrollLines === 0) {
+      this.stopEdgeScroll();
+      return;
+    }
+    if (this.edgeScrollTimer >= 0) {
+      return;
+    }
+    this.edgeScrollTimer = setInterval((): void => {
+      if (this.edgeScrollLines === 0 || !this.selection.selecting) {
+        this.stopEdgeScroll();
+        return;
+      }
+      // 负 = 手指在顶部 → 看更旧内容（offset 增大）
+      this.setScrollOffset(this.scrollOffsetLines - this.edgeScrollLines);
+      // 端点跟随：moveStart/moveEnd 之后锚点已固定，继续用 extend 更新活动端
+      this.applyDragPoint('extend', this.edgeDragX, this.edgeDragY);
+    }, EDGE_SCROLL_INTERVAL_MS);
+  }
+
+  private stopEdgeScroll(): void {
+    if (this.edgeScrollTimer >= 0) {
+      clearInterval(this.edgeScrollTimer);
+      this.edgeScrollTimer = -1;
+    }
+    this.edgeScrollLines = 0;
   }
 
   // ---------------------------------------------------------------- T9 手势
 
   /**
-   * 单指拖动主处理：选择模式中 = 更新活动端；否则竖向滚动
+   * 单指拖动主处理：选择模式中 = 更新活动端（贴边自动滚动）；否则竖向滚动
    * （主屏 = 视图回滚；alt-screen = 方向键/滚轮序列，见 handleVerticalPan）。
+   * 两指及以上的移动属于捏合，忽略（避免先落下的手指把画面拖走）。
    */
   private onPanUpdate(event: GestureEvent): void {
+    if (event.fingerList.length >= 2) {
+      return;
+    }
     if (this.selection.selecting) {
       if (event.fingerList.length > 0) {
         const finger = event.fingerList[0];
@@ -1162,9 +1807,8 @@ export struct TerminalCanvas {
         if (this.handleIdAtPoint(finger.localX, finger.localY) !== 'none') {
           return;
         }
-        this.selection.extend(this.gridPosFromPoint(finger.localX, finger.localY));
-        this.updateSelectionChrome();
-        this.forceFullRedraw();
+        this.applyDragPoint('extend', finger.localX, finger.localY);
+        this.updateEdgeScroll('extend', finger.localX, finger.localY);
       }
       return;
     }
@@ -1173,11 +1817,32 @@ export struct TerminalCanvas {
     this.handleVerticalPan(deltaY, event);
   }
 
+  /** 拖动结束：选择模式收尾；视图滚动按松手速度起飞惯性 */
+  private onPanEnd(event: GestureEvent): void {
+    this.scrollAccumulator.reset();
+    if (this.selection.selecting) {
+      this.stopEdgeScroll();
+      this.refreshSelectionUrl();
+      this.updateSelectionChrome();
+      return;
+    }
+    if (this.lastAltScreen && this.altScrollMode !== 'view') {
+      return; // alt-screen 发键模式不做惯性（避免甩一下发出几十个方向键）
+    }
+    this.flingAccumulator.reset();
+    if (this.fling.start(event.velocityY, Date.now())) {
+      FrameScheduler.get().wakeup();
+    }
+  }
+
   /**
    * 竖向拖动 → 滚动语义。内容跟手方向：手指下滑（deltaY>0）看旧内容
    * （回滚偏移增大 / 发上滚序列），手指上滑看新内容。
    */
   private handleVerticalPan(deltaYPx: number, event: GestureEvent): void {
+    if (event.source === SourceType.Mouse && Date.now() - this.lastAxisEventMs < AXIS_PAN_SUPPRESS_MS) {
+      return; // 滚轮/触控板已由 onAxisEvent 处理
+    }
     const lines = this.scrollAccumulator.push(deltaYPx, this.cellHeightVp);
     if (lines === 0) {
       return;
@@ -1197,36 +1862,253 @@ export struct TerminalCanvas {
         row1 = pos.row + 1;
       }
       const seqs = buildAltScrollSequences(this.altScrollMode, this.lastMouseMode, lines,
-        col1, row1, this.applicationCursorKeys);
+        col1, row1, this.appCursorKeys());
       for (const seq of seqs) {
-        this.sendInputBytes(seq);
+        this.sendScrollSequence(seq);
       }
       return;
     }
     // 主屏：视图滚动回滚缓冲（整窗重绘在 renderFrame 的 paintScrolledWindow）
-    const next = clampScrollOffset(this.scrollOffsetLines + lines, this.lastScrollbackCount);
-    if (next !== this.scrollOffsetLines) {
-      this.scrollOffsetLines = next;
-      this.needsFullRedraw = true;
-      FrameScheduler.get().wakeup();
+    this.setScrollOffset(this.scrollOffsetLines + lines);
+  }
+
+  /**
+   * 鼠标滚轮 / 触控板双指（2in1，onAxisEvent）：
+   *   - 远端开了鼠标上报 → SGR 滚轮序列（vim/htop/tmux 等自己滚）；
+   *   - alt-screen 且非 view 模式 → 方向键 / SGR（同触摸拖动语义）；
+   *   - 否则滚本地回滚缓冲。
+   */
+  private onAxis(event: AxisEvent): void {
+    const value: number = event.getVerticalAxisValue();
+    if (value === 0) {
+      return;
+    }
+    this.lastAxisEventMs = Date.now();
+    this.fling.stop();
+    const isWheel: boolean = event.scrollStep !== undefined && event.scrollStep > 0;
+    const step: number = event.scrollStep !== undefined ? event.scrollStep : 0;
+    const downLines: number = this.wheelAccumulator.push(value, step, isWheel, this.cellHeightVp);
+    if (downLines === 0) {
+      return;
+    }
+    const pos = this.gridPosFromPoint(event.x, event.y);
+    if (this.mouseReportingActive && this.isInputTarget()) {
+      for (const seq of wheelSgrSequences(downLines, pos.col + 1, pos.row + 1)) {
+        this.sendScrollSequence(seq);
+      }
+      return;
+    }
+    // 与触摸拖动同号约定：正 = 看更旧的内容
+    const olderLines: number = -downLines;
+    if (this.lastAltScreen && this.altScrollMode !== 'view') {
+      if (!this.isInputTarget()) {
+        return;
+      }
+      const seqs = buildAltScrollSequences(this.altScrollMode, this.lastMouseMode, olderLines,
+        pos.col + 1, pos.row + 1, this.appCursorKeys());
+      for (const seq of seqs) {
+        this.sendScrollSequence(seq);
+      }
+      return;
+    }
+    this.setScrollOffset(this.scrollOffsetLines + olderLines);
+  }
+
+  /** alt-screen 滚动序列：写终端但不算「用户输入」（不触发回到底部/回调） */
+  private sendScrollSequence(bytes: Uint8Array): void {
+    const terminal = this.terminal;
+    if (terminal === null || bytes.length === 0) {
+      return;
+    }
+    FrameScheduler.get().wakeup();
+    terminal.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+
+  /**
+   * 设置回滚偏移（钳制到 [0, 可回滚行数]）：变化时整窗重绘；跨越 0 时切换
+   * 「回到底部」按钮；回到底部清「新输出」角标；选择模式下同步手柄/菜单位置。
+   * 返回是否真的变化。
+   */
+  private setScrollOffset(lines: number): boolean {
+    const next = clampScrollOffset(lines, this.lastScrollbackCount);
+    if (next === this.scrollOffsetLines) {
+      return false;
+    }
+    this.scrollOffsetLines = next;
+    this.needsFullRedraw = true;
+    const back: boolean = next > 0;
+    if (back !== this.scrolledBack) {
+      this.scrolledBack = back;
+    }
+    if (!back && this.newOutputBadge) {
+      this.newOutputBadge = false;
+    }
+    if (this.selection.selecting) {
+      this.updateSelectionChrome();
+    }
+    FrameScheduler.get().wakeup();
+    return true;
+  }
+
+  /** 回到最新输出（「回到底部」按钮 / 任何输入） */
+  private scrollToBottom(): void {
+    this.fling.stop();
+    this.setScrollOffset(0);
+  }
+
+  /** 惯性一帧：位移换算整行后滚动；到顶/到底即停 */
+  private stepFling(now: number): void {
+    const dy: number = this.fling.step(now);
+    if (dy === 0) {
+      return;
+    }
+    const lines: number = this.flingAccumulator.push(dy, this.cellHeightVp);
+    if (lines === 0) {
+      return;
+    }
+    if (!this.setScrollOffset(this.scrollOffsetLines + lines)) {
+      this.fling.stop(); // 撞到边界
     }
   }
 
-  /** 捏合实时改字号（8–32 钳制）：重测度量 → 重排版面 → 下帧全量上屏 */
+  /** 捏合开始：记录起始字号，停止惯性，进入预览 */
+  private onPinchStart(): void {
+    this.fling.stop();
+    this.pinchBaseFontSize = this.appearance.fontSize;
+    this.pinchLastScale = 1;
+    this.pinchScale = 1;
+    this.pinchLabel = `${Math.round(this.pinchBaseFontSize)}`;
+  }
+
+  /**
+   * 捏合过程只做画面缩放预览 + 字号标签：不重测字体、不重排、不发 PTY resize
+   * （旧实现每一步都 applyAppearance，远端在捏合期间收到几十次 SIGWINCH）。
+   */
   private onPinchUpdate(event: GestureEvent): void {
-    const next = clampFontSize(this.pinchBaseFontSize * event.scale);
+    this.pinchLastScale = event.scale;
+    this.pinchScale = pinchPreviewScale(this.pinchBaseFontSize, event.scale);
+    this.pinchLabel = `${pinchCommitFontSize(this.pinchBaseFontSize, event.scale)}`;
+  }
+
+  /** 捏合松手：按最终字号重排一次，并经回调交给页面持久化 */
+  private onPinchEnd(): void {
+    const next: number = pinchCommitFontSize(this.pinchBaseFontSize, this.pinchLastScale);
+    this.pinchScale = 1;
+    this.pinchLabel = '';
     if (next !== this.appearance.fontSize) {
       this.appearance.fontSize = next;
       this.applyAppearance();
+      this.onFontSizeCommit(next);
     }
   }
 
-  /** 捏合松手：最终字号经回调通知外部落库（组件不写库，职责见头注） */
-  private onPinchEnd(): void {
-    this.onFontSizeCommit(this.appearance.fontSize);
+  private onPinchCancel(): void {
+    this.pinchScale = 1;
+    this.pinchLabel = '';
+  }
+
+  /** 视觉响铃：叠一层前景色薄膜闪一下 */
+  private flashBell(): void {
+    if (!this.visible) {
+      return;
+    }
+    if (this.bellFlashTimer >= 0) {
+      clearTimeout(this.bellFlashTimer);
+    }
+    this.bellFlashOpacity = BELL_FLASH_OPACITY;
+    this.bellFlashTimer = setTimeout((): void => {
+      this.bellFlashTimer = -1;
+      this.bellFlashOpacity = 0;
+    }, BELL_FLASH_MS);
   }
 
   // ---------------------------------------------------------------- 帧流程
+
+  /** 有效光标闪烁：DECSCUSR 覆盖优先，其次外观设置；非聚焦/不可见窗格不闪 */
+  private effectiveCursorBlink(): boolean {
+    if (!this.paneFocused || !this.visible) {
+      return false;
+    }
+    if (this.frameCursorBlink === 0) {
+      return false;
+    }
+    if (this.frameCursorBlink === 1) {
+      return true;
+    }
+    return this.appearance.cursorBlink;
+  }
+
+  /** 有效光标形状：DECSCUSR 覆盖优先（1 block / 2 underline / 3 bar），其次外观设置 */
+  private effectiveCursorStyle(): CursorStyle {
+    switch (this.frameCursorShape) {
+      case 1:
+        return 'block';
+      case 2:
+        return 'underline';
+      case 3:
+        return 'bar';
+      default:
+        return this.appearance.cursorStyle;
+    }
+  }
+
+  /**
+   * 帧元信息入账（每次 beginFrame 后）：alt-screen/鼠标上报/DECCKM/2004/DECSCUSR，
+   * 回滚视口锚定（远端输出不推走正在看的历史）、「新输出」角标、epoch 变化时作废选区。
+   */
+  private ingestFrame(frame: NativeTerminalFrame): void {
+    this.lastAltScreen = frame.altScreen;
+    this.lastMouseMode = frame.mouseMode;
+    this.mouseReportingActive = frame.mouseMode !== 0;
+    this.lastFrameCursorVisible = frame.cursorVisible;
+    if (frame.applicationCursorKeys !== undefined) {
+      this.frameAppCursorKnown = true;
+      this.frameAppCursor = frame.applicationCursorKeys;
+    }
+    this.frameBracketedPaste = frame.bracketedPaste === true;
+    const shape: number = frame.cursorShape !== undefined ? frame.cursorShape : 0;
+    const blink: number = frame.cursorBlink !== undefined ? frame.cursorBlink : -1;
+    if (shape !== this.frameCursorShape || blink !== this.frameCursorBlink) {
+      this.frameCursorShape = shape;
+      this.frameCursorBlink = blink;
+      this.needsFullRedraw = true;
+      this.syncBlinkWakeTimer();
+    }
+    const epoch: number = frame.scrollbackEpoch !== undefined ? frame.scrollbackEpoch : 0;
+    const total: number = frame.scrollbackTotal;
+    const maxOffset: number = Math.max(0, total - frame.scrollbackOldest);
+    if (this.lastScrollbackTotal >= 0) {
+      if (epoch !== this.lastScrollbackEpoch && this.selection.selecting) {
+        // 回滚缓冲被清空/重排（clear、reflow）：绝对行号失效
+        this.exitSelectionMode();
+      }
+      if (this.scrollOffsetLines > 0) {
+        const anchored: number = anchorScrollOffset({
+          offset: this.scrollOffsetLines,
+          prevTotal: this.lastScrollbackTotal,
+          total: total,
+          prevEpoch: this.lastScrollbackEpoch,
+          epoch: epoch,
+          maxOffset: maxOffset
+        });
+        if (frame.revision !== this.lastRenderedRevision && this.lastRenderedRevision >= 0 &&
+          !this.newOutputBadge) {
+          this.newOutputBadge = true;
+        }
+        this.lastScrollbackCount = maxOffset;
+        if (anchored !== this.scrollOffsetLines) {
+          this.setScrollOffset(anchored);
+        }
+      }
+    }
+    this.lastScrollbackTotal = total;
+    this.lastScrollbackOldest = frame.scrollbackOldest;
+    this.lastScrollbackEpoch = epoch;
+    this.lastScrollbackCount = maxOffset;
+    if (this.scrollOffsetLines > maxOffset) {
+      this.setScrollOffset(maxOffset);
+    }
+  }
 
   /** 调度器每帧回调：true = 本帧发生了绘制（供自动休眠统计） */
   private renderFrame = (): boolean => {
@@ -1235,19 +2117,25 @@ export struct TerminalCanvas {
       this.cellWidthVp <= 0 || this.cellHeightVp <= 0) {
       return false;
     }
+    const now: number = Date.now();
+    if (this.fling.running) {
+      this.stepFling(now);
+    }
     const revision = terminal.getRevision();
     if (revision < 0) {
       return false; // 句柄失效
     }
     // A3 光标闪烁：content 静止时若相位翻转，仍需重画（显示/擦除）光标格
     let blinkOnlyRedraw = false;
-    const blinkVisible: boolean = cursorVisibleAt(Date.now(), this.appearance.cursorBlink,
-      CURSOR_BLINK_PERIOD_MS);
+    const blinking: boolean = this.effectiveCursorBlink();
+    const blinkVisible: boolean = !blinking ||
+      cursorVisibleAt(now - this.blinkEpoch, true, CURSOR_BLINK_PERIOD_MS);
     if (!this.needsFullRedraw && revision === this.lastRenderedRevision) {
-      const blinkStable: boolean = !this.appearance.cursorBlink ||
-        blinkVisible === this.lastCursorBlinkVisible;
+      // 光标隐藏（DECTCEM off）或回滚视图中（不画光标）时，相位翻转无可见变化
+      const blinkStable: boolean = !blinking || !this.lastFrameCursorVisible ||
+        this.scrollOffsetLines > 0 || blinkVisible === this.lastCursorBlinkVisible;
       if (blinkStable) {
-        return false; // 无变化：整帧跳过（静止省电第一层）
+        return this.fling.running; // 无变化：整帧跳过；惯性中保持调度器清醒
       }
       // 相位翻转：只重绘光标所在行（block 反色需还原本体字符，脏行位图无此标记）
       blinkOnlyRedraw = true;
@@ -1256,22 +2144,15 @@ export struct TerminalCanvas {
     if (frame === null) {
       return false;
     }
-    // T9：帧元信息缓存（手势处理按最近一帧决策）；回滚量变化时同步钳制偏移
-    this.lastAltScreen = frame.altScreen;
-    this.lastMouseMode = frame.mouseMode;
-    this.mouseReportingActive = frame.mouseMode !== 0;
-    this.lastScrollbackCount = Math.max(0, frame.scrollbackTotal - frame.scrollbackOldest);
-    if (this.scrollOffsetLines > this.lastScrollbackCount) {
-      this.scrollOffsetLines = this.lastScrollbackCount;
-      this.needsFullRedraw = true;
-    }
+    this.ingestFrame(frame);
     if (this.scrollOffsetLines > 0) {
-      // T9 回滚视图：整窗重绘「回滚+主屏」拼接窗口（首版简化，见头注）。
-      // 不 endFrame（脏位图保留，回到底部后由正常路径消费清位）；
-      // 不画光标（光标在主屏，视口内无意义）。revision/尺寸照常记账——
-      // 否则 needsFullRedraw 滞留会让回滚期间每个 vsync 都整窗重绘；
-      // 远端新输出改变 revision 时仍会触发本分支重绘（视口锚定底部惯例）
+      // T9 回滚视图：整窗重绘「回滚+主屏」拼接窗口。不 endFrame（脏位图保留，
+      // 回到底部后由正常路径消费清位）；不画光标。revision/尺寸照常记账——
+      // 否则 needsFullRedraw 滞留会让回滚期间每个 vsync 都整窗重绘
       this.paintScrolledWindow(frame);
+      if (this.selection.selecting) {
+        this.paintSelectionOverlay(frame);
+      }
       this.lastRenderedRevision = frame.revision;
       this.lastGridCols = frame.cols;
       this.lastGridRows = frame.rows;
@@ -1335,9 +2216,11 @@ export struct TerminalCanvas {
     for (const range of ranges) {
       const count = range.end - range.start;
       this.invalidateCtxStyleCache();
-    ctx.fillStyle = this.backgroundArgb;
-      ctx.fillRect(0, env.originY + range.start * env.cellHeight, this.areaWidthVp,
-        count * env.cellHeight);
+      ctx.fillStyle = this.backgroundArgb;
+      // 清底与行背景用同一套像素吸附坐标：相邻区间之间不留缝、不叠色
+      const y0: number = cellTopY(env, range.start);
+      const y1: number = range.end >= frame.rows ? this.areaHeightVp : cellTopY(env, range.end);
+      ctx.fillRect(0, y0, this.areaWidthVp, y1 - y0);
       const view = this.terminal?.readRows(frame, range.start, count);
       if (view === null || view === undefined) {
         continue;
@@ -1349,18 +2232,32 @@ export struct TerminalCanvas {
   /**
    * 光标：画在行内容之后。光标移动时 native 已把新旧光标行标脏（T1 onMoveCursor），
    * 所以旧位置的反色块会被脏行重绘自然覆盖，这里只管画当前位置。
+   * 非聚焦窗格画空心框（一眼看出哪个窗格在接收输入）。
    */
   private paintCursor(frame: NativeTerminalFrame): void {
     if (frame.cursorRow < 0 || frame.cursorRow >= frame.rows ||
       frame.cursorCol < 0 || frame.cursorCol >= frame.cols) {
       return;
     }
-    const style = this.appearance.cursorStyle;
+    const env = this.renderEnv();
+    if (!this.paneFocused) {
+      const x0: number = cellLeftX(env, frame.cursorCol);
+      const y0: number = cellTopY(env, frame.cursorRow);
+      const w: number = cellLeftX(env, frame.cursorCol + 1) - x0;
+      const h: number = cellTopY(env, frame.cursorRow + 1) - y0;
+      const half: number = HOLLOW_CURSOR_LINE_VP / 2;
+      this.invalidateCtxStyleCache();
+      this.context.strokeStyle = this.cursorArgb;
+      this.context.lineWidth = HOLLOW_CURSOR_LINE_VP;
+      this.context.strokeRect(x0 + half, y0 + half, w - HOLLOW_CURSOR_LINE_VP, h - HOLLOW_CURSOR_LINE_VP);
+      return;
+    }
+    const style = this.effectiveCursorStyle();
     const view = style === 'block'
       ? this.terminal?.readRows(frame, frame.cursorRow, 1) ?? null
       : null;
     this.execCommands(generateCursorCommands(style, view, frame.cursorCol, frame.cursorRow,
-      frame.cols, this.renderEnv(), this.cursorArgb));
+      frame.cols, env, this.cursorArgb));
   }
 
   /** 执行绘制指令：先背景后文本；underline/strike 用 fillRect 画线 */
@@ -1403,13 +2300,18 @@ export struct TerminalCanvas {
   private onCanvasReady(): void {
     // onReady 在初始化完成与尺寸变化时触发，且触发时画布已被清空（官方文档语义）
     this.canvasReady = true;
+    try {
+      this.pixelRatio = this.getUIContext().vp2px(1);
+    } catch (_err) {
+      this.pixelRatio = 0; // 读不到像素比：不吸附（旧行为）
+    }
     this.invalidateCtxStyleCache();
     this.measureCells();
     this.relayout();
     this.needsFullRedraw = true;
     FrameScheduler.get().wakeup();
     if (this.autoFocus) {
-      this.scheduleInputFocus();
+      this.scheduleInputFocus(true);
     }
   }
 
@@ -1438,7 +2340,19 @@ export struct TerminalCanvas {
     // T8/T9：旧终端的选择会话与回滚偏移一并作废（网格语义已不属于新终端）
     this.exitSelectionMode();
     this.clickTracker.reset();
+    this.fling.stop();
     this.scrollOffsetLines = 0;
+    this.scrolledBack = false;
+    this.newOutputBadge = false;
+    this.lastScrollbackTotal = -1;
+    this.lastScrollbackOldest = 0;
+    this.lastScrollbackEpoch = 0;
+    this.frameAppCursorKnown = false;
+    this.frameAppCursor = false;
+    this.frameBracketedPaste = false;
+    this.frameCursorShape = 0;
+    this.frameCursorBlink = -1;
+    this.imeEcho.clear();
     this.lastAltScreen = false;
     this.lastMouseMode = 0;
     this.mouseReportingActive = false;
@@ -1461,11 +2375,12 @@ export struct TerminalCanvas {
   }
 
   /**
-   * A3 闪烁唤醒定时器：cursorBlink 开启时每半周期 FrameScheduler.wakeup()，
-   * 避免「无输出 → 自动休眠」吞掉相位翻转。关闭/卸载时清除，静止 CPU≈0。
+   * A3 闪烁唤醒定时器：仅当「有效闪烁」（DECSCUSR/外观开启 + 窗格聚焦 + 可见）时
+   * 每半周期 FrameScheduler.wakeup()，避免自动休眠吞掉相位翻转；其余情况一律停掉，
+   * 后台标签/非聚焦窗格/隐藏页面静止 CPU≈0。
    */
   private syncBlinkWakeTimer(): void {
-    if (!this.appearance.cursorBlink) {
+    if (!this.effectiveCursorBlink()) {
       this.clearBlinkWakeTimer();
       return;
     }
@@ -1487,6 +2402,14 @@ export struct TerminalCanvas {
 
   private onVisibleChanged(): void {
     FrameScheduler.get().setVisible(this.schedulerId, this.visible);
+    if (!this.visible) {
+      this.fling.stop();
+      this.stopEdgeScroll();
+    } else {
+      this.needsFullRedraw = true;
+      FrameScheduler.get().wakeup();
+    }
+    this.syncBlinkWakeTimer();
   }
 
   private onAutoResizeTerminalChanged(): void {
@@ -1497,19 +2420,22 @@ export struct TerminalCanvas {
 
   private onAutoFocusChanged(): void {
     if (this.autoFocus) {
-      this.scheduleInputFocus();
+      this.scheduleInputFocus(true);
     }
   }
 
-  /** 等隐藏 TextInput 完成挂载后再请求焦点；标签/窗格切换也复用同一路径。 */
-  private scheduleInputFocus(): void {
+  /**
+   * 等输入承接方（自绘编辑器：容器 Stack；兜底：隐藏 TextInput）挂载后再请求焦点；
+   * 标签/窗格切换也复用同一路径。外接键盘活跃时只聚焦不弹软键盘。
+   */
+  private scheduleInputFocus(showKeyboard: boolean): void {
     if (this.inputFocusTimer >= 0) {
       clearTimeout(this.inputFocusTimer);
     }
     this.inputFocusTimer = setTimeout((): void => {
       this.inputFocusTimer = -1;
       if (this.autoFocus && this.visible && this.isInputTarget()) {
-        focusControl.requestFocus(this.imeSinkId);
+        this.requestInput(showKeyboard && shouldShowSoftKeyboardOnTouch(this.externalKeyboardActive));
       }
     }, 32);
   }
@@ -1640,8 +2566,11 @@ export struct TerminalCanvas {
     }
     this.notifiedCols = metrics.cols;
     this.notifiedRows = metrics.rows;
-    // T9：网格尺寸变化后回滚窗口的绝对行号语义失效，回到底部（resize 自愈）
-    this.scrollOffsetLines = 0;
+    // T9：网格尺寸变化（列变化会触发 native reflow）后视口/选区的行号语义失效：
+    // 回到底部、退出选择（resize 自愈）
+    this.fling.stop();
+    this.exitSelectionMode();
+    this.setScrollOffset(0);
     this.onGridSizeChanged(metrics.cols, metrics.rows);
     this.pendingTerminalResize = true;
     this.flushPendingTerminalResize();
@@ -1668,7 +2597,9 @@ export struct TerminalCanvas {
       paletteArgb: this.paletteArgb,
       boldAsBright: this.appearance.boldAsBright,
       // 字间距 ≠ 0 时合并字符串会丢间距对齐，退化为逐格一条
-      perGlyphText: this.appearance.letterSpacing !== 0
+      perGlyphText: this.appearance.letterSpacing !== 0,
+      // 矩形边吸附物理像素：分数 vp 行高下行间不再出现细缝/叠色
+      pixelRatio: this.pixelRatio
     };
   }
 
@@ -1767,6 +2698,21 @@ export struct TerminalCanvas {
     )
   }
 
+  /** 气泡菜单单项（≥40vp 高、56vp 宽的触摸目标） */
+  @Builder
+  MenuItem(label: string, action: () => void) {
+    Text(label)
+      .fontSize(Tokens.fontSize.caption)
+      .fontColor(Tokens.Color.appBg)
+      .textAlign(TextAlign.Center)
+      .width(MENU_ITEM_WIDTH_VP)
+      .height(MENU_HEIGHT_VP)
+      .accessibilityText(label)
+      .onClick(() => {
+        action();
+      })
+  }
+
   build() {
     Stack() {
       Canvas(this.context)
@@ -1774,67 +2720,135 @@ export struct TerminalCanvas {
         .height('100%')
         .padding(0)
         .backgroundColor(this.appearance.background)
+        // 捏合预览：只缩放画面（左上角为原点，与松手后重排的网格原点一致）
+        .scale({ x: this.pinchScale, y: this.pinchScale, centerX: 0, centerY: 0 })
         .onReady(() => {
           this.onCanvasReady();
         })
         .onAreaChange((oldArea: Area, newArea: Area) => {
           this.onCanvasAreaChange(oldArea, newArea);
         })
-      // 隐藏 IME 承接框（T6）：1vp 近全透明、不拦截触摸，物理键 IME 前拦截
-      ImeInputSink({
-        sinkId: this.imeSinkId,
-        autoFocus: this.autoFocus,
-        onDelta: this.onImeDelta,
-        onInterceptKey: this.onImeInterceptKey,
-        // T10：外接键盘活跃时不弹软键盘（PhysicalKeyboard 策略）
-        enableSoftKeyboardOnFocus: !this.externalKeyboardActive
-      })
-      // T8 气泡菜单（选择模式下；「粘贴/分享」归 U4）：复制 / 全选
+      if (!this.useCustomIme) {
+        // 兜底通路：隐藏 IME 承接框（自绘编辑器 attach 失败时才挂载）
+        ImeInputSink({
+          sinkId: this.imeSinkId,
+          autoFocus: this.autoFocus,
+          onDelta: this.onImeDelta,
+          onEnter: this.onImeEnter,
+          onInterceptKey: this.onImeInterceptKey,
+          // T10：外接键盘活跃时不弹软键盘（PhysicalKeyboard 策略）
+          enableSoftKeyboardOnFocus: !this.externalKeyboardActive
+        })
+      }
+      // 视觉响铃薄膜（不拦截触摸）
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.appearance.foreground)
+        .opacity(this.bellFlashOpacity)
+        .animation({ duration: BELL_FLASH_MS, curve: Curve.EaseOut })
+        .hitTestBehavior(HitTestMode.None)
+      // T8 气泡菜单：复制 / 粘贴 / 全选 /（选中内容是链接时）打开链接
       if (this.selectionMenuVisible) {
-        Row({ space: MENU_GAP_VP * 2 }) {
-          Text('复制')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.appBg)
-            .padding({
-              left: Tokens.space.md, right: Tokens.space.md,
-              top: Tokens.space.xs, bottom: Tokens.space.xs
+        Row() {
+          this.MenuItem('复制', (): void => {
+            this.copySelection();
+          })
+          this.MenuItem('粘贴', (): void => {
+            this.pasteFromMenu();
+          })
+          this.MenuItem('全选', (): void => {
+            this.selectAllBuffer();
+          })
+          if (this.selectionUrl.length > 0) {
+            this.MenuItem('打开链接', (): void => {
+              this.openSelectionUrl();
             })
-            .onClick(() => {
-              this.copySelection();
-            })
-          Text('全选')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.appBg)
-            .padding({
-              left: Tokens.space.md, right: Tokens.space.md,
-              top: Tokens.space.xs, bottom: Tokens.space.xs
-            })
-            .onClick(() => {
-              this.selectAllOnScreen();
-            })
+          }
         }
         .height(MENU_HEIGHT_VP)
-        .padding({ left: Tokens.space.xs, right: Tokens.space.xs })
+        .padding({ left: MENU_SIDE_PADDING_VP, right: MENU_SIDE_PADDING_VP })
         .backgroundColor(Tokens.Color.accent)
         .borderRadius(Tokens.radius.md)
+        .shadow({ radius: 8, color: '#40000000', offsetY: 2 })
         .position({ x: this.selectionMenuX, y: this.selectionMenuY })
-        .zIndex(2)
+        .zIndex(4)
       }
       if (this.selectionHandlesVisible) {
         this.SelectionStartHandle()
         this.SelectionEndHandle()
       }
+      // 捏合字号标签
+      if (this.pinchLabel.length > 0) {
+        Text(`${this.pinchLabel} pt`)
+          .fontSize(Tokens.fontSize.body)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.accent)
+          .borderRadius(Tokens.radius.md)
+          .padding({ left: Tokens.space.md, right: Tokens.space.md, top: Tokens.space.xs, bottom: Tokens.space.xs })
+          .hitTestBehavior(HitTestMode.None)
+          .zIndex(5)
+      }
+      // 回滚中：「新输出」角标 + 回到底部按钮
+      if (this.scrolledBack) {
+        Column({ space: Tokens.space.xs }) {
+          if (this.newOutputBadge) {
+            Text('有新输出')
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(Tokens.Color.onAccent)
+              .backgroundColor(Tokens.Color.accent)
+              .borderRadius(Tokens.radius.md)
+              .padding({ left: Tokens.space.sm, right: Tokens.space.sm, top: 2, bottom: 2 })
+          }
+          Button() {
+            Text('↓')
+              .fontSize(20)
+              .fontColor(Tokens.Color.onAccent)
+          }
+          .type(ButtonType.Circle)
+          .width(JUMP_BUTTON_VP)
+          .height(JUMP_BUTTON_VP)
+          .backgroundColor(Tokens.Color.accent)
+          .shadow({ radius: 8, color: '#40000000', offsetY: 2 })
+          .accessibilityText('回到底部')
+          .onClick(() => {
+            this.scrollToBottom();
+          })
+        }
+        .alignItems(HorizontalAlign.End)
+        .position({ right: Tokens.space.md, bottom: Tokens.space.md })
+        .zIndex(4)
+      }
     }
+    .id(this.hostId)
     .width('100%')
     .height('100%')
     .padding(0)
+    .clip(true)
     .backgroundColor(this.appearance.background)
-    // T8/T9 触摸手势：互斥识别（先识别到的胜出，其余取消）——
-    // 快速点按 = 聚焦/退出选择（TapGesture，替代 onClick：长按后的抬指
-    // 不会再误触发点击）；按住不动 = 进入选择；直接拖动 = 滚动/拖选；
-    // 双指 = 捏合缩放。长按后的同指拖动被互斥取消，调整选区请抬手再拖。
+    // 自绘编辑器通路：容器自身获焦承接物理键（兜底通路由隐藏 TextInput 获焦）
+    .focusable(true)
+    .focusOnTouch(false)
+    .defaultFocus(this.autoFocus && this.useCustomIme)
+    .accessibilityText('终端')
+    // T8/T9 触摸手势：互斥识别（先识别到的胜出，其余取消）——捏合排最前，两指
+    // 落下时不会被单指拖动抢走；快速点按 = 聚焦/退出选择/停惯性；按住不动 =
+    // 进入选择（链接上直接选中整条）；直接拖动 = 滚动/拖选（松手惯性）。
     .gesture(
       GestureGroup(GestureMode.Exclusive,
+        PinchGesture({ fingers: 2 })
+          .onActionStart(() => {
+            this.onPinchStart();
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.onPinchUpdate(event);
+          })
+          .onActionEnd(() => {
+            this.onPinchEnd();
+          })
+          .onActionCancel(() => {
+            this.onPinchCancel();
+          }),
         LongPressGesture({ fingers: 1, duration: LONG_PRESS_DURATION_MS })
           .onAction((event: GestureEvent) => {
             this.onLongPressSelect(event);
@@ -1843,38 +2857,34 @@ export struct TerminalCanvas {
           .onActionStart(() => {
             this.panLastOffsetY = 0;
             this.scrollAccumulator.reset();
+            this.fling.stop();
           })
           .onActionUpdate((event: GestureEvent) => {
             this.onPanUpdate(event);
           })
-          .onActionEnd(() => {
+          .onActionEnd((event: GestureEvent) => {
+            this.onPanEnd(event);
+          })
+          .onActionCancel(() => {
             this.scrollAccumulator.reset();
-          }),
-        PinchGesture({ fingers: 2 })
-          .onActionStart(() => {
-            this.pinchBaseFontSize = this.appearance.fontSize;
-          })
-          .onActionUpdate((event: GestureEvent) => {
-            this.onPinchUpdate(event);
-          })
-          .onActionEnd(() => {
-            this.onPinchEnd();
+            this.stopEdgeScroll();
           }),
         TapGesture()
-          .onAction(() => {
-            this.onPaneClick();
+          .onAction((event: GestureEvent) => {
+            this.onPaneClick(event);
           })
       )
     )
+    .onAxisEvent((event: AxisEvent): void => {
+      this.onAxis(event);
+    })
     .onMouse((event: MouseEvent): void => {
       // T11：鼠标/触控板（2in1）。frame.mouseMode≠0 时按 SGR 1006 转发；
       // mouseMode=0 时只更新最近格子（双击选词定位用），不改变触摸语义。
-      // TODO(T11 真机)：滚轮字段在部分 SDK 版本的 MouseEvent 上不完整——
-      //   若 event 可读 wheelDelta/scrollDown，在此调 encodeSgrWheel；
-      //   触控板两指滚动已走 pan → buildAltScrollSequences('mouse')。
       const actionName: string = `${event.action}`;
-      this.lastMouseCol1 = this.gridPosFromPoint(event.x, event.y).col + 1;
-      this.lastMouseRow1 = this.gridPosFromPoint(event.x, event.y).row + 1;
+      const pos: CellPos = this.gridPosFromPoint(event.x, event.y);
+      this.lastMouseCol1 = pos.col + 1;
+      this.lastMouseRow1 = pos.row + 1;
       if (actionName.indexOf('Hover') >= 0 || actionName.indexOf('hover') >= 0) {
         // 悬停：仅 mode≥3（任意移动）时转发
         this.onMouseEventReport('Move', -1, event.x, event.y);
@@ -1882,9 +2892,13 @@ export struct TerminalCanvas {
       }
       this.onMouseEventReport(actionName, event.button as number, event.x, event.y);
     })
+    .onKeyPreIme((event: KeyEvent): boolean => {
+      // 自绘编辑器通路：只截 Ctrl/Alt 组合（规则见 shouldInterceptBeforeIme）
+      return this.useCustomIme ? this.handleKeyInput(event, true) : false;
+    })
     .onKeyEvent((event: KeyEvent): boolean => {
-      // 容器自身获焦时的物理键盘通路（API 15 起返回值可拦截冒泡）；
-      // 子组件（ImeInputSink）获焦时按键先经其 onKeyPreIme，此处不再重复
+      // 输入法不消费后的物理键通路（API 15 起返回值可拦截冒泡）；兜底通路下
+      // 子组件（ImeInputSink）获焦时按键先经其 onKeyPreIme
       return this.handleKeyInput(event, false);
     })
   }
