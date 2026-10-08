@@ -24,125 +24,43 @@
  *     若不上报则退化为候选字母直发（可接受降级，不丢字不错字）；
  *   - onKeyPreIme 对 F1–F12/方向键的拦截率（不同外接键盘）。
  */
-import { mapPrintableChar, utf8Bytes } from './KeyMap';
-import { StickySnapshot } from './StickyModifiers';
+import {
+  CommittedDelta,
+  IME_BUFFER_RESET_THRESHOLD,
+  IME_SENTINEL,
+  extractCommittedDelta,
+  sentinelDeleted,
+  stripImeSentinel
+} from './ImeInputLogic';
 
-const DEL = 0x7F;
-const ESC = 0x1B;
-/** 隐藏 TextInput 的已提交文本上限；到阈值即清空，避免长会话 diff 退化。 */
-export const IME_BUFFER_RESET_THRESHOLD = 64;
+export {
+  CommittedDelta,
+  IME_BUFFER_RESET_THRESHOLD,
+  IME_SENTINEL,
+  committedDeltaToInputBytes,
+  extractCommittedDelta,
+  imeDeleteLeftToBytes,
+  imeDeleteRightToBytes,
+  imeEnterBytes,
+  imeInsertToBytes,
+  imeMoveCursorToBytes,
+  normalizeImeText,
+  sentinelDeleted,
+  stripImeSentinel,
+  ImeEchoContext
+} from './ImeInputLogic';
 
-/** IME 一次提交的内容增量（extractCommittedDelta 输出） */
-export interface CommittedDelta {
-  /** 新增文本（可能为空串，如纯退格） */
-  text: string;
-  /** 删除的字符数（按码点计；0 = 无删除） */
-  backspaces: number;
-}
-
-/** 字符串码点数（退格按字符计，代理对如 emoji 只算 1 次）。不用 Array.from：ArkTS 下对代理对可能按 UTF-16 单元拆开。 */
-function codePointCount(s: string): number {
-  let n = 0;
-  let i = 0;
-  while (i < s.length) {
-    const code = s.charCodeAt(i);
-    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < s.length) {
-      const next = s.charCodeAt(i + 1);
-      if (next >= 0xDC00 && next <= 0xDFFF) {
-        i += 2;
-        n++;
-        continue;
-      }
-    }
-    i++;
-    n++;
-  }
-  return n;
-}
+// ---------------------------------------------------------------- 组件粘合（兜底通路）
 
 /**
- * 由 onChange 的前后两个完整值 diff 出提交增量：
- *   最长公共前缀之后，prev 的剩余部分 = 被删除（\x7F×码点数），
- *   curr 的剩余部分 = 新增文本。隐藏输入框内无可见光标，编辑恒发生在尾部，
- *   前缀 diff 足够；中间编辑（拖动光标改字）也会按「删尾+补尾」等价处理。
+ * 隐藏 IME 承接输入框（兜底通路：inputMethod 自绘编辑器 attach 失败时才挂载）。
+ * 1vp×1vp、近全透明、不拦截触摸；每个终端窗格一个实例，点击窗格时 requestFocus。
  *
- * @param previewActive 候选期标志（previewText.value 非空）：候选期返回 null
- *   且不视为提交——候选中的拼音字母绝不发给通道（DESIGN §4.4 验收标准）。
- * 返回 null = 无可提交内容（含前后值一致）。
- */
-export function extractCommittedDelta(prev: string, curr: string,
-  previewActive: boolean): CommittedDelta | null {
-  if (previewActive) {
-    return null;
-  }
-  let prefix = 0;
-  const limit = Math.min(prev.length, curr.length);
-  while (prefix < limit && prev.charCodeAt(prefix) === curr.charCodeAt(prefix)) {
-    prefix++;
-  }
-  const backspaces = codePointCount(prev.substring(prefix));
-  const text = curr.substring(prefix);
-  if (backspaces === 0 && text.length === 0) {
-    return null;
-  }
-  return { text, backspaces };
-}
-
-/**
- * 增量 → VT 字节（null = 本次不发送，如 Ctrl+未定义字符）：
- *   - 退格：0x7F×n；粘滞 Alt 生效时整体加一次 ESC 前缀
- *     （readline backward-kill-word 惯例）；
- *   - 单字符文本 + 粘滞 Ctrl/Alt：走 mapPrintableChar（Ctrl+C → 0x03、
- *     Alt+B → \x1Bb）；Ctrl+未定义字符返回 null 不发送；
- *   - 多字符文本（中文整词上屏等）：整串 UTF-8，粘滞修饰不施加
- *     （IME 整词提交无单键修饰语义）；退格与新增混合时两段各自按
- *     上述规则处理（单字符新增照常施加粘滞修饰）。
- */
-export function committedDeltaToInputBytes(delta: CommittedDelta,
-  sticky: StickySnapshot): Uint8Array | null {
-  if (delta.backspaces === 0 && delta.text.length === 0) {
-    return null;
-  }
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  const push = (part: Uint8Array): void => {
-    parts.push(part);
-    total += part.length;
-  };
-  if (delta.backspaces > 0) {
-    const bs = new Uint8Array(delta.backspaces);
-    bs.fill(DEL);
-    if (sticky.alt) {
-      push(new Uint8Array([ESC]));
-    }
-    push(bs);
-  }
-  if (delta.text.length > 0) {
-    const singleChar = codePointCount(delta.text) === 1;
-    if (singleChar && (sticky.ctrl || sticky.alt)) {
-      const mapped = mapPrintableChar(delta.text, sticky.alt, sticky.ctrl);
-      if (mapped === null) {
-        return null; // Ctrl+未定义字符：整次不发送（退格部分也不发，保持原子）
-      }
-      push(mapped);
-    } else {
-      push(utf8Bytes(delta.text));
-    }
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------- 组件粘合
-
-/**
- * 隐藏 IME 承接输入框（1vp×1vp、近全透明、不拦截触摸）。
- * 每个终端窗格一个实例；点击窗格时 requestFocus() 弹起软键盘。
+ * 相比旧实现补齐的体验缺口：
+ *  - 零宽哨兵：缓冲恒以 IME_SENTINEL 开头，空缓冲上的退格也能识别并发 0x7F；
+ *  - onSubmit：软键盘回车键发 CR，且 keepEditableState 保持键盘不收起；
+ *  - 候选期保护：composition（previewText 非空）期间 onKeyPreIme 一律放行，
+ *    物理键盘中文输入时不会把候选用的方向/退格键截给远端。
  */
 @Component
 export struct ImeInputSink {
@@ -152,6 +70,8 @@ export struct ImeInputSink {
   autoFocus: boolean = false;
   /** 提交增量回调（宿主负责：粘滞修饰 → 字节 → 按焦点路由写入通道） */
   onDelta: (delta: CommittedDelta) => void = () => {};
+  /** 软键盘回车（onSubmit）回调：宿主发 CR */
+  onEnter: () => void = () => {};
   /**
    * IME 前物理键拦截（API 12+ onKeyPreIme）：宿主实现「方向/功能/Ctrl 组合
    * 消费映射，可打印键放行」；返回 true 表示已消费不再进 IME
@@ -160,15 +80,16 @@ export struct ImeInputSink {
   /**
    * T10：外接键盘活跃时置 false——聚焦本承接框**不**拉起软键盘
    * （enableKeyboardOnFocus=false；物理键仍经 onKeyPreIme 进宿主）。
-   * 默认 true 保持移动端 IME 原路径。@Prop：宿主 T10 抑制状态变更时跟随重建。
    */
   @Prop enableSoftKeyboardOnFocus: boolean = true;
 
   private controller: TextInputController = new TextInputController();
-  /** 上次已提交基线（候选期不更新，见头注） */
+  /** 绑定到 TextInput 的值（恒含哨兵前缀；重置时整体回写） */
+  @State private value: string = IME_SENTINEL;
+  /** 上次已提交基线（已剥哨兵；候选期不更新，见头注） */
   private lastValue: string = '';
-  /** controller.deleteText 产生的空值 onChange 只同步基线，不转成退格发送。 */
-  private resettingBuffer: boolean = false;
+  /** 候选（composition）进行中 */
+  private composing: boolean = false;
 
   /** 请求软键盘焦点（点击窗格时调用）；id 未配置时静默忽略 */
   requestFocus(): void {
@@ -177,46 +98,64 @@ export struct ImeInputSink {
     }
   }
 
-  private handleChange(value: string, previewText?: PreviewText): void {
-    if (this.resettingBuffer) {
-      this.resettingBuffer = false;
-      if (value.length === 0) {
-        this.lastValue = '';
-        return;
-      }
-      // 少数输入法不回调清空态而直接回调下一字符；从空基线继续正常处理。
-    }
+  private resetBuffer(): void {
+    this.lastValue = '';
+    this.value = IME_SENTINEL;
+    this.controller.caretPosition(IME_SENTINEL.length);
+  }
+
+  private handleChange(raw: string, previewText?: PreviewText): void {
     const previewActive = previewText !== undefined && previewText.value.length > 0;
-    const delta = extractCommittedDelta(this.lastValue, value, previewActive);
-    if (!previewActive) {
-      this.lastValue = value;
+    this.composing = previewActive;
+    if (previewActive) {
+      return; // 候选期：不发送、不更新基线（中文上屏后整体 diff 一次）
     }
+    const deletedSentinel: boolean = sentinelDeleted(raw);
+    const curr: string = stripImeSentinel(raw);
+    const delta = extractCommittedDelta(this.lastValue, curr, false);
+    this.lastValue = curr;
     if (delta !== null) {
       this.onDelta(delta);
+    } else if (deletedSentinel && curr.length === 0) {
+      // 空缓冲上的退格：删的是哨兵本身
+      this.onDelta({ text: '', backspaces: 1 });
     }
-    if (!previewActive && value.length >= IME_BUFFER_RESET_THRESHOLD) {
-      // 只在候选提交结束后清理，绝不打断中文 composition。先清逻辑基线，再删
-      // TextInput 内容；随后产生的 value='' 回调由 resettingBuffer 吞掉。
-      this.lastValue = '';
-      this.resettingBuffer = true;
-      this.controller.deleteText({ start: 0, end: value.length });
+    if (deletedSentinel || curr.length >= IME_BUFFER_RESET_THRESHOLD) {
+      // 只在候选提交结束后重置，绝不打断中文 composition
+      this.resetBuffer();
+    } else {
+      this.value = raw;
     }
   }
 
   build() {
-    TextInput({ controller: this.controller })
+    TextInput({ text: this.value, controller: this.controller })
       .id(this.sinkId)
       .width(1) // 隐藏承接框：尺寸/透明约定见文件头注
       .height(1)
       .opacity(0.01) // 保持 focusable 的最小可见度（0 会被渲染管线裁掉）
       .showUnderline(false)
+      .caretColor(Color.Transparent)
+      .enterKeyType(EnterKeyType.Send)
+      .enableAutoFill(false)
       .enableKeyboardOnFocus(this.enableSoftKeyboardOnFocus)
       .defaultFocus(this.autoFocus)
       .hitTestBehavior(HitTestMode.None) // 永不拦截触摸，点击全归终端画布
+      .accessibilityText('终端输入')
       .onChange((value: string, previewText?: PreviewText) => {
         this.handleChange(value, previewText);
       })
+      .onSubmit((_enterKey: EnterKeyType, event?: SubmitEvent) => {
+        // 回车 = CR；keepEditableState 让软键盘保持弹出（连续敲命令不闪键盘）
+        if (event !== undefined) {
+          event.keepEditableState();
+        }
+        this.onEnter();
+      })
       .onKeyPreIme((event: KeyEvent): boolean => {
+        if (this.composing) {
+          return false; // 候选中：方向/退格/回车都属于输入法
+        }
         return this.onInterceptKey(event);
       })
   }
