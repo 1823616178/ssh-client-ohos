@@ -53,6 +53,13 @@ inline constexpr uint16_t kAttrStrike    = 1u << 5;
 inline constexpr uint16_t kAttrDim       = 1u << 6;
 inline constexpr uint16_t kAttrWide      = 1u << 7; // 宽字符首格
 
+// reserved 字段（偏移 14 的 u16）位定义。
+// kReservedWrapsNext 只在「行末格」（col = cols-1）有意义：本行是软换行（autowrap），
+// 逻辑上续接下一行。网格行由 VtermBridge 每次 feed/resize 后按 libvterm lineinfo
+// 同步；回滚行在 sb_pushline 时写入、reflow 时重算。ArkTS 复制选区据此决定
+// 行间是否插入换行（wrap-aware copy），也是回滚 reflow 的分组依据。
+inline constexpr uint16_t kReservedWrapsNext = 1u << 0;
+
 struct Cell {
     uint32_t codepoint; // 偏移 0：Unicode 码点；0 = 空；kWideContinuation = 宽字符续格
     uint32_t fgArgb;    // 偏移 4：前景色 ARGB

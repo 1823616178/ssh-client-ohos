@@ -19,7 +19,7 @@ ScrollbackBuffer::ScrollbackBuffer(int cols, size_t capacity)
     cells_.assign(capacity_ * static_cast<size_t>(cols_), Cell{});
 }
 
-void ScrollbackBuffer::pushLine(const Cell *cells, size_t count)
+void ScrollbackBuffer::pushLine(const Cell *cells, size_t count, bool wrapsNext)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     Cell *slot = &cells_[slotOf(totalPushed_) * static_cast<size_t>(cols_)];
@@ -28,6 +28,9 @@ void ScrollbackBuffer::pushLine(const Cell *cells, size_t count)
     // 防御性补空（正常路径 count == cols_）：零值 Cell，codepoint 0 = 空
     for (size_t c = n; c < static_cast<size_t>(cols_); ++c)
         slot[c] = Cell{};
+    Cell &last = slot[static_cast<size_t>(cols_) - 1];
+    last.reserved = static_cast<uint16_t>((last.reserved & ~kReservedWrapsNext) |
+                                          (wrapsNext ? kReservedWrapsNext : 0));
 
     ++totalPushed_;
     if (size_ < capacity_)
@@ -97,6 +100,7 @@ bool ScrollbackBuffer::popLine(Cell *out)
 void ScrollbackBuffer::clear()
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++epoch_;
     size_ = 0; // totalPushed_ 不动：窗口 [totalPushed_, totalPushed_) 为空，序号保持单调
 }
 
@@ -118,6 +122,125 @@ void ScrollbackBuffer::resizeCols(int newCols, const Cell &blank)
     }
     cells_ = std::move(next);
     cols_ = newCols;
+}
+
+namespace {
+
+// 逻辑行末尾的「空白」：码点 0（擦除态）且无反显（反显空格肉眼可见，如状态栏色块）。
+// 与 libvterm reflow 的 line_popcount 口径一致（只看码点），额外保留反显格。
+bool isTrailingBlank(const Cell &c)
+{
+    return c.codepoint == 0 && (c.attrs & kAttrReverse) == 0;
+}
+
+// 把一条逻辑行按 cols 折行追加到 out（每行恰好 cols 格，不足补 blank）。
+// 宽字符首格 + 续格作为整体放置：放不下时行尾留空位并折行（同 libvterm 写入语义）。
+// 除最后一段外的每段行末置 kReservedWrapsNext；最后一段继承 tailWraps。
+void appendWrapped(std::vector<Cell> &out, const std::vector<Cell> &logical, size_t cols,
+                   const Cell &blank, bool tailWraps)
+{
+    size_t rowStart = out.size();
+    out.resize(out.size() + cols, blank);
+    size_t col = 0;
+    for (size_t i = 0; i < logical.size(); ++i) {
+        const Cell &c = logical[i];
+        if (c.codepoint == kWideContinuation) {
+            continue; // 孤立续格（首格已随前段裁掉）：丢弃，续格总随首格一起放置
+        }
+        const bool wide = (c.attrs & kAttrWide) != 0 && i + 1 < logical.size() &&
+                          logical[i + 1].codepoint == kWideContinuation;
+        const size_t need = wide ? 2 : 1;
+        if (col + need > cols) {
+            out[rowStart + cols - 1].reserved |= kReservedWrapsNext;
+            rowStart = out.size();
+            out.resize(out.size() + cols, blank);
+            col = 0;
+        }
+        out[rowStart + col] = c;
+        out[rowStart + col].reserved = 0;
+        ++col;
+        if (wide) {
+            out[rowStart + col] = logical[i + 1];
+            out[rowStart + col].reserved = 0;
+            ++col;
+            ++i;
+        }
+    }
+    Cell &last = out[rowStart + cols - 1];
+    last.reserved = static_cast<uint16_t>((last.reserved & ~kReservedWrapsNext) |
+                                          (tailWraps ? kReservedWrapsNext : 0));
+}
+
+} // namespace
+
+void ScrollbackBuffer::reflow(int newCols, const Cell &blank)
+{
+    assert(newCols > 0);
+    if (newCols < 2) {
+        resizeCols(newCols, blank);
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++epoch_;
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (newCols == cols_) {
+        return;
+    }
+    const size_t oc = static_cast<size_t>(cols_);
+    const size_t nc = static_cast<size_t>(newCols);
+    const uint64_t oldest = oldestIndexLocked();
+
+    std::vector<Cell> out;
+    out.reserve(size_ * nc);
+    std::vector<Cell> logical;
+    logical.reserve(oc * 4);
+
+    uint64_t idx = oldest;
+    while (idx < totalPushed_) {
+        logical.clear();
+        bool tailWraps = false;
+        for (;;) {
+            const Cell *row = &cells_[slotOf(idx) * oc];
+            const bool wraps = (row[oc - 1].reserved & kReservedWrapsNext) != 0;
+            const bool hasNext = idx + 1 < totalPushed_;
+            size_t len = oc;
+            if (wraps && hasNext) {
+                // 宽字符放不下行尾时 libvterm 留一个擦除格再折行：拼接时去掉该空位
+                const Cell *next = &cells_[slotOf(idx + 1) * oc];
+                if (row[oc - 1].codepoint == 0 && (next[0].attrs & kAttrWide) != 0) {
+                    len = oc - 1;
+                }
+            } else {
+                while (len > 0 && isTrailingBlank(row[len - 1])) {
+                    --len;
+                }
+            }
+            logical.insert(logical.end(), row, row + len);
+            ++idx;
+            if (!(wraps && hasNext)) {
+                tailWraps = wraps; // 回滚最后一行可能续接屏幕首行：保留标记
+                break;
+            }
+        }
+        appendWrapped(out, logical, nc, blank, tailWraps);
+    }
+
+    const size_t produced = out.size() / nc;
+    const size_t keep = std::min(produced, capacity_);
+    const size_t skip = produced - keep;
+    std::vector<Cell> next(capacity_ * nc, blank);
+    const uint64_t newTotal = oldest + static_cast<uint64_t>(produced);
+    const uint64_t newOldest = newTotal - static_cast<uint64_t>(keep);
+    for (size_t i = 0; i < keep; ++i) {
+        const uint64_t abs = newOldest + static_cast<uint64_t>(i);
+        const size_t slot = static_cast<size_t>(abs % static_cast<uint64_t>(capacity_));
+        std::memcpy(&next[slot * nc], &out[(skip + i) * nc], nc * sizeof(Cell));
+    }
+    cells_ = std::move(next);
+    cols_ = newCols;
+    totalPushed_ = newTotal;
+    size_ = keep;
+    ++epoch_;
 }
 
 } // namespace term

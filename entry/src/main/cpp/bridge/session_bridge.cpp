@@ -159,6 +159,11 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
 {
     auto *ctx = static_cast<TsfnBridge *>(context);
     std::unique_ptr<BridgeEvent> evt(static_cast<BridgeEvent *>(data));
+    // terminalData 合并闩：事件一到 ArkTS 线程就清（先于任何早退分支），
+    // 此后的新输出会再投递一条，保证不丢唤醒
+    if (evt && evt->kind == EventKind::kTerminalData) {
+        AckTerminalDataEvent(evt->terminal);
+    }
     if (ctx != nullptr) {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         ctx->inFlight.erase(evt.get());
@@ -269,6 +274,13 @@ void CallJs(napi_env env, napi_value jsCb, void *context, void *data)
         SetStrProp(env, obj, "type", "terminalMouseMode");
         SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
         SetNumProp(env, obj, "mouseMode", static_cast<double>(evt->number));
+        break;
+    case EventKind::kTerminalModes:
+        // 沿用 ArkTS 既有的 terminalCursorKeys 事件名（T10 预留），附带 bracketedPaste
+        SetStrProp(env, obj, "type", "terminalCursorKeys");
+        SetNumProp(env, obj, "terminal", static_cast<double>(evt->terminal));
+        SetBoolProp(env, obj, "applicationCursorKeys", evt->success);
+        SetBoolProp(env, obj, "bracketedPaste", evt->hasHint);
         break;
     // ---- N14 SFTP 事件（sftp 句柄经 double 传递，2^53 内精确）----
     case EventKind::kSftpOpen:
@@ -507,20 +519,20 @@ void SendStateEvent(SessionHandle *sh, BridgeEvent *evt)
     EnqueueEvent(sh->stateBridge, evt);
 }
 
-void SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt)
+bool SendTerminalDataEvent(SessionHandle *sh, BridgeEvent *evt)
 {
     // 终端字节已直接 feed 到 native vterm，这里只上抛「revision 变了」。
     // data TSFN 有界；满队列时 EnqueueEvent 会释放 evt，已有待消费事件足以唤醒 UI。
     if (sh == nullptr || evt == nullptr) {
         delete evt;
-        return;
+        return false;
     }
     evt->generation = sh->callGuard.generation();
     if (!sh->callGuard.ShouldDeliver(evt->generation)) {
         delete evt;
-        return;
+        return false;
     }
-    EnqueueEvent(sh->dataBridge, evt);
+    return EnqueueEvent(sh->dataBridge, evt);
 }
 
 namespace {

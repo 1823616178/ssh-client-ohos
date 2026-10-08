@@ -12,7 +12,7 @@
  *   不再属于回滚，计数同步 -1，保持有效窗口 = [oldestIndex(), totalPushed())
  *   连续无洞）。clear() 只清有效行数、不动 totalPushed——清空后有效窗口为空，
  *   之后新推入行沿用原序号继续递增。
- * - 行宽跟随屏幕 cols：resize 时由 VtermBridge 调 resizeCols 全量重排
+ * - 行宽跟随屏幕 cols：resize 时由 VtermBridge 调 reflow 按软换行标记重排（rewrap）
  *   （宽改窄截断、窄改宽补空白格）。采用「resize 时一次性重排」而非「查询时按
  *   当前 cols 截断/补空」：定长槽位才能 O(1)，且 resize 是低频操作，
  *   容量 × cols × 16B 级的一次性拷贝可忽略。重排后存量行与新行统一为新宽度，
@@ -66,7 +66,8 @@ public:
 
     // 推入一行到环形尾：拷贝 min(count, cols) 格，不足补零值 Cell（codepoint 0）；
     // count 超过 cols 截断（调用方 bug 的防御，正常路径 count == cols）。O(1)。
-    void pushLine(const Cell *cells, size_t count);
+    // wrapsNext：该行是软换行、续接下一行（写入行末格 reserved 的 kReservedWrapsNext 位）。
+    void pushLine(const Cell *cells, size_t count, bool wrapsNext = false);
 
     // 窗口查询：absoluteIndex ∈ [oldestIndex(), totalPushed())，O(1)。
     // 越界返回 nullptr（定义行为：调用方跨 NAPI，窗口边界探测是正常用法）。
@@ -97,6 +98,17 @@ public:
     // 物理槽位布局不变，absoluteIndex 语义不受影响。blank 由调用方按当前默认色给。
     void resizeCols(int newCols, const Cell &blank);
 
+    // 列宽变化重排（reflow）：按行末 kReservedWrapsNext 把软换行的物理行拼回逻辑行，
+    // 再按 newCols 重新折行（宽字符不跨行：放不下时行尾留空位换行，与 libvterm 一致）。
+    // 逻辑行尾部空白（码点 0 且无反显）裁掉后补 blank。行数变化后有效窗口左端
+    // （oldestIndex）不变、totalPushed 随行数增减；超出容量时丢最老行。
+    // 绝对行号在 reflow 前后不再对应同一内容：epoch() +1 通知上层失效缓存/选区。
+    // newCols < 2 时退化为 resizeCols（无法容纳宽字符）。
+    void reflow(int newCols, const Cell &blank);
+
+    // 内容重排代际：reflow / clear 时 +1（上层据此判断绝对行号是否仍可比）
+    uint64_t epoch() const { std::lock_guard<std::mutex> lock(mutex_); return epoch_; }
+
     // 内部存储字节数：恒等于 capacity × cols × sizeof(Cell)（预分配定长，内存上界）
     size_t storageBytes() const { std::lock_guard<std::mutex> lock(mutex_); return cells_.size() * sizeof(Cell); }
 
@@ -115,6 +127,7 @@ private:
     size_t capacity_;
     size_t size_ = 0;
     uint64_t totalPushed_ = 0;
+    uint64_t epoch_ = 0;
     std::vector<Cell> cells_; // capacity × cols，槽位 = absoluteIndex % capacity
 };
 

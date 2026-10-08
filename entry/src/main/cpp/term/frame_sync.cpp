@@ -24,6 +24,11 @@ void FrameSync::publish(const VtermBridge &vterm)
     next.bellCount = vterm.bellCount();
     next.scrollbackOldest = sb.oldestIndex();
     next.scrollbackTotal = sb.totalPushed();
+    next.scrollbackEpoch = sb.epoch();
+    next.applicationCursorKeys = vterm.applicationCursorKeys();
+    next.bracketedPaste = vterm.bracketedPaste();
+    next.cursorShape = vterm.cursorShapeOverride();
+    next.cursorBlink = vterm.cursorBlinkOverride();
     next.dirty = grid.dirtyBitmap(); // 数十字节拷贝（rows/64 个 u64）
 
     {

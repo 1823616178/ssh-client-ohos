@@ -159,6 +159,7 @@ add_executable(ssh_core_tests
     vterm_screen_test.cpp
     scrollback_test.cpp
     frame_sync_test.cpp
+    terminal_modes_test.cpp
     vault_test.cpp
     vault_ops_test.cpp
     sftp_test.cpp

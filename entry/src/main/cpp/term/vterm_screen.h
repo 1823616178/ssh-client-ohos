@@ -10,6 +10,11 @@
  *   sb_pushline   → 主屏顶出行写入 ScrollbackBuffer（T2，libvterm 仅主屏触发）
  *   sb_popline    → resize 行数增大时从回滚区弹行回填屏幕顶部
  *   sb_clear      → ED 3（CSI 3 J）清空回滚缓冲
+ *   reflow        → vterm_screen_enable_reflow：改列宽时屏幕按软换行重排；回滚缓冲
+ *                   在 onResize 里按行末 kReservedWrapsNext 同步 reflow
+ *   output        → vterm_output_set_callback：DSR/DA 等终端应答经回调回写远端
+ *   模式探测       → 每次 feed 后用 vterm_keyboard_key / start_paste 探测 DECCKM（应用
+ *                   光标键）与 DECSET 2004（括号粘贴），变化时回调上抛
  *   movecursor    → 记录光标位置，新旧光标行标脏，并抬 revision（纯光标移动也要重绘）
  *   settermprop   → 标题/图标名/光标可见性/鼠标模式/alt-screen 等状态记录
  *   bell          → 计数 + 回调上抛（UI 触感）
@@ -80,6 +85,15 @@ public:
     const std::string &title() const { return title_; }
     const std::string &iconName() const { return iconName_; }
     uint64_t bellCount() const { return bellCount_; }
+    // DECCKM（DECSET 1）：方向键是否走 SS3（ESC O A）形式；由 vterm_keyboard_key 探测
+    bool applicationCursorKeys() const { return appCursorKeys_; }
+    // DECSET 2004：远端是否开启括号粘贴；由 vterm_keyboard_start_paste 探测
+    bool bracketedPaste() const { return bracketedPaste_; }
+    // DECSCUSR 光标形状覆盖：0 = 未覆盖（UI 用用户偏好），1 块 / 2 下划线 / 3 竖线。
+    // 「闪烁块」= 终端复位默认态（DECSCUSR 0/1、RIS 都落到它），视为未覆盖。
+    int cursorShapeOverride() const;
+    // DECSCUSR 闪烁覆盖：-1 = 未覆盖，0 = 不闪，1 = 闪
+    int cursorBlinkOverride() const;
 
     // 事件上抛回调（注入点；不注入则只更新内部状态）
     void setTitleCallback(std::function<void(const std::string &)> cb) { titleCallback_ = std::move(cb); }
@@ -87,6 +101,10 @@ public:
     void setBellCallback(std::function<void()> cb) { bellCallback_ = std::move(cb); }
     // T3：鼠标上报模式变更（DECSET 1000/1002/1003 开关）上抛，供 UI 切换手势行为
     void setMouseModeCallback(std::function<void(MouseMode)> cb) { mouseModeCallback_ = std::move(cb); }
+    // 终端应答输出（DSR 光标位置、DA 设备属性等）：feed 内同步触发，调用方转写远端通道
+    void setOutputCallback(std::function<void(const char *, size_t)> cb) { outputCallback_ = std::move(cb); }
+    // DECCKM / 2004 任一变化时上抛（appCursorKeys, bracketedPaste）
+    void setModesCallback(std::function<void(bool, bool)> cb) { modesCallback_ = std::move(cb); }
 
     // 配色注入：16 色调色板（ARGB）；256 扩展色按 xterm 公式推导，不可单独注入
     void setPalette(const std::array<uint32_t, 16> &argb) { palette_ = argb; }
@@ -105,6 +123,12 @@ private:
     static int onSbPushLine(int cols, const VTermScreenCell *cells, void *user);
     static int onSbPopLine(int cols, VTermScreenCell *cells, void *user);
     static int onSbClear(void *user);
+    static void onOutput(const char *s, size_t len, void *user);
+
+    // 网格每行行末格的 kReservedWrapsNext 按 libvterm lineinfo 同步（feed/resize 后）
+    void syncRowWrapFlags();
+    // DECCKM / 2004 探测（feed 后）：输出临时改道到 probeBuf_，不会发往远端
+    void probeModes();
 
     // 把 damage 矩形内的 libvterm 单元格重读进网格
     void convertRect(int startRow, int startCol, int endRow, int endCol);
@@ -117,6 +141,7 @@ private:
 
     VTerm *vt_ = nullptr;
     VTermScreen *screen_ = nullptr;
+    VTermState *state_ = nullptr;
     CellGrid grid_;
     ScrollbackBuffer scrollback_; // 回滚缓冲（T2）；行宽跟随 grid_.cols()
     // sb_pushline 高频路径的转换暂存（cols 格，onResize 同步），避免每次堆分配
@@ -132,6 +157,24 @@ private:
     std::string title_;
     std::string iconName_;
     uint64_t bellCount_ = 0;
+    bool appCursorKeys_ = false;
+    bool bracketedPaste_ = false;
+    int cursorShape_ = VTERM_PROP_CURSORSHAPE_BLOCK;
+    bool cursorBlink_ = true;
+    bool pendingCursorBlink_ = true; // DECSCUSR 先发 BLINK 再发 SHAPE；单独的 DECSET 12 不改形状覆盖
+
+    // resize 期间（vterm_set_size 内）的回滚交互状态：
+    //   resizeWrapSnapshot_ = resize 前主屏各行 lineinfo.continuation（第 r 行是否续接第 r-1 行）；
+    //   resize_buffer 顶出旧行 0..k 时，第 i 次 push 的行是否软换行 = snapshot[i+1]。
+    bool resizing_ = false;
+    int resizeOldCols_ = 0;
+    int resizeNewCols_ = 0;
+    size_t resizePushIndex_ = 0;
+    std::vector<uint8_t> resizeWrapSnapshot_;
+
+    // 输出改道（模式探测期间）
+    bool probing_ = false;
+    std::string probeBuf_;
 
     // 配色
     std::array<uint32_t, 16> palette_{};
@@ -145,6 +188,8 @@ private:
     std::function<void(const std::string &)> iconNameCallback_;
     std::function<void()> bellCallback_;
     std::function<void(MouseMode)> mouseModeCallback_;
+    std::function<void(const char *, size_t)> outputCallback_;
+    std::function<void(bool, bool)> modesCallback_;
 };
 
 } // namespace term
