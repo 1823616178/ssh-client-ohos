@@ -321,7 +321,7 @@ class TestEnv {
   readonly vm: TerminalViewModel;
 
   /** 可传入上一个页面的宿主 / DAO / 寄存处，模拟「返回后从主机列表恢复」 */
-  constructor(host?: FakeSessionHost, dao?: FakeHostDao, parking?: TerminalParkingLot) {
+  constructor(host?: FakeSessionHost, dao?: FakeHostDao, parking?: TerminalParkingLot, mainPaneId?: string) {
     this.host = host ?? new FakeSessionHost();
     this.dao = dao ?? new FakeHostDao();
     const sessionHost: FakeSessionHost = this.host;
@@ -335,6 +335,7 @@ class TestEnv {
       terminalFactory: this.host.factory.factory,
       secretWriter: this.secrets,
       parking: this.parking,
+      mainPaneId: mainPaneId,
       now: (): number => this.clock,
       onBell: (paneId: string): void => {
         this.bellPanes.push(paneId);
@@ -1183,6 +1184,54 @@ export default function terminalViewModelTest() {
       expect(env2.vm.passwordPrompt.visible).assertTrue();
       expect(env2.vm.passwordPrompt.error.indexOf('超时') >= 0).assertTrue();
     });
+    it('迷你窗口就地切换_旧VM detach寄存_新VM以迷你窗格接管同一终端_不新开shell', 0, async () => {
+      const mini: string = 'index-side-terminal';
+      const host: FakeSessionHost = new FakeSessionHost();
+      const dao: FakeHostDao = new FakeHostDao();
+      dao.put(sampleHost('h1'));
+      dao.put(sampleHost('h2'));
+      host.addSession('s-1', 'h1', '主机h1', 'established', 4001);
+      host.addSession('s-2', 'h2', '主机h2', 'established', 4002);
+      const first: TestEnv = new TestEnv(host, dao, undefined, mini);
+      await first.vm.start({ hostId: '', sessionId: 's-1' });
+      const term1: FakeTerminal = host.factory.terminals[0];
+      expect(host.ops.indexOf(`bind:s-1:${mini}`) >= 0).assertTrue();
+      // 切到 s-2：旧 VM 让出 s-1（寄存、解绑、不关闭）
+      first.vm.detach();
+      expect(host.ops.indexOf(`unbind:${mini}:false`) >= 0).assertTrue();
+      expect(host.ops.indexOf('close:s-1')).assertEqual(-1);
+      expect(first.parking.has('s-1')).assertTrue();
+      const second: TestEnv = new TestEnv(host, dao, first.parking, mini);
+      await second.vm.start({ hostId: '', sessionId: 's-2' });
+      expect(host.ops.indexOf(`bind:s-2:${mini}`) >= 0).assertTrue();
+      second.vm.detach();
+      // 切回 s-1：取回同一终端对象，不新 attach
+      const before: number = host.factory.terminals.length;
+      const third: TestEnv = new TestEnv(host, dao, first.parking, mini);
+      await third.vm.start({ hostId: '', sessionId: 's-1' });
+      expect(host.factory.terminals.length).assertEqual(before);
+      expect(third.vm.terminal === term1).assertTrue();
+      expect(term1.detachCount).assertEqual(0);
+      expect(first.parking.has('s-2')).assertTrue();
+    });
+
+    it('等待受理期间detach_会话保留不关闭_dispose则关闭', 0, async () => {
+      const host: FakeSessionHost = new FakeSessionHost();
+      const dao: FakeHostDao = new FakeHostDao();
+      dao.put(sampleHost('h1'));
+      const a: TestEnv = new TestEnv(host, dao);
+      const pendingA: Promise<void> = a.vm.start({ hostId: 'h1', sessionId: '' });
+      a.vm.detach();
+      await pendingA;
+      expect(host.connectCalls.length).assertEqual(1);
+      expect(host.ops.indexOf('close:s-new-1')).assertEqual(-1);
+      const b: TestEnv = new TestEnv(host, dao);
+      const pendingB: Promise<void> = b.vm.start({ hostId: 'h1', sessionId: '' });
+      b.vm.dispose();
+      await pendingB;
+      expect(host.ops.indexOf('close:s-new-2') >= 0).assertTrue();
+    });
+
     it('返回detach_会话不断开_终端寄存_恢复时复用画面不重建', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.dao.put(sampleHost('h1'));
