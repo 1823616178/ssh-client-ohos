@@ -9,8 +9,15 @@
  *     全页返回后迷你窗口按原会话重新取回；
  *   - md/lg：迷你窗口 = Index 中栏嵌入终端；sm：底部半屏面板（bindSheet）承载同一组件。
  *
+ * 多窗口（平板 / 2in1 独立终端窗口，见 service/window/WindowRegistry）：
+ *   - 会话所在窗口由窗格 id 前缀反推（windowKeyOfPaneId），迷你窗口所在窗口同理；
+ *   - 正显示在其它窗口的会话：行标「独立窗口中」，点按行或 ⤢ 都是把那个窗口带到前台，
+ *     迷你窗口绝不去抢它的窗格绑定（locateSession / decideSessionTap）；
+ *   - 迷你窗口记住的会话被迁去独立窗口后，全页返回时不再等待，直接回到空态（'elsewhere'）。
+ *
  * 本文件只放纯函数与无 UI 依赖的类；SessionManager 接线集中在 SessionActivityTracker.global()。
  */
+import { windowKeyOfPaneId } from '../common/constants/WindowKeys';
 import { SshEvent } from '../napi/SshNative';
 import { SessionInfo, SessionManager } from '../service/SessionManager';
 import {
@@ -93,10 +100,11 @@ export interface MiniSessionProbe {
 /**
  * - gone：会话已关闭/不存在 → 迷你窗口回到空态；
  * - already：已绑在迷你窗格（无需动作）；
- * - wait：仍被其他窗格持有（全页终端尚未完成 detach）→ 稍后重试；
+ * - wait：仍被本窗口其他窗格持有（全页终端尚未完成 detach）→ 稍后重试；
+ * - elsewhere：已被别的系统窗口接管（例如全页里「在新窗口打开」）→ 不等待、不抢，迷你窗口回到空态；
  * - adopt：未绑定 → 迷你窗口接管（取回寄存终端，画面/回滚保留）。
  */
-export type MiniResumeAction = 'gone' | 'already' | 'wait' | 'adopt';
+export type MiniResumeAction = 'gone' | 'already' | 'wait' | 'elsewhere' | 'adopt';
 
 export function decideMiniResume(probe: MiniSessionProbe | null, miniPaneId: string): MiniResumeAction {
   if (probe === null || probe.state === 'closed' || probe.state === 'closing') {
@@ -106,9 +114,49 @@ export function decideMiniResume(probe: MiniSessionProbe | null, miniPaneId: str
     return 'already';
   }
   if (probe.paneId !== null) {
-    return 'wait';
+    return windowKeyOfPaneId(probe.paneId) === windowKeyOfPaneId(miniPaneId) ? 'wait' : 'elsewhere';
   }
   return 'adopt';
+}
+
+// ---------------------------------------------------------------- 会话位置（多窗口）
+
+/**
+ * 会话当前显示在哪里（相对迷你窗口所在的系统窗口）：
+ *   - background：没有窗格在显示（后台）；
+ *   - mini：迷你窗口；
+ *   - page：同一系统窗口里的其它窗格（全页终端）；
+ *   - window：别的系统窗口（独立终端窗口 / 另一个主窗口实例），windowKey 指明是哪个。
+ */
+export type SessionPlace = 'background' | 'mini' | 'page' | 'window';
+
+export interface SessionLocation {
+  readonly place: SessionPlace;
+  /** 会话所在窗口；background 时为迷你窗口所在窗口 */
+  readonly windowKey: string;
+}
+
+export function locateSession(paneId: string | null, miniPaneId: string): SessionLocation {
+  const here: string = windowKeyOfPaneId(miniPaneId);
+  if (paneId === null || paneId.length === 0) {
+    return { place: 'background', windowKey: here };
+  }
+  if (paneId === miniPaneId) {
+    return { place: 'mini', windowKey: here };
+  }
+  const owner: string = windowKeyOfPaneId(paneId);
+  return { place: owner === here ? 'page' : 'window', windowKey: owner };
+}
+
+/**
+ * 活动会话行的点按 / ⤢：
+ *   - focus-window：会话在别的系统窗口 → 把那个窗口带到前台（不抢绑定、不在本窗口再开）；
+ *   - local：其余情况照常（点按 = 迷你窗口就地切换；⤢ = 本窗口全页）。
+ */
+export type SessionTapAction = 'local' | 'focus-window';
+
+export function decideSessionTap(location: SessionLocation): SessionTapAction {
+  return location.place === 'window' ? 'focus-window' : 'local';
 }
 
 /** 全页返回后取回会话的重试上限与间隔（全页 detach 通常在返回前同步完成，重试只是兜底） */
@@ -308,8 +356,10 @@ export interface ActiveSessionRow {
   readonly statusLabel: string;
   /** 当前正显示在迷你窗口 */
   readonly inMini: boolean;
-  /** 正被全页终端（其他窗格）持有 */
+  /** 正被本窗口的全页终端（其他窗格）持有 */
   readonly inFullPage: boolean;
+  /** 正显示在别的系统窗口（多窗口；点按 = 切到那个窗口） */
+  readonly inOtherWindow: boolean;
   readonly unread: boolean;
   readonly bell: boolean;
   readonly accessibilityText: string;
@@ -336,13 +386,16 @@ export function buildActiveSessionRows(sessions: ActiveSessionLike[], hostNames:
     const seen: number = (titleCounts.get(baseTitle) ?? 0) + 1;
     titleCounts.set(baseTitle, seen);
     const title: string = seen > 1 ? `${baseTitle} #${seen}` : baseTitle;
-    const inMini: boolean = session.paneId === miniPaneId ||
-      (session.paneId === null && miniSessionId.length > 0 && session.sessionId === miniSessionId);
-    const inFullPage: boolean = session.paneId !== null && session.paneId !== miniPaneId;
+    const place: SessionPlace = locateSession(session.paneId, miniPaneId).place;
+    const inMini: boolean = place === 'mini' ||
+      (place === 'background' && miniSessionId.length > 0 && session.sessionId === miniSessionId);
+    const inFullPage: boolean = place === 'page';
+    const inOtherWindow: boolean = place === 'window';
+    const shown: boolean = inMini || inFullPage || inOtherWindow;
     const act: SessionActivityState = activity.stateOf(session.sessionId);
     // 正在显示的会话不挂徽标（tracker 也不会给它记，这里兜底过渡态）
-    const unread: boolean = act.unread && !inMini && !inFullPage;
-    const bell: boolean = act.bell && !inMini && !inFullPage;
+    const unread: boolean = act.unread && !shown;
+    const bell: boolean = act.bell && !shown;
     const statusLabel: string = hostConnStatusLabel(status);
     const parts: string[] = [statusLabel];
     if (act.title.length > 0) {
@@ -352,6 +405,8 @@ export function buildActiveSessionRows(sessions: ActiveSessionLike[], hostNames:
       parts.push('迷你窗口中');
     } else if (inFullPage) {
       parts.push('全页终端中');
+    } else if (inOtherWindow) {
+      parts.push('独立窗口中');
     }
     const subtitle: string = parts.join(' · ');
     const badges: string[] = [];
@@ -371,6 +426,7 @@ export function buildActiveSessionRows(sessions: ActiveSessionLike[], hostNames:
       statusLabel: statusLabel,
       inMini: inMini,
       inFullPage: inFullPage,
+      inOtherWindow: inOtherWindow,
       unread: unread,
       bell: bell,
       accessibilityText: a11y,

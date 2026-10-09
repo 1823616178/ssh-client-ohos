@@ -12,11 +12,14 @@ import {
   SessionActivityLookup,
   SessionActivityState,
   SessionActivityTracker,
+  SessionLocation,
   activeSessionsHeader,
   buildActiveSessionRows,
   decideHostTap,
   decideMiniResume,
+  decideSessionTap,
   encodeMiniTarget,
+  locateSession,
   miniPresentationOf,
   parseMiniTarget
 } from '../main/ets/viewmodel/MiniTerminalModel';
@@ -199,6 +202,53 @@ export default function miniTerminalModelTest() {
         .assertEqual('already');
       expect(decideMiniResume({ state: 'disconnected', paneId: null }, MINI_TERMINAL_PANE_ID)).assertEqual('adopt');
       expect(decideMiniResume({ state: 'error', paneId: null }, MINI_TERMINAL_PANE_ID)).assertEqual('adopt');
+    });
+
+    it('多窗口_会话位置_迷你窗口_本窗口全页_别的窗口_后台', 0, () => {
+      expect(locateSession(null, MINI_TERMINAL_PANE_ID).place).assertEqual('background');
+      expect(locateSession(null, MINI_TERMINAL_PANE_ID).windowKey).assertEqual('main');
+      expect(locateSession(MINI_TERMINAL_PANE_ID, MINI_TERMINAL_PANE_ID).place).assertEqual('mini');
+      expect(locateSession('terminal-main', MINI_TERMINAL_PANE_ID).place).assertEqual('page');
+      expect(locateSession('pane-3', MINI_TERMINAL_PANE_ID).place).assertEqual('page');
+      const other: SessionLocation = locateSession('session:abc-1:terminal-main', MINI_TERMINAL_PANE_ID);
+      expect(other.place).assertEqual('window');
+      expect(other.windowKey).assertEqual('session:abc-1');
+      expect(locateSession('new:u1:pane-2', MINI_TERMINAL_PANE_ID).windowKey).assertEqual('new:u1');
+      // 迷你窗口自己在非主窗口：同窗口前缀的窗格算本窗口，主窗口窗格算别的窗口
+      const miniInWin: string = `new:u1:${MINI_TERMINAL_PANE_ID}`;
+      expect(locateSession('new:u1:terminal-main', miniInWin).place).assertEqual('page');
+      expect(locateSession('terminal-main', miniInWin).place).assertEqual('window');
+      expect(locateSession('terminal-main', miniInWin).windowKey).assertEqual('main');
+      expect(decideSessionTap(other)).assertEqual('focus-window');
+      expect(decideSessionTap(locateSession('terminal-main', MINI_TERMINAL_PANE_ID))).assertEqual('local');
+      expect(decideSessionTap(locateSession(null, MINI_TERMINAL_PANE_ID))).assertEqual('local');
+      expect(decideSessionTap(locateSession(MINI_TERMINAL_PANE_ID, MINI_TERMINAL_PANE_ID))).assertEqual('local');
+    });
+
+    it('多窗口_活动会话行标独立窗口中_不挂徽标_全页返回取回判elsewhere', 0, () => {
+      const activity: MapActivity = new MapActivity();
+      activity.states.set('s2', { unread: true, bell: true, title: 'htop' });
+      activity.states.set('s3', { unread: true, bell: false, title: '' });
+      const rows: ActiveSessionRow[] = buildActiveSessionRows([
+        session('s1', 'h1', 'a', 'established', MINI_TERMINAL_PANE_ID),
+        session('s2', 'h2', 'b', 'established', 'session:s2:terminal-main'),
+        session('s3', 'h3', 'c', 'established', null)
+      ], new Map(), 's1', activity, MINI_TERMINAL_PANE_ID);
+      expect(rows.length).assertEqual(3);
+      expect(rows[0].inMini).assertTrue();
+      expect(rows[0].inOtherWindow).assertFalse();
+      expect(rows[1].inOtherWindow).assertTrue();
+      expect(rows[1].inFullPage).assertFalse();
+      expect(rows[1].inMini).assertFalse();
+      expect(rows[1].unread).assertFalse();
+      expect(rows[1].bell).assertFalse();
+      expect(rows[1].subtitle).assertEqual('运行中 · htop · 独立窗口中');
+      expect(rows[2].unread).assertTrue();
+      expect(rows[2].inOtherWindow).assertFalse();
+      expect(decideMiniResume({ state: 'established', paneId: 'session:s2:terminal-main' }, MINI_TERMINAL_PANE_ID))
+        .assertEqual('elsewhere');
+      expect(decideMiniResume({ state: 'established', paneId: 'pane-2' }, MINI_TERMINAL_PANE_ID))
+        .assertEqual('wait');
     });
   });
 }

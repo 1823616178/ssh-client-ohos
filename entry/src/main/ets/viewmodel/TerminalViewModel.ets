@@ -25,6 +25,10 @@
  *
  * 会话级状态（多会话互不串扰）：OSC 标题 / DECCKM / 响铃节流各按 sessionId 记账，
  * 聚焦切换时投影到顶栏字段；非可见会话的响铃 / 新输出记为标签徽标，激活标签即清除。
+ *
+ * 多窗口：每个窗口一个 VM；mainPaneId 与 paneIdFactory 由页面按 windowKey 注入前缀，
+ * 保证进程级窗格绑定不撞车。detachTab 把单个标签的会话「迁出」——终端寄存到
+ * TerminalParkingLot、窗格解绑但会话不断，新窗口按 sessionId 进入即可接管画面与回滚。
  */
 
 import { HostProfile } from '../common/model/models';
@@ -37,7 +41,7 @@ import { Logger } from '../common/utils/Logger';
 import { SshEvent, SshNativeSession } from '../napi/SshNative';
 import { SshTerminal } from '../napi/SshTerminal';
 import { AppDatabase } from '../repository/AppDatabase';
-import { SessionManager } from '../service/SessionManager';
+import { SessionInfo, SessionManager } from '../service/SessionManager';
 import { SnippetSendHub } from '../view/terminal/SnippetSendHub';
 import { BellLimiter } from '../view/terminal/TerminalBell';
 import {
@@ -45,6 +49,7 @@ import {
   PANE_DIVIDER_SIZE_VP,
   PaneBreakpoint,
   PaneFocusDirection,
+  PaneIdFactory,
   PaneLayout,
   PaneLeaf,
   PaneRect,
@@ -369,6 +374,8 @@ export interface TerminalSessionHostLike {
   cancelAutoReconnect(sessionId: string): boolean;
   /** 会话主机快照（分屏/新标签复用；临时主机 DAO 没有时靠这条） */
   hostOf(sessionId: string): HostProfile | null;
+  /** 会话当前绑定的窗格（null = 未绑定）。多窗口：据此判断会话是否正显示在别的窗口 */
+  paneOfSession(sessionId: string): string | null;
   addEventListener(listener: TerminalSessionEventListener): void;
   removeEventListener(listener: TerminalSessionEventListener): void;
   addDirtyListener(listener: TerminalDirtyListener): void;
@@ -440,6 +447,11 @@ class C4SessionHost implements TerminalSessionHostLike {
 
   getSession(sessionId: string): TerminalSessionLike | null {
     return SessionManager.get().getSession(sessionId);
+  }
+
+  paneOfSession(sessionId: string): string | null {
+    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+    return info === null ? null : info.paneId;
   }
 
   listSessions(): TerminalSessionLike[] {
@@ -578,6 +590,20 @@ export class TerminalParkingLot implements TerminalParkingLike {
     return this.entries.size;
   }
 
+  /**
+   * 用户显式断开会话时同步丢弃其寄存（detach 终端、释放 native 句柄引用）。
+   * 会话数监听里的 prune 也会兜底，但通知在重入时会被丢弃，这里不依赖它。返回是否有寄存被丢弃。
+   */
+  discard(sessionId: string): boolean {
+    const entry: ParkedTerminal | undefined = this.entries.get(sessionId);
+    if (entry === undefined) {
+      return false;
+    }
+    this.entries.delete(sessionId);
+    entry.terminal.detach();
+    return true;
+  }
+
   /** 失主寄存一律 detach 并移除 */
   prune(): void {
     const dead: string[] = [];
@@ -623,8 +649,19 @@ export interface TerminalViewModelDeps {
   /**
    * 首叶 paneId（缺省 TERMINAL_MAIN_PANE_ID）。Index 侧栏嵌入终端用自己的 id，
    * 既与画布 focusId 一致（焦点 / 光标形态正确），也不与全页终端的首叶抢绑定。
+   * 非主窗口再加 `${windowKey}:` 前缀（多窗口改造）。
    */
   mainPaneId?: string;
+  /**
+   * 标签 / 窗格 / 分屏 id 工厂（缺省 PaneTabSet 内置自增序列）。非主窗口注入
+   * PrefixedPaneIdFactory，避免与其它窗口的 `pane-N` 在进程级注册表里撞车。
+   */
+  paneIdFactory?: PaneIdFactory;
+  /**
+   * 目标会话正显示在别的窗口（窗格绑定不属于本页）时回调（多窗口）：VM 不抢绑定、
+   * 不改本页状态，由页面把那个窗口带到前台。缺省 no-op。
+   */
+  onSessionElsewhere?: (sessionId: string, paneId: string) => void;
 }
 
 /** 已 attach 终端的缓存条目：终端 + 绑定的 native 句柄（重连换柄检测依据） */
@@ -703,7 +740,8 @@ export class TerminalViewModel {
   private pendingPasswordInitial: boolean = false;
   /** 认证失败后补录对应的已有会话；空串 = 还没有会话，提交后走 connect。 */
   private pendingPasswordSessionId: string = '';
-  private readonly tabSet: PaneTabSet = new PaneTabSet();
+  private readonly tabSet: PaneTabSet;
+  private readonly elsewhereHook: (sessionId: string, paneId: string) => void;
   /** sessionId → 已 attach 终端（含切换走的会话：换回时复用，画面/回滚保留） */
   private readonly attachedTerminals: Map<string, AttachedTerminal> = new Map();
   /** sessionId → termType（attach 用；HostDao 尽力而为，缺省 DEFAULT_TERM_TYPE） */
@@ -749,6 +787,8 @@ export class TerminalViewModel {
     this.bellHook = deps?.onBell ?? ((_paneId: string): void => {});
     this.nowFn = deps?.now ?? ((): number => Date.now());
     this.mainPaneId = deps?.mainPaneId ?? TERMINAL_MAIN_PANE_ID;
+    this.tabSet = new PaneTabSet(deps?.paneIdFactory);
+    this.elsewhereHook = deps?.onSessionElsewhere ?? ((_sessionId: string, _paneId: string): void => {});
     this.unsubFocus = this.focusHost.addListener((id: string): void => {
       this.onExternalFocus(id);
     });
@@ -792,6 +832,10 @@ export class TerminalViewModel {
       const info: TerminalSessionLike | null = this.sessionHost().getSession(params.sessionId);
       if (info === null) {
         this.failStart('会话不存在或已关闭，请返回主机列表重新连接');
+        return;
+      }
+      if (this.redirectIfElsewhere(params.sessionId)) {
+        this.failStart('该会话已在其他窗口打开');
         return;
       }
       this.adoptSession(info, this.hostForSession(info.sessionId) ?? this.lookupHost(info.hostId));
@@ -1064,7 +1108,7 @@ export class TerminalViewModel {
       return;
     }
     const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
-    if (info === null) {
+    if (info === null || this.redirectIfElsewhere(sessionId)) {
       return;
     }
     const existing: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
@@ -1268,7 +1312,7 @@ export class TerminalViewModel {
       return;
     }
     const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
-    if (info === null) {
+    if (info === null || this.redirectIfElsewhere(sessionId)) {
       return;
     }
     const existing: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
@@ -1486,25 +1530,128 @@ export class TerminalViewModel {
     }
     this.tabSet.closeTab(tabId);
     this.lastFocusByTab.delete(tabId);
+    this.focusAfterTabRemoved();
+    this.refreshViews();
+  }
+
+  /** 标签被摘除后：聚焦剩余激活标签上次聚焦叶（否则首叶）；无标签则 shouldExit */
+  private focusAfterTabRemoved(): void {
     const active = this.tabSet.activeTab();
     if (active === null) {
       this.focusedPaneId = '';
       this.currentSessionId = '';
       this.terminal = null;
       this.shouldExit = true;
-    } else {
-      const remembered: string | undefined = this.lastFocusByTab.get(active.tabId);
-      const rememberedLeaf: PaneLeaf | null =
-        remembered === undefined ? null : this.tabSet.findLeaf(remembered);
-      const nextLeaves: PaneLeaf[] = leavesOf(active.root);
-      const next: PaneLeaf | null = rememberedLeaf !== null ? rememberedLeaf :
-        (nextLeaves.length > 0 ? nextLeaves[0] : null);
-      if (next !== null) {
-        this.focusedPaneId = next.paneId;
-        this.focusHost.focus(next.paneId);
-      }
+      return;
     }
+    const remembered: string | undefined = this.lastFocusByTab.get(active.tabId);
+    const rememberedLeaf: PaneLeaf | null =
+      remembered === undefined ? null : this.tabSet.findLeaf(remembered);
+    const nextLeaves: PaneLeaf[] = leavesOf(active.root);
+    const next: PaneLeaf | null = rememberedLeaf !== null ? rememberedLeaf :
+      (nextLeaves.length > 0 ? nextLeaves[0] : null);
+    if (next !== null) {
+      this.focusedPaneId = next.paneId;
+      this.focusHost.focus(next.paneId);
+    }
+  }
+
+  /**
+   * 把整个标签的会话迁出本页（多窗口「在新窗口打开」）：会话**不断开**。
+   *   - 存活会话：已装配终端寄存到 TerminalParkingLot（画面 / 回滚 / 标题 / DECCKM 保留），
+   *     窗格 unbindPane(false)，本页会话级记账清掉；新窗口按 sessionId 进入即接管；
+   *   - shell 已退出 / 已关闭的会话：没有可迁的东西，按关窗格语义关闭；
+   *   - 标签从树上摘除，焦点回落同 closeTab；摘的是末标签则 shouldExit。
+   * 返回迁出的 sessionId（标签内先序：先左后右 / 先上后下）；未知标签返回空数组。
+   * 新窗口拉起失败时调用方用 restoreDetached 收回。
+   */
+  detachTab(tabId: string): string[] {
+    if (this.disposed) {
+      return [];
+    }
+    const tab = this.tabSet.findTab(tabId);
+    if (tab === null) {
+      return [];
+    }
+    const moved: string[] = [];
+    const parking: TerminalParkingLike = this.parking();
+    for (const leaf of leavesOf(tab.root)) {
+      const sessionId: string = leaf.sessionId;
+      const info: TerminalSessionLike | null =
+        sessionId.length > 0 ? this.sessionHost().getSession(sessionId) : null;
+      const alive: boolean = info !== null && info.state !== 'closed' && info.state !== 'closing' &&
+        this.closedBySession.get(sessionId) !== true;
+      if (!alive) {
+        this.releaseLeafResources(leaf, true);
+        continue;
+      }
+      this.focusHost.unregister(leaf.paneId);
+      const cached: AttachedTerminal | undefined = this.attachedTerminals.get(sessionId);
+      if (cached !== undefined) {
+        parking.park(sessionId, {
+          terminal: cached.terminal,
+          nativeHandle: cached.nativeHandle,
+          title: this.titleBySession.get(sessionId) ?? '',
+          applicationCursorKeys: this.appCursorBySession.get(sessionId) === true
+        });
+        this.attachedTerminals.delete(sessionId);
+        if (this.terminal === cached.terminal) {
+          this.terminal = null;
+        }
+      }
+      this.sessionHost().unbindPane(leaf.paneId, false);
+      this.forgetSession(sessionId);
+      moved.push(sessionId);
+    }
+    this.tabSet.closeTab(tabId);
+    this.lastFocusByTab.delete(tabId);
+    this.focusAfterTabRemoved();
+    this.refreshSessionList();
     this.refreshViews();
+    Logger.info(`标签迁出：${moved.length} 个会话转交新窗口`, LOG_TAG);
+    return moved;
+  }
+
+  /** detachTab 的回滚（新窗口拉起失败）：把迁出的会话按新标签收回本页 */
+  async restoreDetached(sessionIds: string[]): Promise<void> {
+    if (this.disposed || sessionIds.length === 0) {
+      return;
+    }
+    this.shouldExit = false;
+    for (const sessionId of sessionIds) {
+      await this.revealSession(sessionId);
+    }
+  }
+
+  /**
+   * 会话正绑在不属于本页的窗格上（= 显示在别的窗口）：回调页面并返回 true，调用方放弃本次
+   * 打开——抢绑定会抛错，而 bindLeafSession 的失败分支会关闭会话，绝不能走到那里。
+   */
+  private redirectIfElsewhere(sessionId: string): boolean {
+    const paneId: string | null = this.sessionHost().paneOfSession(sessionId);
+    if (paneId === null || paneId.length === 0 || this.tabSet.findLeaf(paneId) !== null) {
+      return false;
+    }
+    Logger.info(`会话已在其他窗格显示（${paneId}），不抢绑定`, LOG_TAG);
+    this.elsewhereHook(sessionId, paneId);
+    return true;
+  }
+
+  /**
+   * 显示某个既有会话（多窗口：新窗口带入的附加会话 / 复用窗口的再次打开请求）：
+   * 本页已有该会话则聚焦其窗格（连带激活所在标签）；否则新开一个标签接管，
+   * 寄存的终端随之取回。绝不替换当前窗格里的会话。
+   */
+  async revealSession(sessionId: string): Promise<void> {
+    if (this.disposed || sessionId.length === 0) {
+      return;
+    }
+    const existing: PaneLeaf | null = this.tabSet.leafBySession(sessionId);
+    if (existing !== null) {
+      this.focusPane(existing.paneId);
+      return;
+    }
+    await this.openSession(sessionId, 'tab');
   }
 
   /** 全标签叶子数（单测断言树保活用） */

@@ -25,8 +25,23 @@
 
 // KeyboardAvoidMode 必须显式导入：全局作用域里另有一个同名旧枚举（没有 RESIZE），
 // 不导入会解析到那一个并报「Property 'RESIZE' does not exist」
-import { KeyboardAvoidMode, router, window } from '@kit.ArkUI';
+import { KeyboardAvoidMode, window } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
+import { common } from '@kit.AbilityKit';
+import {
+  MAIN_WINDOW_KEY,
+  TerminalWindowLaunch,
+  paneIdPrefixOf,
+  windowKeyOfPaneId
+} from '../common/constants/WindowKeys';
+import { focusWindowOfSession, openTerminalWindow } from '../common/utils/TerminalNavigation';
+import {
+  abilityContextOf,
+  supportsMultiWindow,
+  takeWindowLaunch,
+  windowKeyOf
+} from '../common/utils/WindowContext';
+import { TerminalOpenRequest, WindowRegistry } from '../service/window/WindowRegistry';
 import {
   AppearanceProfile,
   HostProfile,
@@ -56,7 +71,7 @@ import {
   terminalAppearanceFromProfile
 } from '../view/terminal/TerminalAppearance';
 import { filterHosts, sessionStateToStatus } from '../viewmodel/HostListViewModel';
-import { DividerRect, PaneBreakpoint } from '../viewmodel/PaneTree';
+import { DividerRect, PaneBreakpoint, PrefixedPaneIdFactory } from '../viewmodel/PaneTree';
 import { ShortcutAction } from '../view/terminal/ShortcutMap';
 import {
   OverlayModel,
@@ -67,6 +82,7 @@ import {
   TerminalRouteParams,
   TerminalSessionLike,
   PasswordPromptModel,
+  TERMINAL_MAIN_PANE_ID,
   TerminalViewModel,
   deriveOverlay,
   overlayPresentation,
@@ -292,22 +308,28 @@ interface AppearanceColorInputParams {
   kind: string;
 }
 
-/** 生产焦点宿主：转发给全局 FocusManager（画布点击 / 键条路由共用） */
+/** 生产焦点宿主：转发给所在窗口的 FocusManager（画布点击 / 键条路由共用；多窗口各一份） */
 class PageFocusHost implements TerminalFocusHostLike {
+  private readonly fm: FocusManager;
+
+  constructor(fm: FocusManager) {
+    this.fm = fm;
+  }
+
   register(id: string): boolean {
-    return FocusManager.get().register(id);
+    return this.fm.register(id);
   }
 
   unregister(id: string): boolean {
-    return FocusManager.get().unregister(id);
+    return this.fm.unregister(id);
   }
 
   focus(id: string): boolean {
-    return FocusManager.get().focus(id);
+    return this.fm.focus(id);
   }
 
   addListener(cb: (id: string) => void): () => void {
-    return FocusManager.get().addListener(cb);
+    return this.fm.addListener(cb);
   }
 }
 
@@ -414,8 +436,18 @@ struct TerminalPage {
   private colorPickerOriginal: string = '';
   /** 与所有 TerminalCanvas 共享的粘滞修饰状态。 */
   private readonly stickyModifiers: StickyModifiers = new StickyModifiers();
-  /** 视图模型：多标签/分屏编排 / 终端装配 / 蒙层派生 / 事件分发 */
-  private readonly vm: TerminalViewModel = new TerminalViewModel({
+  /** 所在系统窗口（多窗口改造；主窗口 = MAIN_WINDOW_KEY，aboutToAppear 解析） */
+  private windowKey: string = MAIN_WINDOW_KEY;
+  /** 平板 / 2in1 才露「在新窗口打开」（手机保持改造前交互） */
+  private readonly multiWindow: boolean = supportsMultiWindow();
+  /** 复用窗口（onNewWant）的打开请求订阅 */
+  private unsubscribeOpenRequest: () => void = () => {};
+  /**
+   * 视图模型：多标签/分屏编排 / 终端装配 / 蒙层派生 / 事件分发。
+   * 主窗口沿用此实例（id 无前缀、主窗口 FocusManager，与改造前一致）；
+   * 非主窗口在 aboutToAppear 换成 createViewModel(windowKey)（此时尚未 start，无副作用）。
+   */
+  private vm: TerminalViewModel = new TerminalViewModel({
     vibrate: (): void => {
       vibrateLight(this.hapticEnabled);
     },
@@ -429,11 +461,59 @@ struct TerminalPage {
       // 已节流的视觉响铃：投递到对应画布闪一下
       TerminalActionHub.get().execute(paneId, 'bell');
     },
-    focusHost: new PageFocusHost()
+    focusHost: new PageFocusHost(FocusManager.get()),
+    onSessionElsewhere: (sessionId: string, paneId: string): void => {
+      this.focusSessionWindow(sessionId, paneId);
+    }
   });
+
+  /** 非主窗口的 VM：窗格 id 带 `${windowKey}:` 前缀、焦点走本窗口 FocusManager */
+  private createViewModel(windowKey: string): TerminalViewModel {
+    const prefix: string = paneIdPrefixOf(windowKey);
+    return new TerminalViewModel({
+      vibrate: (): void => {
+        vibrateLight(this.hapticEnabled);
+      },
+      onContentDirty: (): void => {
+        FrameScheduler.get().wakeup();
+      },
+      onUiChange: (): void => {
+        this.syncFromVm();
+      },
+      onBell: (paneId: string): void => {
+        TerminalActionHub.get().execute(paneId, 'bell');
+      },
+      focusHost: new PageFocusHost(FocusManager.forWindow(windowKey)),
+      mainPaneId: `${prefix}${TERMINAL_MAIN_PANE_ID}`,
+      paneIdFactory: new PrefixedPaneIdFactory(prefix),
+      onSessionElsewhere: (sessionId: string, paneId: string): void => {
+        this.focusSessionWindow(sessionId, paneId);
+      }
+    });
+  }
+
+  /** 选中的会话正显示在别的窗口：把那个窗口带到前台（不抢绑定，见 VM.redirectIfElsewhere） */
+  private focusSessionWindow(sessionId: string, paneId: string): void {
+    const targetKey: string = windowKeyOfPaneId(paneId);
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (targetKey === this.windowKey || context === null) {
+      return;
+    }
+    this.showToast('该会话已在其他窗口打开，已切换过去');
+    focusWindowOfSession(context, targetKey, sessionId).then((ok: boolean) => {
+      if (!ok) {
+        this.showToast('该会话已在其他窗口打开');
+      }
+    });
+  }
 
   aboutToAppear(): void {
     this.terminalPageVisible = true;
+    this.windowKey = windowKeyOf(this.getUIContext());
+    if (this.windowKey !== MAIN_WINDOW_KEY) {
+      this.vm.detach();
+      this.vm = this.createViewModel(this.windowKey);
+    }
     try {
       this.hapticEnabled = SettingsRepository.isHapticEnabled();
       this.shortcutBindingsJson = SettingsRepository.getKeyboardShortcuts();
@@ -441,16 +521,55 @@ struct TerminalPage {
     } catch (err) {
       Logger.warn(`设置读取失败，使用默认值：${JSON.stringify(err)}`, LOG_TAG);
     }
-    const rawParams: Object | null = this.readRouteParams();
-    const params: TerminalRouteParams = parseTerminalRouteParams(rawParams);
+    // 终端窗口：启动参数在窗口级 LocalStorage（根页面拿不到 router 参数）；主窗口回退路由参数
+    const launch: TerminalWindowLaunch | null = takeWindowLaunch(this.getUIContext());
+    let extraSessionIds: string[] = [];
+    let params: TerminalRouteParams;
+    if (launch !== null) {
+      params = {
+        hostId: launch.hostId,
+        sessionId: launch.sessionIds.length > 0 ? launch.sessionIds[0] : ''
+      };
+      extraSessionIds = launch.sessionIds.slice(1);
+    } else {
+      params = parseTerminalRouteParams(this.readRouteParams());
+    }
     Logger.info(
-      `终端页路由 hostIdLen=${params.hostId.length} sessionIdLen=${params.sessionId.length}`,
+      `终端页路由 hostIdLen=${params.hostId.length} sessionIdLen=${params.sessionId.length}` +
+        ` extra=${extraSessionIds.length}`,
       LOG_TAG);
-    this.vm.start(params).catch((err: Object) => {
+    const extras: string[] = extraSessionIds;
+    this.vm.start(params).then(async (): Promise<void> => {
+      // 标签迁入新窗口：首个会话已由 start 采用，其余会话各开一个标签
+      for (const sessionId of extras) {
+        await this.vm.revealSession(sessionId);
+      }
+    }).catch((err: Object) => {
       Logger.error(`终端页启动异常: ${JSON.stringify(err)}`, LOG_TAG);
     });
+    if (this.windowKey !== MAIN_WINDOW_KEY) {
+      this.unsubscribeOpenRequest = WindowRegistry.get().setOpenRequestListener(this.windowKey,
+        (request: TerminalOpenRequest): void => {
+          this.onOpenRequest(request);
+        });
+    }
     this.applyKeyboardAvoidMode();
     this.applyTerminalWindowLayout();
+  }
+
+  /** 复用窗口被再次拉起（同一会话再开 / 主机再拨）：在本窗口显示，不新开窗口 */
+  private onOpenRequest(request: TerminalOpenRequest): void {
+    const run = async (): Promise<void> => {
+      for (const sessionId of request.sessionIds) {
+        await this.vm.revealSession(sessionId);
+      }
+      if (request.sessionIds.length === 0 && request.hostId.length > 0) {
+        await this.vm.openHost(request.hostId, 'tab');
+      }
+    };
+    run().catch((err: Object) => {
+      Logger.error(`终端窗口打开请求处理异常: ${JSON.stringify(err)}`, LOG_TAG);
+    });
   }
 
   /** 从主机编辑页返回时刷新已保存连接；终端画布与会话本身不重建。 */
@@ -464,14 +583,14 @@ struct TerminalPage {
       Logger.warn(`键条布局读取失败：${JSON.stringify(err)}`, LOG_TAG);
     }
     // 常亮只在真正看着终端时生效：跳去主机编辑页那段时间不该压着系统不息屏
-    ScreenAwake.get().setTerminalVisible(true);
+    ScreenAwake.forWindow(this.windowKey).setTerminalVisible(true);
     FrameScheduler.get().wakeup();
   }
 
   onPageHide(): void {
     // 页面被盖住 / 应用退后台：画布停绘（FrameScheduler setVisible false），光标停闪
     this.pageVisible = false;
-    ScreenAwake.get().setTerminalVisible(false);
+    ScreenAwake.forWindow(this.windowKey).setTerminalVisible(false);
   }
 
   /**
@@ -549,32 +668,44 @@ struct TerminalPage {
   /**
    * 让窗口内容真正布局到系统导航区底部。expandSafeArea 只能放开 ArkUI 节点，
    * 若窗口本身仍按安全区裁剪，PTY Canvas 的 visible bounds 仍会停在导航条上沿。
+   *
+   * 多窗口：优先用本窗口 Ability 登记的主窗口对象（WindowRegistry）；
+   * getLastWindow 在多实例下可能拿到别的窗口，只作取不到时的兜底。
    */
   private applyTerminalWindowLayout(): void {
+    const registered: window.Window | null = WindowRegistry.get().windowOf(this.windowKey);
+    if (registered !== null) {
+      this.adoptTerminalWindow(registered);
+      return;
+    }
     const uiContext: UIContext = this.getUIContext();
     const hostContext: Context | undefined = uiContext.getHostContext();
     if (hostContext === undefined) {
       return;
     }
     window.getLastWindow(hostContext).then((win: window.Window) => {
-      if (!this.terminalPageVisible) {
-        return;
-      }
-      this.terminalWindow = win;
-      try {
-        const systemArea: window.AvoidArea =
-          win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
-        this.terminalTopInsetVp = uiContext.px2vp(systemArea.topRect.height);
-      } catch (err) {
-        Logger.warn(`状态栏安全区读取失败：${JSON.stringify(err)}`, LOG_TAG);
-      }
-      win.setWindowLayoutFullScreen(true).catch((err: Object) => {
-        Logger.warn(`终端全屏布局设置失败：${JSON.stringify(err)}`, LOG_TAG);
-      });
-      this.syncTerminalChromeColor();
+      this.adoptTerminalWindow(win);
     }).catch((err: Object) => {
       Logger.warn(`终端窗口获取失败：${JSON.stringify(err)}`, LOG_TAG);
     });
+  }
+
+  private adoptTerminalWindow(win: window.Window): void {
+    if (!this.terminalPageVisible) {
+      return;
+    }
+    this.terminalWindow = win;
+    try {
+      const systemArea: window.AvoidArea =
+        win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      this.terminalTopInsetVp = this.getUIContext().px2vp(systemArea.topRect.height);
+    } catch (err) {
+      Logger.warn(`状态栏安全区读取失败：${JSON.stringify(err)}`, LOG_TAG);
+    }
+    win.setWindowLayoutFullScreen(true).catch((err: Object) => {
+      Logger.warn(`终端全屏布局设置失败：${JSON.stringify(err)}`, LOG_TAG);
+    });
+    this.syncTerminalChromeColor();
   }
 
   /**
@@ -617,7 +748,7 @@ struct TerminalPage {
 
   aboutToDisappear(): void {
     this.terminalPageVisible = false;
-    ScreenAwake.get().setTerminalVisible(false);
+    ScreenAwake.forWindow(this.windowKey).setTerminalVisible(false);
     this.colorPickerVisible = false;
     this.terminalTopInsetVp = 0;
     this.dragSplitId = '';
@@ -642,7 +773,8 @@ struct TerminalPage {
       Logger.warn(`恢复键盘避让模式失败：${JSON.stringify(err)}`, LOG_TAG);
     }
     this.fullscreen = false;
-    // 系统手势返回等未经 onBack 的离开路径：同样只转后台不断开（detach 幂等）
+    this.unsubscribeOpenRequest();
+    // 系统手势返回 / 关闭终端窗口等未经 onBack 的离开路径：同样只转后台不断开（detach 幂等）
     this.vm.detach();
   }
 
@@ -681,7 +813,7 @@ struct TerminalPage {
   /** 路由参数读取（HostListPage 传入 hostId 或 sessionId；异常收敛为空，由 VM 落错误蒙层） */
   private readRouteParams(): Object | null {
     try {
-      const params: Object | undefined = router.getParams();
+      const params: Object | undefined = this.getUIContext().getRouter().getParams();
       return params === undefined ? null : params;
     } catch (err) {
       Logger.warn(`路由参数解析失败: ${JSON.stringify(err)}`, LOG_TAG);
@@ -808,7 +940,7 @@ struct TerminalPage {
     }
     const params: Record<string, Object> = {};
     params['sessionId'] = sid;
-    router.pushUrl({ url: 'pages/SftpPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/SftpPage', params: params });
   }
 
   /** M6：当前会话主机 → PortForwardPage */
@@ -825,7 +957,7 @@ struct TerminalPage {
         params['hostName'] = host.name.length > 0 ? host.name : host.host;
       }
     }
-    router.pushUrl({ url: 'pages/PortForwardPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/PortForwardPage', params: params });
   }
 
   /** 已保存连接：复用主机列表的名称 / 地址 / 用户名过滤。 */
@@ -1221,15 +1353,66 @@ struct TerminalPage {
       this.showToast(live > 1 ? `${live} 个会话仍在后台运行，可在主机列表恢复` :
         '会话仍在后台运行，可在主机列表恢复');
     }
-    router.back();
+    this.leavePage();
   }
 
   /** 关完最后一个窗格 / 标签：会话已全部关闭，直接退出 */
   private exitIfEmpty(): void {
     if (this.vm.shouldExit) {
       this.vm.dispose();
-      router.back();
+      this.leavePage();
     }
+  }
+
+  /**
+   * 离开终端页。主窗口：router.back 回主机列表（与改造前一致）。
+   * 终端窗口：终端页是根页面，router.back 无处可回，改为关闭本窗口（terminateSelf；
+   * module.json5 已配 removeMissionAfterTerminate，最近任务里不留空卡片）。
+   */
+  private leavePage(): void {
+    const uiRouter = this.getUIContext().getRouter();
+    if (this.windowKey !== MAIN_WINDOW_KEY && Number(uiRouter.getLength()) <= 1) {
+      const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+      if (context !== null) {
+        context.terminateSelf().catch((err: Object) => {
+          Logger.warn(`关闭终端窗口失败：${JSON.stringify(err)}`, LOG_TAG);
+        });
+        return;
+      }
+    }
+    uiRouter.back();
+  }
+
+  /**
+   * 「在新窗口打开」（仅平板 / 2in1）：把整个标签（含其中分屏）的会话迁到新的系统窗口，
+   * 会话不断开、画面与回滚随寄存终端一起过去。拉起失败则原样收回本页。
+   * 迁走的是本页最后一个标签时，拉起成功后本页随之离开（主窗口回主机列表 / 终端窗口关闭）。
+   */
+  private moveTabToNewWindow(tabId: string): void {
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context === null) {
+      this.showToast('无法打开新窗口');
+      return;
+    }
+    const moved: string[] = this.vm.detachTab(tabId);
+    if (moved.length === 0) {
+      // 标签里没有存活会话（都已结束）：detachTab 已按关闭处理
+      this.exitIfEmpty();
+      return;
+    }
+    openTerminalWindow(context, '', moved, false).then((ok: boolean) => {
+      if (ok) {
+        if (this.vm.shouldExit) {
+          this.vm.detach();
+          this.leavePage();
+        }
+        return;
+      }
+      this.showToast('新窗口打开失败，已收回本页');
+      this.vm.restoreDetached(moved).catch((err: Object) => {
+        Logger.error(`收回迁出会话失败: ${JSON.stringify(err)}`, LOG_TAG);
+      });
+    });
   }
 
   /** 是否紧凑外框（手机竖屏等窄断点） */
@@ -1842,6 +2025,27 @@ struct TerminalPage {
           .margin({ left: Tokens.space.xs2 })
           .accessibilityText('有新输出')
       }
+      if (this.multiWindow && $$.tab.active) {
+        // 在新窗口打开（平板 / 2in1，仅当前标签露出，避免标签栏拥挤）
+        Text('⧉')
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(this.chromeTextDim())
+          .width(SMALL_CLOSE_VISUAL_VP)
+          .height(SMALL_CLOSE_VISUAL_VP)
+          .textAlign(TextAlign.Center)
+          .borderRadius(Tokens.radius.xs)
+          .margin({ left: Tokens.space.xs2 })
+          .responseRegion({
+            x: -(TOUCH_TARGET_VP - SMALL_CLOSE_VISUAL_VP) / 2,
+            y: -(TOUCH_TARGET_VP - SMALL_CLOSE_VISUAL_VP) / 2,
+            width: TOUCH_TARGET_VP,
+            height: TOUCH_TARGET_VP
+          })
+          .accessibilityText(`在新窗口打开 ${$$.tab.title}`)
+          .onClick(() => {
+            this.moveTabToNewWindow($$.tab.tabId);
+          })
+      }
       Text('×')
         .fontSize(Tokens.fontSize.caption)
         .fontColor(this.chromeTextDim())
@@ -1991,7 +2195,7 @@ struct TerminalPage {
         .width('100%')
         .margin({ top: Tokens.space.sm })
         .onClick(() => {
-          router.pushUrl({ url: 'pages/HostEditPage' });
+          this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage' });
         })
     }
     .alignItems(HorizontalAlign.Start)
@@ -2633,7 +2837,7 @@ struct TerminalPage {
         .margin({ top: Tokens.space.sm })
         .onClick(() => {
           this.showSideBar = false;
-          router.pushUrl({ url: 'pages/HostEditPage' });
+          this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage' });
         })
     }
     .alignItems(HorizontalAlign.Start)
@@ -2884,7 +3088,7 @@ struct TerminalPage {
         .onClick(() => {
           this.cancelAppearancePreviewIfNeeded();
           this.showSideBar = false;
-          router.pushUrl({ url: 'pages/KeyBarEditorPage' });
+          this.getUIContext().getRouter().pushUrl({ url: 'pages/KeyBarEditorPage' });
         })
 
       Row({ space: Tokens.space.xs }) {

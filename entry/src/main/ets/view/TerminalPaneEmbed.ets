@@ -1,22 +1,29 @@
 /**
  * TerminalPaneEmbed —— 首页「迷你终端窗口」：md/lg 嵌在 Index 中栏，sm 放在底部半屏面板。
  *
- * 与 TerminalPage 同用 TerminalViewModel + TerminalCanvas + FocusManager，单窗格。
+ * 与 TerminalPage 同用 TerminalViewModel + TerminalCanvas + FocusManager（按所在窗口取实例），单窗格。
  * 目标由父页经 `target`（encodeMiniTarget：按主机新拨 / 接管既有会话）驱动：
  *   - 切换目标 = 旧 VM detach（终端寄存、窗格解绑、会话保持后台）→ 新 VM 接管，
  *     同一个 TerminalCanvas 实例换绑终端：不重连、回滚保留、输入法焦点不丢；
- *   - 「⤢ 全页」：先 detach 让出会话，再由父页 push TerminalPage（全页可绑定同一会话）；
+ *   - 「⤢ 全页」：先 detach 让出会话，再由父页 push TerminalPage（父页 UIContext 的 Router）；
  *   - 全页返回：父页递增 `resumeTick` → 按原会话取回（decideMiniResume；全页尚未解绑则短暂重试）；
  *   - 收起 / 组件销毁一律 detach，从不关闭会话（断开在活动会话行里显式操作）。
+ * 多窗口：窗格 id 带所在窗口前缀（主窗口无前缀，与改造前一致）；目标会话正显示在别的系统窗口时
+ * 不抢绑定——把那个窗口带到前台、迷你窗口回到空态并提示（VM onSessionElsewhere）。
  * 切换会话不自动弹软键盘（浏览列表时不遮挡），点按迷你终端再输入；外接键盘同理点按聚焦。
  */
 import { SshTerminal } from '../napi/SshTerminal';
 import { Logger } from '../common/utils/Logger';
 import { SessionInfo, SessionManager } from '../service/SessionManager';
+import { common } from '@kit.AbilityKit';
+import { focusWindowOfSession } from '../common/utils/TerminalNavigation';
+import { abilityContextOf, windowKeyOf } from '../common/utils/WindowContext';
 import { Tokens } from '../theme/Tokens';
 import { TerminalCanvas } from './TerminalCanvas';
 import { FrameScheduler } from './FrameScheduler';
 import { FocusManager } from './terminal/FocusManager';
+import { paneIdPrefixOf, windowKeyOfPaneId } from '../common/constants/WindowKeys';
+import { PrefixedPaneIdFactory } from '../viewmodel/PaneTree';
 import {
   OverlayModel,
   OverlayPresentation,
@@ -39,22 +46,28 @@ import {
 const LOG_TAG: string = 'TerminalPaneEmbed';
 const HEADER_BUTTON_VP: number = 40;
 
-/** 生产焦点宿主：与 TerminalPage.PageFocusHost 同实现 */
+/** 生产焦点宿主：与 TerminalPage.PageFocusHost 同实现（绑定所在窗口的 FocusManager） */
 class EmbedFocusHost implements TerminalFocusHostLike {
+  private readonly fm: FocusManager;
+
+  constructor(fm: FocusManager) {
+    this.fm = fm;
+  }
+
   register(id: string): boolean {
-    return FocusManager.get().register(id);
+    return this.fm.register(id);
   }
 
   unregister(id: string): boolean {
-    return FocusManager.get().unregister(id);
+    return this.fm.unregister(id);
   }
 
   focus(id: string): boolean {
-    return FocusManager.get().focus(id);
+    return this.fm.focus(id);
   }
 
   addListener(cb: (id: string) => void): () => void {
-    return FocusManager.get().addListener(cb);
+    return this.fm.addListener(cb);
   }
 }
 
@@ -92,6 +105,8 @@ export struct TerminalPaneEmbed {
   /** 迷你窗口当前会话变化（'' = 无） */
   onSessionChanged: (sessionId: string, hostId: string) => void = (_s: string, _h: string): void => {};
 
+  /** 首叶 / 画布 focusId（主窗口即 MINI_TERMINAL_PANE_ID；非主窗口带窗口前缀） */
+  @State private embedPaneId: string = MINI_TERMINAL_PANE_ID;
   @State private hostName: string = '';
   @State private terminalTitle: string = '';
   @State private overlayModel: OverlayModel = deriveOverlay({
@@ -176,6 +191,9 @@ export struct TerminalPaneEmbed {
   }
 
   private startVm(hostId: string, sessionId: string): void {
+    const windowKey: string = windowKeyOf(this.getUIContext());
+    const prefix: string = paneIdPrefixOf(windowKey);
+    this.embedPaneId = `${prefix}${MINI_TERMINAL_PANE_ID}`;
     const vm: TerminalViewModel = new TerminalViewModel({
       onContentDirty: (): void => {
         FrameScheduler.get().wakeup();
@@ -185,9 +203,15 @@ export struct TerminalPaneEmbed {
           this.syncFromVm();
         }
       },
-      focusHost: new EmbedFocusHost(),
-      // 与画布 focusId 一致，且不与全页终端首叶 terminal-main 抢绑定
-      mainPaneId: MINI_TERMINAL_PANE_ID
+      focusHost: new EmbedFocusHost(FocusManager.forWindow(windowKey)),
+      // 与画布 focusId 一致，且不与全页终端首叶 terminal-main 抢绑定；非主窗口再加窗口前缀
+      mainPaneId: this.embedPaneId,
+      paneIdFactory: new PrefixedPaneIdFactory(prefix),
+      onSessionElsewhere: (elsewhereSessionId: string, paneId: string): void => {
+        if (this.vm === vm) {
+          this.onSessionElsewhere(elsewhereSessionId, paneId);
+        }
+      }
     });
     this.vm = vm;
     this.emptyHint = '';
@@ -225,7 +249,7 @@ export struct TerminalPaneEmbed {
     const sessionId: string = this.rememberedSessionId;
     const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
     const action: MiniResumeAction = decideMiniResume(
-      info === null ? null : { state: info.state, paneId: info.paneId }, MINI_TERMINAL_PANE_ID);
+      info === null ? null : { state: info.state, paneId: info.paneId }, this.embedPaneId);
     switch (action) {
       case 'adopt':
         this.startVm('', sessionId);
@@ -239,8 +263,14 @@ export struct TerminalPaneEmbed {
           }, MINI_RESUME_RETRY_MS);
         } else {
           Logger.warn('迷你终端取回会话超时：会话仍被其他窗格持有', LOG_TAG);
-          this.emptyHint = '该会话正在其他窗口中使用';
+          this.emptyHint = '该会话正在全页终端中使用';
         }
+        break;
+      case 'elsewhere':
+        // 会话已迁去独立窗口（全页「在新窗口打开」）：不等、不抢，回到空态
+        this.rememberedSessionId = '';
+        this.emptyHint = '该会话已在独立窗口中打开，点按左侧对应行可切换过去';
+        this.reportSession();
         break;
       case 'gone':
         this.rememberedSessionId = '';
@@ -249,6 +279,30 @@ export struct TerminalPaneEmbed {
         break;
       default:
         break;
+    }
+  }
+
+  /**
+   * VM 发现目标会话正绑在不属于迷你窗口的窗格上（start 已以「已在其他窗口打开」失败返回）：
+   * 放弃本次接管、迷你窗口回到空态；会话在别的系统窗口则把那个窗口带到前台。
+   */
+  private onSessionElsewhere(sessionId: string, paneId: string): void {
+    const owner: string = windowKeyOfPaneId(paneId);
+    const here: string = windowKeyOfPaneId(this.embedPaneId);
+    this.release();
+    this.rememberedSessionId = '';
+    this.pendingHostId = '';
+    this.reportSession();
+    if (owner === here) {
+      this.emptyHint = '该会话正在全页终端中使用';
+      return;
+    }
+    this.emptyHint = '该会话已在独立窗口中打开，已切换到该窗口';
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context !== null) {
+      focusWindowOfSession(context, owner, sessionId).catch((err: Object) => {
+        Logger.warn(`切换到会话所在窗口失败: ${JSON.stringify(err)}`, LOG_TAG);
+      });
     }
   }
 
@@ -316,7 +370,7 @@ export struct TerminalPaneEmbed {
         if (this.canvasTerminal !== null) {
           TerminalCanvas({
             terminal: this.canvasTerminal,
-            focusId: MINI_TERMINAL_PANE_ID,
+            focusId: this.embedPaneId,
             autoFocus: false,
             visible: true
           })

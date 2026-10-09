@@ -5,7 +5,6 @@
  * 与桌面端 ssh-tool 共用保险库与同步文档（SyncDocumentV1），可同账号双向同步。
  */
 
-import { router } from '@kit.ArkUI';
 import { Tokens } from '../theme/Tokens';
 import { PageHeader } from '../view/PageHeader';
 import { DeviceItem } from '../service/sync/ApiTypes';
@@ -662,7 +661,7 @@ struct AccountSyncPage {
         .width('100%')
         .margin({ top: Tokens.space.xs })
         .onClick(() => {
-          router.pushUrl({ url: 'pages/ConfigManagerPage' });
+          this.getUIContext().getRouter().pushUrl({ url: 'pages/ConfigManagerPage' });
         })
 
       Divider()

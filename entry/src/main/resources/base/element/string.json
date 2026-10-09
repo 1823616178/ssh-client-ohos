@@ -13,6 +13,14 @@
       "value": "SSH 客户端"
     },
     {
+      "name": "TerminalWindowAbility_desc",
+      "value": "SSH 独立终端窗口"
+    },
+    {
+      "name": "TerminalWindowAbility_label",
+      "value": "SSH 终端"
+    },
+    {
       "name": "reason_vibrate",
       "value": "用于按键与复制成功的触感反馈"
     },

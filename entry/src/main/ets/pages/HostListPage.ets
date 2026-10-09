@@ -14,7 +14,6 @@
  * 递增 refreshTick 触发重载（U2 接线，@Prop @Watch）。
  */
 
-import { router } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { HostProfile, createDefaultHostProfile } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
@@ -23,7 +22,15 @@ import { CredentialStore } from '../repository/CredentialStore';
 import { SessionEventListener, SessionInfo, SessionManager } from '../service/SessionManager';
 import { Tokens } from '../theme/Tokens';
 import { SyncRuntime } from '../service/sync/SyncRuntime';
-import { pushTerminalForHost, pushTerminalForSession } from '../common/utils/TerminalNavigation';
+import {
+  focusWindowOfSession,
+  openTerminalWindow,
+  pushTerminalForHost,
+  pushTerminalForSession
+} from '../common/utils/TerminalNavigation';
+import { paneIdPrefixOf } from '../common/constants/WindowKeys';
+import { abilityContextOf, supportsMultiWindow, windowKeyOf } from '../common/utils/WindowContext';
+import { common } from '@kit.AbilityKit';
 import {
   ActiveSessionLike,
   HostConnStatus,
@@ -37,9 +44,13 @@ import {
   ActiveSessionRow,
   MINI_TERMINAL_PANE_ID,
   SessionActivityTracker,
+  SessionLocation,
   activeSessionsHeader,
-  buildActiveSessionRows
+  buildActiveSessionRows,
+  decideSessionTap,
+  locateSession
 } from '../viewmodel/MiniTerminalModel';
+import { TerminalParkingLot } from '../viewmodel/TerminalViewModel';
 
 const LOG_TAG: string = 'HostListPage';
 /** 活动会话区最大高度：超出后区内滚动，不把主机列表挤没 */
@@ -121,6 +132,8 @@ export struct HostListPage {
   private readonly viewModel: HostListViewModel = new HostListViewModel();
   private readonly dataSource: HostRowDataSource = new HostRowDataSource();
   // 快速连接表单值（不需要响应式，普通成员即可）
+  /** 平板 / 2in1 才露「新窗口」入口（手机保持改造前交互） */
+  private readonly multiWindow: boolean = supportsMultiWindow();
   private quickAddress: string = '';
   private quickUser: string = '';
 
@@ -182,27 +195,64 @@ export struct HostListPage {
     }
     const sessions: ActiveSessionLike[] = SessionManager.get().listSessions();
     this.activeSessions = buildActiveSessionRows(sessions, names, this.miniSessionId,
-      SessionActivityTracker.global(), MINI_TERMINAL_PANE_ID);
+      SessionActivityTracker.global(), this.miniPaneId());
   }
 
-  /** 点按行：迷你窗口就地切换（父页提供时）；否则退化为全页 */
+  /** 本窗口迷你终端的窗格 id（主窗口无前缀；与 TerminalPaneEmbed.embedPaneId 同口径） */
+  private miniPaneId(): string {
+    return `${paneIdPrefixOf(windowKeyOf(this.getUIContext()))}${MINI_TERMINAL_PANE_ID}`;
+  }
+
+  /**
+   * 多窗口：会话正显示在别的系统窗口时，把那个窗口带到前台并返回 true——
+   * 不在本窗口再开（迷你窗口 / 全页都不去抢它的窗格绑定）。
+   */
+  private focusIfInOtherWindow(sessionId: string): boolean {
+    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+    const location: SessionLocation = locateSession(info === null ? null : info.paneId, this.miniPaneId());
+    if (decideSessionTap(location) !== 'focus-window') {
+      return false;
+    }
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context === null) {
+      this.toast('该会话已在其他窗口打开');
+      return true;
+    }
+    focusWindowOfSession(context, location.windowKey, sessionId).then((ok: boolean) => {
+      if (!ok) {
+        this.toast('该会话已在其他窗口打开');
+      }
+    });
+    return true;
+  }
+
+  /**
+   * 点按行：会话在别的系统窗口 → 切到那个窗口；否则迷你窗口就地切换（父页提供时），
+   * 再否则退化为本窗口全页。
+   */
   private resumeSession(sessionId: string): void {
     SessionActivityTracker.global().markSeen(sessionId);
+    if (this.focusIfInOtherWindow(sessionId)) {
+      return;
+    }
     if (this.onOpenSession !== null) {
       this.onOpenSession(sessionId);
       return;
     }
-    pushTerminalForSession(sessionId);
+    pushTerminalForSession(this.getUIContext(), sessionId);
   }
 
-  /** 行内「⤢」：显式进入全页终端 */
+  /** 行内「⤢」：显式进入全页终端（会话已在别的系统窗口则切过去，不在本窗口重复打开） */
   private openSessionFullPage(sessionId: string): void {
     SessionActivityTracker.global().markSeen(sessionId);
+    if (this.focusIfInOtherWindow(sessionId)) {
+      return;
+    }
     if (this.onOpenSessionFullPage !== null) {
       this.onOpenSessionFullPage(sessionId);
       return;
     }
-    pushTerminalForSession(sessionId);
+    pushTerminalForSession(this.getUIContext(), sessionId);
   }
 
   private confirmCloseSession(item: ActiveSessionRow): void {
@@ -220,6 +270,8 @@ export struct HostListPage {
         fontColor: Tokens.Color.danger,
         action: () => {
           SessionManager.get().close(item.sessionId);
+          // 寄存的终端（全页返回 / 迷你窗口切走 / 迁窗时留下）随会话一起释放
+          TerminalParkingLot.global().discard(item.sessionId);
           if (this.onSessionClosed !== null) {
             this.onSessionClosed(item.sessionId);
           }
@@ -285,7 +337,7 @@ export struct HostListPage {
 
   /** 「+」与空状态按钮共用：跳 HostEditPage 新建（U2 接线） */
   private onAddHost(): void {
-    router.pushUrl({ url: 'pages/HostEditPage' });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage' });
   }
 
   /**
@@ -298,7 +350,26 @@ export struct HostListPage {
       this.onOpenHost(host.id);
       return;
     }
-    pushTerminalForHost(host.id);
+    pushTerminalForHost(this.getUIContext(), host.id);
+  }
+
+  /**
+   * 滑动菜单「新窗口」（仅平板 / 2in1）：在独立系统窗口里按 hostId 新拨一路会话，
+   * 与当前窗口互不影响。拉起失败回退为本窗口全页打开。
+   */
+  private openTerminalInNewWindow(host: HostProfile): void {
+    recordHostLastUsed(host.id);
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context === null) {
+      pushTerminalForHost(this.getUIContext(), host.id);
+      return;
+    }
+    openTerminalWindow(context, host.id, [], false).then((ok: boolean) => {
+      if (!ok) {
+        this.toast('新窗口打开失败，已在当前窗口打开');
+        pushTerminalForHost(this.getUIContext(), host.id);
+      }
+    });
   }
 
   /** 快速连接：host[:port] + 用户名 → 临时 HostProfile（不落库）→ 先受理连接再持 sessionId 跳 TerminalPage */
@@ -318,7 +389,7 @@ export struct HostListPage {
     // 临时主机不落库，TerminalPage 无法按 hostId 取回，故先受理连接、持 sessionId 跳转
     SessionManager.get().connect(host).then((info: SessionInfo) => {
       Logger.info(`快速连接已受理：${info.sessionId}（${displayName}）`, LOG_TAG);
-      pushTerminalForSession(info.sessionId);
+      pushTerminalForSession(this.getUIContext(), info.sessionId);
     }).catch((err: Object) => {
       const message: string = err instanceof Error ? err.message : '连接发起失败';
       Logger.error(`快速连接发起失败（${displayName}）: ${JSON.stringify(err)}`, LOG_TAG);
@@ -330,14 +401,14 @@ export struct HostListPage {
   private onEditHost(hostId: string): void {
     const params: Record<string, Object> = {};
     params['hostId'] = hostId;
-    router.pushUrl({ url: 'pages/HostEditPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage', params: params });
   }
 
   /** 滑动菜单「SFTP」：带 hostId（SftpPage 无会话时会提示先建立 SSH 会话） */
   private onOpenSftp(host: HostProfile): void {
     const params: Record<string, Object> = {};
     params['hostId'] = host.id;
-    router.pushUrl({ url: 'pages/SftpPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/SftpPage', params: params });
   }
 
   /** 滑动菜单「转发」：PortForwardPage（规则编辑仍在 HostEdit） */
@@ -345,7 +416,7 @@ export struct HostListPage {
     const params: Record<string, Object> = {};
     params['hostId'] = host.id;
     params['hostName'] = host.name.length > 0 ? host.name : host.host;
-    router.pushUrl({ url: 'pages/PortForwardPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/PortForwardPage', params: params });
   }
 
   /** 滑动菜单「删除」→ 二次确认对话框 */
@@ -501,7 +572,7 @@ export struct HostListPage {
       .backgroundColor(Color.Transparent)
       .width(ROW_ACTION_VP)
       .height(ROW_ACTION_VP)
-      .accessibilityText(`在完整终端页打开 ${item.title}`)
+      .accessibilityText(item.inOtherWindow ? `切换到 ${item.title} 所在窗口` : `在完整终端页打开 ${item.title}`)
       .onClick(() => {
         this.openSessionFullPage(item.sessionId);
       })
@@ -525,7 +596,8 @@ export struct HostListPage {
     .borderRadius(Tokens.radius.sm)
     .backgroundColor(item.inMini ? Tokens.Color.surfaceHover : Color.Transparent)
     .accessibilityText(item.inMini ? `${item.accessibilityText}，正在迷你窗口显示` :
-      `${item.accessibilityText}，点按在迷你窗口查看`)
+      (item.inOtherWindow ? `${item.accessibilityText}，点按切换到该窗口` :
+        `${item.accessibilityText}，点按在迷你窗口查看`))
     .onClick(() => {
       this.resumeSession(item.sessionId);
     })
@@ -673,7 +745,7 @@ export struct HostListPage {
     .margin({ right: Tokens.space.xs })
     .accessibilityText(`云同步：${this.syncChipSub}`)
     .onClick(() => {
-      router.pushUrl({ url: 'pages/AccountSyncPage' });
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/AccountSyncPage' });
     })
   }
 
@@ -694,7 +766,7 @@ export struct HostListPage {
     .accessibilityText('设置')
     .accessibilityDescription('打开通用设置')
     .onClick(() => {
-      router.pushUrl({ url: 'pages/SettingsPage' });
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/SettingsPage' });
     })
   }
 
@@ -715,7 +787,7 @@ export struct HostListPage {
     .accessibilityText('配置中心')
     .accessibilityDescription('主机、分组、片段与转发的集中管理')
     .onClick(() => {
-      router.pushUrl({ url: 'pages/ConfigManagerPage' });
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/ConfigManagerPage' });
     })
   }
 
@@ -941,11 +1013,25 @@ export struct HostListPage {
     }
   }
 
-  /** 滑动菜单：编辑 + SFTP + 转发 + 删除（danger 底色，与次操作视觉隔离） */
+  /** 滑动菜单：[新窗口] + 编辑 + SFTP + 转发 + 删除（danger 底色，与次操作视觉隔离） */
   @Builder
   SwipeActions(row: HostListRow) {
     if (row.host !== null) {
       Row() {
+        if (this.multiWindow) {
+          Button('新窗口')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.text)
+            .backgroundColor(Tokens.Color.surfaceHover)
+            .borderRadius(Tokens.radius.sm)
+            .height('100%')
+            .margin({ right: Tokens.space.xs })
+            .onClick(() => {
+              if (row.host !== null) {
+                this.openTerminalInNewWindow(row.host);
+              }
+            })
+        }
         Button('编辑')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.text)

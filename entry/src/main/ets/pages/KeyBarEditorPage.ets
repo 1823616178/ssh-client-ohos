@@ -8,7 +8,6 @@
  * 纯逻辑全部在 view/KeyBarLayout.ets（有单测），本页只做呈现与状态。
  */
 
-import { router } from '@kit.ArkUI';
 import { Logger } from '../common/utils/Logger';
 import { SettingsRepository } from '../repository/SettingsRepository';
 import { Tokens } from '../theme/Tokens';
@@ -77,7 +76,7 @@ struct KeyBarEditorPage {
         fontColor: Tokens.Color.danger,
         action: () => {
           this.dirty = false;
-          router.back();
+          this.getUIContext().getRouter().back();
         }
       }
     });
@@ -119,7 +118,7 @@ struct KeyBarEditorPage {
       } catch (toastErr) {
         Logger.warn(`toast 失败：${JSON.stringify(toastErr)}`, LOG_TAG);
       }
-      router.back();
+      this.getUIContext().getRouter().back();
     } catch (err) {
       Logger.error(`键条布局保存失败：${JSON.stringify(err)}`, LOG_TAG);
       this.message = '保存失败，请稍后重试';

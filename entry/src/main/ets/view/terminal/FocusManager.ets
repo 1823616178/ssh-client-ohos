@@ -10,23 +10,41 @@
  *   - 聚焦窗格被 unregister 后不自动改投他人（focusedId 置空），
  *     由用户点击/U4b 显式 focus——避免输入误投到非预期会话。
  *
- * 单测用 `new FocusManager()` 拿隔离实例；生产用 `FocusManager.get()` 全局单例
- * （与 FrameScheduler.get() 同模式）。粘贴/片段发送的路由接线属 T8/U10，
- * 本任务只交付焦点状态与键盘/IME 输入的投递判定。
+ * 单测用 `new FocusManager()` 拿隔离实例；生产用 `FocusManager.forWindow(windowKey)`
+ * ——多窗口改造后焦点是「每个系统窗口各一个」：两个窗口各有自己的聚焦窗格，
+ * 互不抢焦点（`get()` = 主窗口实例，与改造前全局单例同义）。粘贴/片段发送的路由
+ * 接线属 T8/U10，本任务只交付焦点状态与键盘/IME 输入的投递判定。
  */
+
+import { MAIN_WINDOW_KEY } from '../../common/constants/WindowKeys';
 
 /** 焦点变化监听：newFocusedId 为空串 = 当前无聚焦窗格 */
 export type FocusChangedListener = (newFocusedId: string) => void;
 
 export class FocusManager {
-  private static instance: FocusManager | null = null;
+  /** windowKey → 该窗口的焦点管理器 */
+  private static readonly byWindow: Map<string, FocusManager> = new Map();
 
-  /** 全局单例（窗格树/终端组件共用） */
+  /** 主窗口实例（与改造前全局单例同义） */
   static get(): FocusManager {
-    if (FocusManager.instance === null) {
-      FocusManager.instance = new FocusManager();
+    return FocusManager.forWindow(MAIN_WINDOW_KEY);
+  }
+
+  /** 指定窗口的焦点管理器（窗格树/终端组件按所在窗口取用；首次访问时创建） */
+  static forWindow(windowKey: string): FocusManager {
+    let instance: FocusManager | undefined = FocusManager.byWindow.get(windowKey);
+    if (instance === undefined) {
+      instance = new FocusManager();
+      FocusManager.byWindow.set(windowKey, instance);
     }
-    return FocusManager.instance;
+    return instance;
+  }
+
+  /** 窗口销毁时丢弃其焦点表（主窗口实例保留，与改造前单例生命周期一致） */
+  static releaseWindow(windowKey: string): void {
+    if (windowKey !== MAIN_WINDOW_KEY) {
+      FocusManager.byWindow.delete(windowKey);
+    }
   }
 
   /** 已登记窗格（保持登记序；聚焦失败回退与测试断言用） */

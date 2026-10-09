@@ -37,6 +37,7 @@ import i18nTest from './I18n.test';
 import benchMetricsTest from './BenchMetrics.test';
 import keyManagerLogicTest from './KeyManagerLogic.test';
 import cursorBlinkTest from './CursorBlink.test';
+import multiWindowTest from './MultiWindow.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -79,4 +80,5 @@ export default function testsuite() {
   benchMetricsTest();
   keyManagerLogicTest();
   cursorBlinkTest();
+  multiWindowTest();
 }

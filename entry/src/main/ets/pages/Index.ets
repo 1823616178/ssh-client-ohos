@@ -15,9 +15,10 @@
  *   - 只有显式「⤢」（迷你窗口标题栏 / 活动会话行）才 push TerminalPage；push 前迷你窗口
  *     先让出会话（寄存终端 + 解绑），全页返回后 onPageShow 递增 resumeTick 取回原会话。
  *   - 收起迷你窗口不断开会话；断开只在活动会话行「✕」里确认。
+ *   - 多窗口（平板 / 2in1）：已在独立终端窗口里的会话，点按行或 ⤢ 都是切到那个窗口
+ *     （HostListPage 处理，不经迷你窗口）；页面跳转一律走本页 UIContext 的 Router。
  */
 
-import { router } from '@kit.ArkUI';
 import { HostProfile } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
 import {
@@ -117,16 +118,16 @@ struct Index {
   private openSessionFullPage(sessionId: string): void {
     this.miniController.release();
     this.miniSheetShown = false;
-    pushTerminalForSession(sessionId);
+    pushTerminalForSession(this.getUIContext(), sessionId);
   }
 
   /** 迷你窗口标题栏「⤢」（迷你窗口已自行让出会话） */
   private onMiniOpenFullPage(sessionId: string, hostId: string): void {
     this.miniSheetShown = false;
     if (sessionId.length > 0) {
-      pushTerminalForSession(sessionId);
+      pushTerminalForSession(this.getUIContext(), sessionId);
     } else if (hostId.length > 0) {
-      pushTerminalForHost(hostId);
+      pushTerminalForHost(this.getUIContext(), hostId);
     }
   }
 
@@ -184,12 +185,12 @@ struct Index {
     }
     try {
       if (tab.needsHostId) {
-        router.pushUrl({
+        this.getUIContext().getRouter().pushUrl({
           url: tab.route,
           params: { hostId: this.selectedHostId }
         });
       } else {
-        router.pushUrl({ url: tab.route });
+        this.getUIContext().getRouter().pushUrl({ url: tab.route });
       }
     } catch (err) {
       Logger.warn(`打开右侧面板路由失败 ${tab.route}`, LOG_TAG);

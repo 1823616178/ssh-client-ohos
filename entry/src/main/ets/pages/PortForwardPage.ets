@@ -23,7 +23,6 @@ import {
   PortForwardViewModel
 } from '../viewmodel/PortForwardViewModel';
 import { ForwardRuntimeLog } from '../service/portforward/PortForwardRuntime';
-import { router } from '@kit.ArkUI';
 
 const LOG_TAG: string = 'PortForwardPage';
 
@@ -201,7 +200,7 @@ struct PortForwardPage {
   };
 
   private readRouteParams(): ForwardRouteParams {
-    const raw: object | null = router.getParams() as object | null;
+    const raw: object | null = this.getUIContext().getRouter().getParams() as object | null;
     if (raw === null) {
       return {};
     }
@@ -404,7 +403,7 @@ struct PortForwardPage {
     }
     const params: Record<string, Object> = {};
     params['hostId'] = this.hostId;
-    router.pushUrl({ url: 'pages/HostEditPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage', params: params });
   }
 }
 

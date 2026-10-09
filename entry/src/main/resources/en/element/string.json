@@ -13,6 +13,14 @@
       "value": "SSH Client"
     },
     {
+      "name": "TerminalWindowAbility_desc",
+      "value": "SSH standalone terminal window"
+    },
+    {
+      "name": "TerminalWindowAbility_label",
+      "value": "SSH Terminal"
+    },
+    {
       "name": "reason_vibrate",
       "value": "Haptic feedback for keys and copy success"
     },
