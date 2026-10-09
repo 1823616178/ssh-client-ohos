@@ -77,12 +77,6 @@ struct Index {
     }
   }
 
-  private openFullTerminal(): void {
-    if (this.selectedHostId.length > 0) {
-      pushTerminalForHost(this.getUIContext(), this.selectedHostId);
-    }
-  }
-
   private regions(): LayoutRegions {
     return resolveLayoutRegions(
       this.breakpoint,
@@ -211,63 +205,19 @@ struct Index {
 
   @Builder
   RightContentPane() {
-    Column() {
-      Row() {
-        Text(this.selectedHostName.length > 0 ? this.selectedHostName : this.selectedHostId)
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.textDim)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-        Button('全页终端')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.onAccent)
-          .backgroundColor(Tokens.Color.accent)
-          .borderRadius(Tokens.radius.sm)
-          .height(28)
-          .onClick(() => {
-            this.openFullTerminal();
-          })
-        Button('清除选择')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.text)
-          .backgroundColor(Tokens.Color.surfaceHover)
-          .borderRadius(Tokens.radius.sm)
-          .height(28)
-          .margin({ left: Tokens.space.xs })
-          .accessibilityText('清除当前主机选择')
-          .onClick(() => {
-            this.embedTerminal = false;
-            this.selectedHostId = '';
-            this.selectedHostName = '';
-          })
+    TerminalPaneEmbed({
+      hostId: this.selectedHostId,
+      onClose: (): void => {
+        this.embedTerminal = false;
+        this.selectedHostId = '';
+        this.selectedHostName = '';
+      },
+      onOpenFullPage: (hostId: string): void => {
+        pushTerminalForHost(this.getUIContext(), hostId);
       }
+    })
       .width('100%')
-      .padding({
-        left: Tokens.space.sm,
-        right: Tokens.space.sm,
-        top: Tokens.space.xs,
-        bottom: Tokens.space.xs
-      })
-      .backgroundColor(Tokens.Color.surface)
-
-      TerminalPaneEmbed({
-        hostId: this.selectedHostId,
-        onClose: (): void => {
-          this.embedTerminal = false;
-          this.selectedHostId = '';
-          this.selectedHostName = '';
-        },
-        onOpenFullPage: (hostId: string): void => {
-          pushTerminalForHost(this.getUIContext(), hostId);
-        }
-      })
-        .width('100%')
-        .layoutWeight(1)
-    }
-    .width('100%')
-    .height('100%')
-    .backgroundColor(Tokens.Color.appBg)
+      .height('100%')
   }
 
   /** lg 右侧侧面板（片段 / 转发 / 文件传输 → 全页路由） */
