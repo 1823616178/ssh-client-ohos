@@ -17,8 +17,13 @@
  *
  * 与其它输入框共存：页面里的普通 TextInput（密码框、搜索框）获焦时由 ArkUI 自行
  * attach，会顶掉本编辑器——回到终端时（点按/聚焦）重新 attach 即可。
+ *
+ * 多窗口：控制器仍是进程唯一，但 attach 绑定的是当时获焦的窗口。记下当前 owner
+ * 所在窗口（ownerWindowKey），窗口切换获焦时由该窗口的聚焦画布判断
+ * isOwnedByOtherWindow 后重新 attach（见 TerminalCanvas.onHostWindowActive）。
  */
 import { inputMethod } from '@kit.IMEKit';
+import { MAIN_WINDOW_KEY } from '../../common/constants/WindowKeys';
 import { Logger } from '../../common/utils/Logger';
 
 const LOG_TAG: string = 'TerminalIme';
@@ -48,6 +53,8 @@ export class TerminalImeEditor {
   private available: boolean = true;
   private listening: boolean = false;
   private ownerId: string = '';
+  /** 当前 owner 所在窗口（'' = 无 owner） */
+  private ownerWindowKey: string = '';
   private client: TerminalImeClient | null = null;
   private attached: boolean = false;
   private attaching: boolean = false;
@@ -73,6 +80,14 @@ export class TerminalImeEditor {
     return this.keyboardShown;
   }
 
+  /**
+   * 当前 owner 是否在别的窗口（多窗口：本窗口获焦时据此决定是否重新 attach）。
+   * 无 owner 时为 false——没有人在用输入法，不必抢。
+   */
+  isOwnedByOtherWindow(windowKey: string): boolean {
+    return this.ownerId.length > 0 && this.ownerWindowKey !== windowKey;
+  }
+
   /** 当前客户端是否为 ownerId（多窗格路由用） */
   isOwner(ownerId: string): boolean {
     return this.ownerId === ownerId && this.attached;
@@ -92,12 +107,14 @@ export class TerminalImeEditor {
    * 让 ownerId 成为输入目标并 attach（showKeyboard=true 时同时弹软键盘）。
    * 返回 false = attach 失败（已切 unavailable，调用方走兜底）。
    */
-  async attach(ownerId: string, client: TerminalImeClient, showKeyboard: boolean): Promise<boolean> {
+  async attach(ownerId: string, client: TerminalImeClient, showKeyboard: boolean,
+    windowKey: string = MAIN_WINDOW_KEY): Promise<boolean> {
     const controller = this.ensureController();
     if (controller === null) {
       return false;
     }
     this.ownerId = ownerId;
+    this.ownerWindowKey = windowKey;
     this.client = client;
     this.registerListeners(controller);
     if (this.attaching) {
@@ -125,7 +142,8 @@ export class TerminalImeEditor {
   }
 
   /** 已 attach 时只弹软键盘；否则走 attach(showKeyboard=true) */
-  async show(ownerId: string, client: TerminalImeClient): Promise<boolean> {
+  async show(ownerId: string, client: TerminalImeClient,
+    windowKey: string = MAIN_WINDOW_KEY): Promise<boolean> {
     if (this.controller !== null && this.attached && this.ownerId === ownerId) {
       try {
         await this.controller.showTextInput();
@@ -135,7 +153,7 @@ export class TerminalImeEditor {
         this.attached = false;
       }
     }
-    return this.attach(ownerId, client, true);
+    return this.attach(ownerId, client, true, windowKey);
   }
 
   /** 收起软键盘（保持 attach，物理键盘/再次弹出不需要重新绑定） */
@@ -154,6 +172,7 @@ export class TerminalImeEditor {
       return;
     }
     this.ownerId = '';
+    this.ownerWindowKey = '';
     this.client = null;
     const controller = this.controller;
     if (controller === null || !this.attached) {

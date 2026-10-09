@@ -8,7 +8,9 @@
     "srcEntry": "./ets/entryabilitystage/EntryAbilityStage.ets",
     "deviceTypes": [
       "phone",
-      "tablet"
+      "tablet",
+      // 多窗口：PC/2in1 上主机列表与多个终端窗口并排（TerminalWindowAbility）
+      "2in1"
     ],
     "deliveryWithInstall": true,
     "installationFree": false,
@@ -32,7 +34,8 @@
         "reason": "$string:reason_vibrate",
         "usedScene": {
           "abilities": [
-            "EntryAbility"
+            "EntryAbility",
+            "TerminalWindowAbility"
           ],
           "when": "inuse"
         }
@@ -43,7 +46,8 @@
         "reason": "$string:reason_read_pasteboard",
         "usedScene": {
           "abilities": [
-            "EntryAbility"
+            "EntryAbility",
+            "TerminalWindowAbility"
           ],
           "when": "inuse"
         }
@@ -73,6 +77,33 @@
               "ohos.want.action.home"
             ]
           }
+        ]
+      },
+      {
+        // 多窗口方案 A：独立终端窗口。specified 实例由 EntryAbilityStage.onAcceptWant 分配
+        // （`new:<uuid>` 新开 / `session:<id>` 复用）；只由本应用拉起，不上桌面
+        "name": "TerminalWindowAbility",
+        "srcEntry": "./ets/terminalwindowability/TerminalWindowAbility.ets",
+        "description": "$string:TerminalWindowAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:TerminalWindowAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "launchType": "specified",
+        "exported": false,
+        // 关窗即移出最近任务（会话已转后台，可从主机列表恢复）
+        "removeMissionAfterTerminate": true,
+        "supportWindowMode": [
+          "fullscreen",
+          "split",
+          "floating"
+        ],
+        // 单位 vp：终端至少容得下约 40 列 × 10 行与顶栏 / 键条
+        "minWindowWidth": 360,
+        "minWindowHeight": 320,
+        // 后台保活长时任务可能移交到本窗口（主窗口先关时），需同样声明 dataTransfer
+        "backgroundModes": [
+          "dataTransfer"
         ]
       }
     ],

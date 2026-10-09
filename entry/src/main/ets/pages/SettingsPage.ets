@@ -14,7 +14,6 @@
  * 纪律：颜色与尺寸一律走 Design Token（`theme/Tokens`），不写魔法数字。
  */
 
-import { router } from '@kit.ArkUI';
 import { Tokens } from '../theme/Tokens';
 import { PageHeader } from '../view/PageHeader';
 import { Logger } from '../common/utils/Logger';
@@ -60,7 +59,7 @@ struct SettingsPage {
   /** 常亮档位落库 + 通知常亮服务（当前若正开着终端页，立刻按新档生效） */
   private applyKeepScreenOn(): void {
     SettingsRepository.setKeepScreenOnMode(this.keepScreenOnMode);
-    ScreenAwake.get().refreshSettings();
+    ScreenAwake.refreshAllSettings();
     Logger.info(`屏幕常亮档位已更新：${this.keepScreenOnMode}`, LOG_TAG);
   }
 
@@ -249,7 +248,7 @@ struct SettingsPage {
     .accessibilityText(title)
     .accessibilityDescription(subtitle)
     .onClick(() => {
-      router.pushUrl({ url: url });
+      this.getUIContext().getRouter().pushUrl({ url: url });
     })
   }
 

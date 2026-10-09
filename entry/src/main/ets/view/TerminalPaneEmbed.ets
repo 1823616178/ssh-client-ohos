@@ -3,15 +3,17 @@
  *
  * 与 TerminalPage 同用 TerminalViewModel + TerminalCanvas + FocusManager，
  * 侧栏内为单窗格终端；多标签/分屏与键盘避让等完整能力走全页 TerminalPage。
- * 全页入口：pushTerminalForHost(hostId)（common/utils/TerminalNavigation）。
+ * 全页入口：父组件经 onOpenFullPage 注入（Index → pushTerminalForHost(uiContext, hostId)）。
  */
 import { SshTerminal } from '../napi/SshTerminal';
 import { Logger } from '../common/utils/Logger';
-import { pushTerminalForHost } from '../common/utils/TerminalNavigation';
 import { Tokens } from '../theme/Tokens';
 import { TerminalCanvas } from './TerminalCanvas';
 import { FrameScheduler } from './FrameScheduler';
 import { FocusManager } from './terminal/FocusManager';
+import { paneIdPrefixOf } from '../common/constants/WindowKeys';
+import { windowKeyOf } from '../common/utils/WindowContext';
+import { PrefixedPaneIdFactory } from '../viewmodel/PaneTree';
 import {
   OverlayModel,
   TerminalFocusHostLike,
@@ -22,22 +24,28 @@ import {
 const LOG_TAG: string = 'TerminalPaneEmbed';
 const EMBED_PANE_ID: string = 'index-side-terminal';
 
-/** 生产焦点宿主：与 TerminalPage.PageFocusHost 同实现 */
+/** 生产焦点宿主：与 TerminalPage.PageFocusHost 同实现（绑定所在窗口的 FocusManager） */
 class EmbedFocusHost implements TerminalFocusHostLike {
+  private readonly fm: FocusManager;
+
+  constructor(fm: FocusManager) {
+    this.fm = fm;
+  }
+
   register(id: string): boolean {
-    return FocusManager.get().register(id);
+    return this.fm.register(id);
   }
 
   unregister(id: string): boolean {
-    return FocusManager.get().unregister(id);
+    return this.fm.unregister(id);
   }
 
   focus(id: string): boolean {
-    return FocusManager.get().focus(id);
+    return this.fm.focus(id);
   }
 
   addListener(cb: (id: string) => void): () => void {
-    return FocusManager.get().addListener(cb);
+    return this.fm.addListener(cb);
   }
 }
 
@@ -47,13 +55,16 @@ export struct TerminalPaneEmbed {
   @Prop @Watch('onHostIdChanged') hostId: string = '';
   /** 关闭嵌入（右栏回到提示/主机详情） */
   onClose: () => void = () => {};
-  /** 打开全页 TerminalPage（多标签/分屏等完整能力） */
-  onOpenFullPage: (hostId: string) => void = (id: string): void => {
-    pushTerminalForHost(id);
-  };
+  /**
+   * 打开全页 TerminalPage（多标签/分屏等完整能力）。由父组件注入——跳转须走
+   * 父页 UIContext 的 Router（多窗口下全局 router 绑定窗口不确定），缺省不动作。
+   */
+  onOpenFullPage: (hostId: string) => void = (_id: string): void => {};
 
   /** V1 观察不到 @ObservedV2：@State 镜像 + onUiChange 驱动 */
   @State private uiTick: number = 0;
+  /** 首叶 / 画布 focusId（主窗口即 EMBED_PANE_ID；非主窗口带窗口前缀） */
+  @State private embedPaneId: string = EMBED_PANE_ID;
   @State private hostName: string = '';
   @State private sessionState: string = '';
   @State private overlayModel: OverlayModel = deriveOverlay({
@@ -87,6 +98,8 @@ export struct TerminalPaneEmbed {
     if (hostId.length === 0) {
       return;
     }
+    const prefix: string = paneIdPrefixOf(windowKeyOf(this.getUIContext()));
+    this.embedPaneId = `${prefix}${EMBED_PANE_ID}`;
     const vm: TerminalViewModel = new TerminalViewModel({
       onContentDirty: (): void => {
         FrameScheduler.get().wakeup();
@@ -94,9 +107,10 @@ export struct TerminalPaneEmbed {
       onUiChange: (): void => {
         this.syncFromVm();
       },
-      focusHost: new EmbedFocusHost(),
-      // 与画布 focusId 一致，且不与全页终端首叶 terminal-main 抢绑定
-      mainPaneId: EMBED_PANE_ID
+      focusHost: new EmbedFocusHost(FocusManager.forWindow(windowKeyOf(this.getUIContext()))),
+      // 与画布 focusId 一致，且不与全页终端首叶 terminal-main 抢绑定；非主窗口再加窗口前缀
+      mainPaneId: this.embedPaneId,
+      paneIdFactory: new PrefixedPaneIdFactory(prefix)
     });
     this.vm = vm;
     vm.start({ hostId: hostId, sessionId: '' }).catch((err: Object) => {
@@ -174,7 +188,7 @@ export struct TerminalPaneEmbed {
         if (this.canvasTerminal !== null) {
           TerminalCanvas({
             terminal: this.canvasTerminal,
-            focusId: EMBED_PANE_ID,
+            focusId: this.embedPaneId,
             autoFocus: true,
             visible: true
           })

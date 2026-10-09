@@ -14,7 +14,6 @@
  *   - 临时主机（快速连接）不进右栏，仍 sessionId 全页 push。
  */
 
-import { router } from '@kit.ArkUI';
 import { HostProfile } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
 import {
@@ -80,7 +79,7 @@ struct Index {
 
   private openFullTerminal(): void {
     if (this.selectedHostId.length > 0) {
-      pushTerminalForHost(this.selectedHostId);
+      pushTerminalForHost(this.getUIContext(), this.selectedHostId);
     }
   }
 
@@ -101,12 +100,12 @@ struct Index {
     }
     try {
       if (tab.needsHostId) {
-        router.pushUrl({
+        this.getUIContext().getRouter().pushUrl({
           url: tab.route,
           params: { hostId: this.selectedHostId }
         });
       } else {
-        router.pushUrl({ url: tab.route });
+        this.getUIContext().getRouter().pushUrl({ url: tab.route });
       }
     } catch (err) {
       Logger.warn(`打开右侧面板路由失败 ${tab.route}`, LOG_TAG);
@@ -260,7 +259,7 @@ struct Index {
           this.selectedHostName = '';
         },
         onOpenFullPage: (hostId: string): void => {
-          pushTerminalForHost(hostId);
+          pushTerminalForHost(this.getUIContext(), hostId);
         }
       })
         .width('100%')

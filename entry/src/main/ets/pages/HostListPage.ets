@@ -14,7 +14,6 @@
  * 递增 refreshTick 触发重载（U2 接线，@Prop @Watch）。
  */
 
-import { router } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { HostProfile, createDefaultHostProfile } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
@@ -23,7 +22,15 @@ import { CredentialStore } from '../repository/CredentialStore';
 import { SessionEventListener, SessionInfo, SessionManager } from '../service/SessionManager';
 import { Tokens } from '../theme/Tokens';
 import { SyncRuntime } from '../service/sync/SyncRuntime';
-import { pushTerminalForHost, pushTerminalForSession } from '../common/utils/TerminalNavigation';
+import {
+  focusWindowOfSession,
+  openTerminalWindow,
+  pushTerminalForHost,
+  pushTerminalForSession
+} from '../common/utils/TerminalNavigation';
+import { MAIN_WINDOW_KEY, windowKeyOfPaneId } from '../common/constants/WindowKeys';
+import { abilityContextOf, supportsMultiWindow } from '../common/utils/WindowContext';
+import { common } from '@kit.AbilityKit';
 import {
   ActiveSessionItem,
   ActiveSessionLike,
@@ -100,6 +107,8 @@ export struct HostListPage {
   private readonly viewModel: HostListViewModel = new HostListViewModel();
   private readonly dataSource: HostRowDataSource = new HostRowDataSource();
   // 快速连接表单值（不需要响应式，普通成员即可）
+  /** 平板 / 2in1 才露「新窗口」入口（手机保持改造前交互） */
+  private readonly multiWindow: boolean = supportsMultiWindow();
   private quickAddress: string = '';
   private quickUser: string = '';
 
@@ -154,8 +163,25 @@ export struct HostListPage {
     this.activeSessions = buildActiveSessionItems(sessions, names);
   }
 
+  /**
+   * 恢复活动会话。多窗口：会话正显示在某个终端窗口里时，把那个窗口带到前台，
+   * 而不是在本窗口再开一页去抢窗格绑定；其余情况与改造前相同（push 终端页）。
+   */
   private resumeSession(sessionId: string): void {
-    pushTerminalForSession(sessionId);
+    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+    const paneId: string | null = info === null ? null : info.paneId;
+    if (paneId !== null && windowKeyOfPaneId(paneId) !== MAIN_WINDOW_KEY) {
+      const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+      if (context !== null) {
+        focusWindowOfSession(context, windowKeyOfPaneId(paneId), sessionId).then((ok: boolean) => {
+          if (!ok) {
+            this.toast('该会话已在其他窗口打开');
+          }
+        });
+        return;
+      }
+    }
+    pushTerminalForSession(this.getUIContext(), sessionId);
   }
 
   private confirmCloseSession(item: ActiveSessionItem): void {
@@ -233,7 +259,7 @@ export struct HostListPage {
 
   /** 「+」与空状态按钮共用：跳 HostEditPage 新建（U2 接线） */
   private onAddHost(): void {
-    router.pushUrl({ url: 'pages/HostEditPage' });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage' });
   }
 
   /**
@@ -246,7 +272,26 @@ export struct HostListPage {
       this.onOpenHost(host.id);
       return;
     }
-    pushTerminalForHost(host.id);
+    pushTerminalForHost(this.getUIContext(), host.id);
+  }
+
+  /**
+   * 滑动菜单「新窗口」（仅平板 / 2in1）：在独立系统窗口里按 hostId 新拨一路会话，
+   * 与当前窗口互不影响。拉起失败回退为本窗口全页打开。
+   */
+  private openTerminalInNewWindow(host: HostProfile): void {
+    recordHostLastUsed(host.id);
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context === null) {
+      pushTerminalForHost(this.getUIContext(), host.id);
+      return;
+    }
+    openTerminalWindow(context, host.id, [], false).then((ok: boolean) => {
+      if (!ok) {
+        this.toast('新窗口打开失败，已在当前窗口打开');
+        pushTerminalForHost(this.getUIContext(), host.id);
+      }
+    });
   }
 
   /** 快速连接：host[:port] + 用户名 → 临时 HostProfile（不落库）→ 先受理连接再持 sessionId 跳 TerminalPage */
@@ -266,7 +311,7 @@ export struct HostListPage {
     // 临时主机不落库，TerminalPage 无法按 hostId 取回，故先受理连接、持 sessionId 跳转
     SessionManager.get().connect(host).then((info: SessionInfo) => {
       Logger.info(`快速连接已受理：${info.sessionId}（${displayName}）`, LOG_TAG);
-      pushTerminalForSession(info.sessionId);
+      pushTerminalForSession(this.getUIContext(), info.sessionId);
     }).catch((err: Object) => {
       const message: string = err instanceof Error ? err.message : '连接发起失败';
       Logger.error(`快速连接发起失败（${displayName}）: ${JSON.stringify(err)}`, LOG_TAG);
@@ -278,14 +323,14 @@ export struct HostListPage {
   private onEditHost(hostId: string): void {
     const params: Record<string, Object> = {};
     params['hostId'] = hostId;
-    router.pushUrl({ url: 'pages/HostEditPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/HostEditPage', params: params });
   }
 
   /** 滑动菜单「SFTP」：带 hostId（SftpPage 无会话时会提示先建立 SSH 会话） */
   private onOpenSftp(host: HostProfile): void {
     const params: Record<string, Object> = {};
     params['hostId'] = host.id;
-    router.pushUrl({ url: 'pages/SftpPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/SftpPage', params: params });
   }
 
   /** 滑动菜单「转发」：PortForwardPage（规则编辑仍在 HostEdit） */
@@ -293,7 +338,7 @@ export struct HostListPage {
     const params: Record<string, Object> = {};
     params['hostId'] = host.id;
     params['hostName'] = host.name.length > 0 ? host.name : host.host;
-    router.pushUrl({ url: 'pages/PortForwardPage', params: params });
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/PortForwardPage', params: params });
   }
 
   /** 滑动菜单「删除」→ 二次确认对话框 */
@@ -570,7 +615,7 @@ export struct HostListPage {
     .margin({ right: Tokens.space.xs })
     .accessibilityText(`云同步：${this.syncChipSub}`)
     .onClick(() => {
-      router.pushUrl({ url: 'pages/AccountSyncPage' });
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/AccountSyncPage' });
     })
   }
 
@@ -591,7 +636,7 @@ export struct HostListPage {
     .accessibilityText('设置')
     .accessibilityDescription('打开通用设置')
     .onClick(() => {
-      router.pushUrl({ url: 'pages/SettingsPage' });
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/SettingsPage' });
     })
   }
 
@@ -612,7 +657,7 @@ export struct HostListPage {
     .accessibilityText('配置中心')
     .accessibilityDescription('主机、分组、片段与转发的集中管理')
     .onClick(() => {
-      router.pushUrl({ url: 'pages/ConfigManagerPage' });
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/ConfigManagerPage' });
     })
   }
 
@@ -838,11 +883,25 @@ export struct HostListPage {
     }
   }
 
-  /** 滑动菜单：编辑 + SFTP + 转发 + 删除（danger 底色，与次操作视觉隔离） */
+  /** 滑动菜单：[新窗口] + 编辑 + SFTP + 转发 + 删除（danger 底色，与次操作视觉隔离） */
   @Builder
   SwipeActions(row: HostListRow) {
     if (row.host !== null) {
       Row() {
+        if (this.multiWindow) {
+          Button('新窗口')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.text)
+            .backgroundColor(Tokens.Color.surfaceHover)
+            .borderRadius(Tokens.radius.sm)
+            .height('100%')
+            .margin({ right: Tokens.space.xs })
+            .onClick(() => {
+              if (row.host !== null) {
+                this.openTerminalInNewWindow(row.host);
+              }
+            })
+        }
         Button('编辑')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.text)
