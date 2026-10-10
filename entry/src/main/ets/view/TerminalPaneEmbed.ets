@@ -1,28 +1,50 @@
 /**
- * TerminalPaneEmbed —— Index md/lg 右栏的单窗格终端嵌入。
+ * TerminalPaneEmbed —— 首页「迷你终端窗口」：md/lg 嵌在 Index 中栏，sm 放在底部半屏面板。
  *
- * 与 TerminalPage 同用 TerminalViewModel + TerminalCanvas + FocusManager，
- * 侧栏内为单窗格终端；多标签/分屏与键盘避让等完整能力走全页 TerminalPage。
- * 全页入口：父组件经 onOpenFullPage 注入（Index → pushTerminalForHost(uiContext, hostId)）。
+ * 与 TerminalPage 同用 TerminalViewModel + TerminalCanvas + FocusManager（按所在窗口取实例），单窗格。
+ * 目标由父页经 `target`（encodeMiniTarget：按主机新拨 / 接管既有会话）驱动：
+ *   - 切换目标 = 旧 VM detach（终端寄存、窗格解绑、会话保持后台）→ 新 VM 接管，
+ *     同一个 TerminalCanvas 实例换绑终端：不重连、回滚保留、输入法焦点不丢；
+ *   - 「⤢ 全页」：先 detach 让出会话，再由父页 push TerminalPage（父页 UIContext 的 Router）；
+ *   - 全页返回：父页递增 `resumeTick` → 按原会话取回（decideMiniResume；全页尚未解绑则短暂重试）；
+ *   - 收起 / 组件销毁一律 detach，从不关闭会话（断开在活动会话行里显式操作）。
+ * 多窗口：窗格 id 带所在窗口前缀（主窗口无前缀，与改造前一致）；目标会话正显示在别的系统窗口时
+ * 不抢绑定——把那个窗口带到前台、迷你窗口回到空态并提示（VM onSessionElsewhere）。
+ * 切换会话不自动弹软键盘（浏览列表时不遮挡），点按迷你终端再输入；外接键盘同理点按聚焦。
  */
 import { SshTerminal } from '../napi/SshTerminal';
 import { Logger } from '../common/utils/Logger';
+import { SessionInfo, SessionManager } from '../service/SessionManager';
+import { common } from '@kit.AbilityKit';
+import { focusWindowOfSession } from '../common/utils/TerminalNavigation';
+import { abilityContextOf, windowKeyOf } from '../common/utils/WindowContext';
 import { Tokens } from '../theme/Tokens';
 import { TerminalCanvas } from './TerminalCanvas';
 import { FrameScheduler } from './FrameScheduler';
 import { FocusManager } from './terminal/FocusManager';
-import { paneIdPrefixOf } from '../common/constants/WindowKeys';
-import { windowKeyOf } from '../common/utils/WindowContext';
+import { paneIdPrefixOf, windowKeyOfPaneId } from '../common/constants/WindowKeys';
 import { PrefixedPaneIdFactory } from '../viewmodel/PaneTree';
 import {
   OverlayModel,
+  OverlayPresentation,
   TerminalFocusHostLike,
   TerminalViewModel,
-  deriveOverlay
+  deriveOverlay,
+  overlayPresentation
 } from '../viewmodel/TerminalViewModel';
+import {
+  MINI_RESUME_RETRY_LIMIT,
+  MINI_RESUME_RETRY_MS,
+  MINI_TERMINAL_PANE_ID,
+  MiniResumeAction,
+  MiniTarget,
+  SessionActivityTracker,
+  decideMiniResume,
+  parseMiniTarget
+} from '../viewmodel/MiniTerminalModel';
 
 const LOG_TAG: string = 'TerminalPaneEmbed';
-const EMBED_PANE_ID: string = 'index-side-terminal';
+const HEADER_BUTTON_VP: number = 40;
 
 /** 生产焦点宿主：与 TerminalPage.PageFocusHost 同实现（绑定所在窗口的 FocusManager） */
 class EmbedFocusHost implements TerminalFocusHostLike {
@@ -49,24 +71,44 @@ class EmbedFocusHost implements TerminalFocusHostLike {
   }
 }
 
+/**
+ * 父页持有的控制器：push 全页前让迷你窗口先让出会话（同步 detach），
+ * 避免全页 bindPane 时会话仍绑在迷你窗格上。
+ */
+export class MiniTerminalController {
+  releaseHandler: () => void = (): void => {};
+  currentSessionHandler: () => string = (): string => '';
+
+  release(): void {
+    this.releaseHandler();
+  }
+
+  currentSessionId(): string {
+    return this.currentSessionHandler();
+  }
+}
+
 @Component
 export struct TerminalPaneEmbed {
-  /** 连接目标主机 id（变化时拆旧建新） */
-  @Prop @Watch('onHostIdChanged') hostId: string = '';
-  /** 关闭嵌入（右栏回到提示/主机详情） */
+  /** encodeMiniTarget 编码的目标（'' = 空态） */
+  @Prop @Watch('onTargetChanged') target: string = '';
+  /** 父页 onPageShow 递增：从全页终端返回后取回原会话 */
+  @Prop @Watch('onResumeTick') resumeTick: number = 0;
+  /** 底部面板形态：标题栏更紧凑 */
+  @Prop compact: boolean = false;
+  /** 父页控制器（可选） */
+  controller: MiniTerminalController | null = null;
+  /** 收起迷你窗口（会话保持后台） */
   onClose: () => void = () => {};
-  /**
-   * 打开全页 TerminalPage（多标签/分屏等完整能力）。由父组件注入——跳转须走
-   * 父页 UIContext 的 Router（多窗口下全局 router 绑定窗口不确定），缺省不动作。
-   */
-  onOpenFullPage: (hostId: string) => void = (_id: string): void => {};
+  /** 打开全页 TerminalPage：sessionId 非空接管会话；否则按 hostId 新拨（连接尚未受理时） */
+  onOpenFullPage: (sessionId: string, hostId: string) => void = (_s: string, _h: string): void => {};
+  /** 迷你窗口当前会话变化（'' = 无） */
+  onSessionChanged: (sessionId: string, hostId: string) => void = (_s: string, _h: string): void => {};
 
-  /** V1 观察不到 @ObservedV2：@State 镜像 + onUiChange 驱动 */
-  @State private uiTick: number = 0;
-  /** 首叶 / 画布 focusId（主窗口即 EMBED_PANE_ID；非主窗口带窗口前缀） */
-  @State private embedPaneId: string = EMBED_PANE_ID;
+  /** 首叶 / 画布 focusId（主窗口即 MINI_TERMINAL_PANE_ID；非主窗口带窗口前缀） */
+  @State private embedPaneId: string = MINI_TERMINAL_PANE_ID;
   @State private hostName: string = '';
-  @State private sessionState: string = '';
+  @State private terminalTitle: string = '';
   @State private overlayModel: OverlayModel = deriveOverlay({
     state: '',
     reconnectCountdownSec: 0,
@@ -77,141 +119,268 @@ export struct TerminalPaneEmbed {
     startError: ''
   });
   @State private canvasTerminal: SshTerminal | null = null;
+  @State private emptyHint: string = '';
 
   private vm: TerminalViewModel | null = null;
+  /** 最近一次显示的会话（全页返回时据此取回） */
+  private rememberedSessionId: string = '';
+  private rememberedHostId: string = '';
+  /** 按主机新拨、连接尚未受理时的主机 id（⤢ 退化为按主机全页） */
+  private pendingHostId: string = '';
+  private reportedSessionId: string = '';
+  private resumeTimer: number = -1;
+  private resumeAttempts: number = 0;
+
+  /** 本实例注册到控制器的处理函数（断点切换时新旧实例可能短暂并存，注销前比对身份） */
+  private readonly releaseFn: () => void = (): void => {
+    this.release();
+  };
+  private readonly currentSessionFn: () => string = (): string => this.rememberedSessionId;
 
   aboutToAppear(): void {
-    this.startVm(this.hostId);
+    if (this.controller !== null) {
+      this.controller.releaseHandler = this.releaseFn;
+      this.controller.currentSessionHandler = this.currentSessionFn;
+    }
+    this.applyTarget(parseMiniTarget(this.target));
   }
 
   aboutToDisappear(): void {
-    this.disposeVm();
+    this.cancelResume();
+    this.release();
+    if (this.controller !== null && this.controller.releaseHandler === this.releaseFn) {
+      this.controller.releaseHandler = (): void => {};
+      this.controller.currentSessionHandler = (): string => '';
+    }
   }
 
-  private onHostIdChanged(): void {
-    this.disposeVm();
-    this.canvasTerminal = null;
-    this.startVm(this.hostId);
+  private onTargetChanged(): void {
+    this.applyTarget(parseMiniTarget(this.target));
   }
 
-  private startVm(hostId: string): void {
-    if (hostId.length === 0) {
+  private onResumeTick(): void {
+    this.resumeAttempts = 0;
+    this.tryResume();
+  }
+
+  private applyTarget(target: MiniTarget): void {
+    this.cancelResume();
+    if (target.kind === 'none') {
+      this.release();
+      this.rememberedSessionId = '';
+      this.rememberedHostId = '';
+      this.reportSession();
       return;
     }
-    const prefix: string = paneIdPrefixOf(windowKeyOf(this.getUIContext()));
-    this.embedPaneId = `${prefix}${EMBED_PANE_ID}`;
+    if (target.kind === 'session' && target.id === this.reportedSessionId && this.vm !== null) {
+      return; // 已在显示
+    }
+    this.release();
+    if (target.kind === 'session') {
+      this.rememberedSessionId = target.id;
+      this.rememberedHostId = this.hostIdOf(target.id);
+      this.pendingHostId = '';
+      SessionActivityTracker.global().markSeen(target.id);
+      this.startVm('', target.id);
+    } else {
+      this.rememberedSessionId = '';
+      this.rememberedHostId = target.id;
+      this.pendingHostId = target.id;
+      this.startVm(target.id, '');
+    }
+  }
+
+  private startVm(hostId: string, sessionId: string): void {
+    const windowKey: string = windowKeyOf(this.getUIContext());
+    const prefix: string = paneIdPrefixOf(windowKey);
+    this.embedPaneId = `${prefix}${MINI_TERMINAL_PANE_ID}`;
     const vm: TerminalViewModel = new TerminalViewModel({
       onContentDirty: (): void => {
         FrameScheduler.get().wakeup();
       },
       onUiChange: (): void => {
-        this.syncFromVm();
+        if (this.vm === vm) {
+          this.syncFromVm();
+        }
       },
-      focusHost: new EmbedFocusHost(FocusManager.forWindow(windowKeyOf(this.getUIContext()))),
+      focusHost: new EmbedFocusHost(FocusManager.forWindow(windowKey)),
       // 与画布 focusId 一致，且不与全页终端首叶 terminal-main 抢绑定；非主窗口再加窗口前缀
       mainPaneId: this.embedPaneId,
-      paneIdFactory: new PrefixedPaneIdFactory(prefix)
+      paneIdFactory: new PrefixedPaneIdFactory(prefix),
+      onSessionElsewhere: (elsewhereSessionId: string, paneId: string): void => {
+        if (this.vm === vm) {
+          this.onSessionElsewhere(elsewhereSessionId, paneId);
+        }
+      }
     });
     this.vm = vm;
-    vm.start({ hostId: hostId, sessionId: '' }).catch((err: Object) => {
-      Logger.error(`嵌入终端启动异常: ${JSON.stringify(err)}`, LOG_TAG);
+    this.emptyHint = '';
+    // sessionId 路径在 start 内同步完成 adoptSession（取回寄存终端），画布当帧即可换绑
+    vm.start({ hostId: hostId, sessionId: sessionId }).catch((err: Object) => {
+      Logger.error(`迷你终端启动异常: ${JSON.stringify(err)}`, LOG_TAG);
     });
     this.syncFromVm();
   }
 
-  private disposeVm(): void {
-    if (this.vm !== null) {
-      this.vm.dispose();
-      this.vm = null;
+  /** 让出会话：终端寄存、窗格解绑、会话保持后台（幂等） */
+  private release(): void {
+    const vm: TerminalViewModel | null = this.vm;
+    if (vm === null) {
+      return;
     }
+    this.vm = null;
+    vm.detach();
+    this.canvasTerminal = null;
+  }
+
+  private cancelResume(): void {
+    if (this.resumeTimer >= 0) {
+      clearTimeout(this.resumeTimer);
+      this.resumeTimer = -1;
+    }
+  }
+
+  /** 全页返回：按原会话取回；全页尚未解绑则短暂重试；会话已结束则回到空态 */
+  private tryResume(): void {
+    this.cancelResume();
+    if (this.vm !== null || this.rememberedSessionId.length === 0) {
+      return;
+    }
+    const sessionId: string = this.rememberedSessionId;
+    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+    const action: MiniResumeAction = decideMiniResume(
+      info === null ? null : { state: info.state, paneId: info.paneId }, this.embedPaneId);
+    switch (action) {
+      case 'adopt':
+        this.startVm('', sessionId);
+        break;
+      case 'wait':
+        if (this.resumeAttempts < MINI_RESUME_RETRY_LIMIT) {
+          this.resumeAttempts++;
+          this.resumeTimer = setTimeout((): void => {
+            this.resumeTimer = -1;
+            this.tryResume();
+          }, MINI_RESUME_RETRY_MS);
+        } else {
+          Logger.warn('迷你终端取回会话超时：会话仍被其他窗格持有', LOG_TAG);
+          this.emptyHint = '该会话正在全页终端中使用';
+        }
+        break;
+      case 'elsewhere':
+        // 会话已迁去独立窗口（全页「在新窗口打开」）：不等、不抢，回到空态
+        this.rememberedSessionId = '';
+        this.emptyHint = '该会话已在独立窗口中打开，点按左侧对应行可切换过去';
+        this.reportSession();
+        break;
+      case 'gone':
+        this.rememberedSessionId = '';
+        this.emptyHint = '会话已结束，可在左侧选择其他活动会话';
+        this.reportSession();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * VM 发现目标会话正绑在不属于迷你窗口的窗格上（start 已以「已在其他窗口打开」失败返回）：
+   * 放弃本次接管、迷你窗口回到空态；会话在别的系统窗口则把那个窗口带到前台。
+   */
+  private onSessionElsewhere(sessionId: string, paneId: string): void {
+    const owner: string = windowKeyOfPaneId(paneId);
+    const here: string = windowKeyOfPaneId(this.embedPaneId);
+    this.release();
+    this.rememberedSessionId = '';
+    this.pendingHostId = '';
+    this.reportSession();
+    if (owner === here) {
+      this.emptyHint = '该会话正在全页终端中使用';
+      return;
+    }
+    this.emptyHint = '该会话已在独立窗口中打开，已切换到该窗口';
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context !== null) {
+      focusWindowOfSession(context, owner, sessionId).catch((err: Object) => {
+        Logger.warn(`切换到会话所在窗口失败: ${JSON.stringify(err)}`, LOG_TAG);
+      });
+    }
+  }
+
+  private hostIdOf(sessionId: string): string {
+    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+    return info === null ? '' : info.hostId;
+  }
+
+  private reportSession(): void {
+    const current: string = this.rememberedSessionId;
+    if (current === this.reportedSessionId) {
+      return;
+    }
+    this.reportedSessionId = current;
+    this.onSessionChanged(current, current.length > 0 ? this.rememberedHostId : '');
   }
 
   /** VM → @State 镜像（与 TerminalPage.syncFromVm 同约定） */
   private syncFromVm(): void {
     const vm: TerminalViewModel | null = this.vm;
-    this.uiTick = this.uiTick + 1;
     if (vm === null) {
       return;
     }
     this.hostName = vm.hostName;
-    this.sessionState = vm.sessionState;
+    this.terminalTitle = vm.terminalTitle;
     this.overlayModel = vm.overlay;
     const term = vm.terminal;
     this.canvasTerminal = term as SshTerminal | null;
+    const sessionId: string = vm.currentSessionId;
+    if (sessionId.length > 0 && sessionId !== this.rememberedSessionId) {
+      this.rememberedSessionId = sessionId;
+      this.rememberedHostId = this.hostIdOf(sessionId);
+      this.pendingHostId = '';
+    }
+    this.reportSession();
+  }
+
+  private openFullPage(): void {
+    const sessionId: string = this.vm !== null ? this.vm.currentSessionId : this.rememberedSessionId;
+    const hostId: string = this.pendingHostId;
+    if (sessionId.length === 0 && hostId.length === 0) {
+      return;
+    }
+    // 先让出会话（寄存终端 + 解绑），全页才能绑定同一会话并取回画面
+    this.release();
+    if (sessionId.length > 0) {
+      SessionActivityTracker.global().markSeen(sessionId);
+    }
+    this.onOpenFullPage(sessionId, sessionId.length > 0 ? '' : hostId);
+  }
+
+  private presentation(): OverlayPresentation {
+    return overlayPresentation(this.overlayModel, this.canvasTerminal !== null);
+  }
+
+  private headerTitle(): string {
+    const name: string = this.hostName.length > 0 ? this.hostName : '迷你终端';
+    return this.terminalTitle.length > 0 ? `${name} · ${this.terminalTitle}` : name;
   }
 
   build() {
     Column() {
-      Row() {
-        Text(this.hostName.length > 0 ? this.hostName : '侧栏终端')
-          .fontSize(Tokens.fontSize.caption)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Tokens.Color.text)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-        Button('全页终端')
-          .fontSize(Tokens.fontSize.caption)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.Color.onAccent)
-          .backgroundColor(Tokens.Color.accent)
-          .borderRadius(Tokens.radius.sm)
-          .height(32)
-          .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
-          .accessibilityText('打开完整终端页')
-          .onClick(() => {
-            this.onOpenFullPage(this.hostId);
-          })
-        Button('关闭')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.textDim)
-          .backgroundColor(Tokens.Color.surfaceHover)
-          .borderRadius(Tokens.radius.sm)
-          .height(32)
-          .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
-          .margin({ left: Tokens.space.xs })
-          .accessibilityText('关闭侧栏终端')
-          .onClick(() => {
-            this.onClose();
-          })
-      }
-      .width('100%')
-      .padding({
-        left: Tokens.space.sm,
-        right: Tokens.space.sm,
-        top: Tokens.space.xs,
-        bottom: Tokens.space.xs
-      })
-      .backgroundColor(Tokens.Color.surface)
-
-      Stack() {
+      this.Header()
+      Stack({ alignContent: Alignment.Top }) {
         if (this.canvasTerminal !== null) {
           TerminalCanvas({
             terminal: this.canvasTerminal,
             focusId: this.embedPaneId,
-            autoFocus: true,
+            autoFocus: false,
             visible: true
           })
             .width('100%')
             .height('100%')
-        } else {
-          Column() {
-            Text(this.overlayModel.kind === 'error'
-              ? (this.overlayModel.detail.length > 0 ? this.overlayModel.detail : this.overlayModel.title)
-              : (this.overlayModel.title.length > 0 ? this.overlayModel.title : '正在准备连接…'))
-              .fontSize(Tokens.fontSize.body)
-              .fontColor(Tokens.Color.text)
-            if (this.overlayModel.detail.length > 0) {
-              Text(this.overlayModel.detail)
-                .fontSize(Tokens.fontSize.caption)
-                .fontColor(Tokens.Color.textDim)
-                .margin({ top: Tokens.space.xs })
-            }
+          if (this.presentation() === 'banner') {
+            this.Banner()
           }
-          .width('100%')
-          .height('100%')
-          .justifyContent(FlexAlign.Center)
-          .backgroundColor(Tokens.Color.appBg)
+        } else {
+          this.EmptyOrOverlay()
         }
       }
       .layoutWeight(1)
@@ -220,6 +389,135 @@ export struct TerminalPaneEmbed {
     }
     .width('100%')
     .height('100%')
+    .backgroundColor(Tokens.Color.appBg)
+  }
+
+  @Builder
+  Header() {
+    Row() {
+      Text(this.headerTitle())
+        .fontSize(Tokens.fontSize.caption)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.Color.text)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+        .accessibilityText(`迷你终端：${this.headerTitle()}`)
+      Button() {
+        Text(this.compact ? '⤢' : '⤢ 全页')
+          .fontSize(Tokens.fontSize.caption)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.onAccent)
+      }
+      .backgroundColor(Tokens.Color.accent)
+      .borderRadius(Tokens.radius.sm)
+      .height(HEADER_BUTTON_VP)
+      .constraintSize({ minWidth: HEADER_BUTTON_VP })
+      .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
+      .accessibilityText('在完整终端页打开当前会话')
+      .onClick(() => {
+        this.openFullPage();
+      })
+      Button() {
+        Text('✕')
+          .fontSize(Tokens.fontSize.body)
+          .fontColor(Tokens.Color.textDim)
+      }
+      .backgroundColor(Tokens.Color.surfaceHover)
+      .borderRadius(Tokens.radius.sm)
+      .width(HEADER_BUTTON_VP)
+      .height(HEADER_BUTTON_VP)
+      .margin({ left: Tokens.space.xs })
+      .accessibilityText('收起迷你终端，会话保持后台运行')
+      .onClick(() => {
+        this.release();
+        this.onClose();
+      })
+    }
+    .width('100%')
+    .padding({
+      left: Tokens.space.sm,
+      right: Tokens.space.xs,
+      top: Tokens.space.xs2,
+      bottom: Tokens.space.xs2
+    })
+    .backgroundColor(Tokens.Color.surface)
+  }
+
+  /** 有画面时的非阻塞状态条（断线 / 重连倒计时 / 已结束），画面可继续滚动查看 */
+  @Builder
+  Banner() {
+    Row() {
+      Text(this.overlayModel.detail.length > 0
+        ? `${this.overlayModel.title} · ${this.overlayModel.detail}` : this.overlayModel.title)
+        .fontSize(Tokens.fontSize.caption)
+        .fontColor(Tokens.Color.text)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+      if (this.overlayModel.showReconnectNow) {
+        Button('重连')
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.accent)
+          .borderRadius(Tokens.radius.sm)
+          .height(HEADER_BUTTON_VP)
+          .accessibilityText('立即重新连接')
+          .onClick(() => {
+            if (this.vm !== null) {
+              this.vm.reconnectNow();
+            }
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: Tokens.space.sm, right: Tokens.space.xs })
+    .backgroundColor(Tokens.Color.surfaceHover)
+    .opacity(0.94)
+    .hitTestBehavior(HitTestMode.Transparent)
+  }
+
+  @Builder
+  EmptyOrOverlay() {
+    Column() {
+      if (this.vm === null) {
+        Text(this.emptyHint.length > 0 ? this.emptyHint : '点按左侧活动会话或主机，在这里查看终端')
+          .fontSize(Tokens.fontSize.body)
+          .fontColor(Tokens.Color.textDim)
+          .textAlign(TextAlign.Center)
+      } else {
+        Text(this.overlayModel.kind === 'error'
+          ? (this.overlayModel.detail.length > 0 ? this.overlayModel.detail : this.overlayModel.title)
+          : (this.overlayModel.title.length > 0 ? this.overlayModel.title : '正在准备连接…'))
+          .fontSize(Tokens.fontSize.body)
+          .fontColor(Tokens.Color.text)
+          .textAlign(TextAlign.Center)
+        if (this.overlayModel.kind !== 'error' && this.overlayModel.detail.length > 0) {
+          Text(this.overlayModel.detail)
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.textDim)
+            .margin({ top: Tokens.space.xs })
+        }
+        if (this.overlayModel.showReconnectNow) {
+          Button('立即重连')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.onAccent)
+            .backgroundColor(Tokens.Color.accent)
+            .borderRadius(Tokens.radius.sm)
+            .height(HEADER_BUTTON_VP)
+            .margin({ top: Tokens.space.sm })
+            .onClick(() => {
+              if (this.vm !== null) {
+                this.vm.reconnectNow();
+              }
+            })
+        }
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .padding(Tokens.space.md)
     .backgroundColor(Tokens.Color.appBg)
   }
 }

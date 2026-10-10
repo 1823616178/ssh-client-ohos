@@ -49,6 +49,7 @@ import {
   parseTerminalRouteParams
 } from '../main/ets/viewmodel/TerminalViewModel';
 import { PrefixedPaneIdFactory } from '../main/ets/viewmodel/PaneTree';
+import { MINI_TERMINAL_PANE_ID, decideMiniResume } from '../main/ets/viewmodel/MiniTerminalModel';
 
 // ---------- fake：native 会话句柄 ----------
 
@@ -341,9 +342,11 @@ class TestEnv {
 
   /**
    * 可传入上一个页面的宿主 / DAO / 寄存处，模拟「返回后从主机列表恢复」；
-   * panePrefix 模拟非主窗口（窗格 id 带窗口前缀，多窗口改造）。
+   * panePrefix 模拟非主窗口（窗格 id 带窗口前缀，多窗口改造）；
+   * mainPaneId 模拟迷你窗口等自带首叶 id 的宿主（与 panePrefix 同给时以 mainPaneId 为准）。
    */
-  constructor(host?: FakeSessionHost, dao?: FakeHostDao, parking?: TerminalParkingLot, panePrefix?: string) {
+  constructor(host?: FakeSessionHost, dao?: FakeHostDao, parking?: TerminalParkingLot, panePrefix?: string,
+    mainPaneId?: string) {
     this.host = host ?? new FakeSessionHost();
     this.dao = dao ?? new FakeHostDao();
     const sessionHost: FakeSessionHost = this.host;
@@ -370,7 +373,8 @@ class TestEnv {
       onUiChange: (): void => {
         this.uiCount++;
       },
-      mainPaneId: panePrefix === undefined ? undefined : `${panePrefix}${TERMINAL_MAIN_PANE_ID}`,
+      mainPaneId: mainPaneId !== undefined ? mainPaneId :
+        (panePrefix === undefined ? undefined : `${panePrefix}${TERMINAL_MAIN_PANE_ID}`),
       paneIdFactory: panePrefix === undefined ? undefined : new PrefixedPaneIdFactory(panePrefix)
     });
   }
@@ -1207,6 +1211,54 @@ export default function terminalViewModelTest() {
       expect(env2.vm.passwordPrompt.visible).assertTrue();
       expect(env2.vm.passwordPrompt.error.indexOf('超时') >= 0).assertTrue();
     });
+    it('迷你窗口就地切换_旧VM detach寄存_新VM以迷你窗格接管同一终端_不新开shell', 0, async () => {
+      const mini: string = 'index-side-terminal';
+      const host: FakeSessionHost = new FakeSessionHost();
+      const dao: FakeHostDao = new FakeHostDao();
+      dao.put(sampleHost('h1'));
+      dao.put(sampleHost('h2'));
+      host.addSession('s-1', 'h1', '主机h1', 'established', 4001);
+      host.addSession('s-2', 'h2', '主机h2', 'established', 4002);
+      const first: TestEnv = new TestEnv(host, dao, undefined, undefined, mini);
+      await first.vm.start({ hostId: '', sessionId: 's-1' });
+      const term1: FakeTerminal = host.factory.terminals[0];
+      expect(host.ops.indexOf(`bind:s-1:${mini}`) >= 0).assertTrue();
+      // 切到 s-2：旧 VM 让出 s-1（寄存、解绑、不关闭）
+      first.vm.detach();
+      expect(host.ops.indexOf(`unbind:${mini}:false`) >= 0).assertTrue();
+      expect(host.ops.indexOf('close:s-1')).assertEqual(-1);
+      expect(first.parking.has('s-1')).assertTrue();
+      const second: TestEnv = new TestEnv(host, dao, first.parking, undefined, mini);
+      await second.vm.start({ hostId: '', sessionId: 's-2' });
+      expect(host.ops.indexOf(`bind:s-2:${mini}`) >= 0).assertTrue();
+      second.vm.detach();
+      // 切回 s-1：取回同一终端对象，不新 attach
+      const before: number = host.factory.terminals.length;
+      const third: TestEnv = new TestEnv(host, dao, first.parking, undefined, mini);
+      await third.vm.start({ hostId: '', sessionId: 's-1' });
+      expect(host.factory.terminals.length).assertEqual(before);
+      expect(third.vm.terminal === term1).assertTrue();
+      expect(term1.detachCount).assertEqual(0);
+      expect(first.parking.has('s-2')).assertTrue();
+    });
+
+    it('等待受理期间detach_会话保留不关闭_dispose则关闭', 0, async () => {
+      const host: FakeSessionHost = new FakeSessionHost();
+      const dao: FakeHostDao = new FakeHostDao();
+      dao.put(sampleHost('h1'));
+      const a: TestEnv = new TestEnv(host, dao);
+      const pendingA: Promise<void> = a.vm.start({ hostId: 'h1', sessionId: '' });
+      a.vm.detach();
+      await pendingA;
+      expect(host.connectCalls.length).assertEqual(1);
+      expect(host.ops.indexOf('close:s-new-1')).assertEqual(-1);
+      const b: TestEnv = new TestEnv(host, dao);
+      const pendingB: Promise<void> = b.vm.start({ hostId: 'h1', sessionId: '' });
+      b.vm.dispose();
+      await pendingB;
+      expect(host.ops.indexOf('close:s-new-2') >= 0).assertTrue();
+    });
+
     it('返回detach_会话不断开_终端寄存_恢复时复用画面不重建', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.dao.put(sampleHost('h1'));
@@ -1382,6 +1434,68 @@ export default function terminalViewModelTest() {
       expect(env.vm.currentSessionId).assertEqual('s-1');
       expect(shared.ops.indexOf('close:s-2')).assertEqual(-1);
       expect(shared.paneOfSession('s-2')).assertEqual('new:w9:terminal-main');
+    });
+
+    it('迷你窗口与独立窗口_会话迁去独立窗口后迷你窗口不抢绑定_窗口关闭后迷你窗口取回同一终端', 0, async () => {
+      const host: FakeSessionHost = new FakeSessionHost();
+      const dao: FakeHostDao = new FakeHostDao();
+      dao.put(sampleHost('h1'));
+      host.addSession('s-1', 'h1', '主机h1', 'established', 3701);
+      // 主窗口全页终端持有 s-1，随后「在新窗口打开」迁出
+      const page: TestEnv = new TestEnv(host, dao);
+      await page.vm.start({ hostId: '', sessionId: 's-1' });
+      const term: FakeTerminal = host.factory.terminals[0];
+      expect(page.vm.detachTab(page.vm.tabs[0].tabId).join(',')).assertEqual('s-1');
+      // 独立窗口接管（窗格 id 带窗口前缀）
+      const win: TestEnv = new TestEnv(host, dao, page.parking, 'new:w1:');
+      await win.vm.start({ hostId: '', sessionId: 's-1' });
+      const winPane: string = `new:w1:${TERMINAL_MAIN_PANE_ID}`;
+      expect(host.paneOfSession('s-1')).assertEqual(winPane);
+      // 全页返回首页：迷你窗口按记住的会话取回 → 判定在别的窗口，不等待
+      expect(decideMiniResume({ state: 'established', paneId: host.paneOfSession('s-1') }, MINI_TERMINAL_PANE_ID))
+        .assertEqual('elsewhere');
+      // 即便迷你窗口仍去接管（点按了旧目标）：VM 只回调、不绑迷你窗格、不关会话
+      const redirects: string[] = [];
+      const mini: TerminalViewModel = new TerminalViewModel({
+        sessionHost: host,
+        hostDao: dao,
+        terminalFactory: host.factory.factory,
+        parking: page.parking,
+        mainPaneId: MINI_TERMINAL_PANE_ID,
+        onSessionElsewhere: (sessionId: string, paneId: string): void => {
+          redirects.push(`${sessionId}@${paneId}`);
+        }
+      });
+      await mini.start({ hostId: '', sessionId: 's-1' });
+      expect(redirects.join(',')).assertEqual(`s-1@${winPane}`);
+      expect(host.ops.indexOf(`bind:s-1:${MINI_TERMINAL_PANE_ID}`)).assertEqual(-1);
+      expect(host.ops.indexOf('close:s-1')).assertEqual(-1);
+      mini.detach();
+      expect(host.paneOfSession('s-1')).assertEqual(winPane);
+      // 独立窗口关闭（返回不断开 → detach 寄存）：迷你窗口可取回同一终端，不新开 shell
+      win.vm.detach();
+      expect(decideMiniResume({ state: 'established', paneId: host.paneOfSession('s-1') }, MINI_TERMINAL_PANE_ID))
+        .assertEqual('adopt');
+      const mini2: TestEnv = new TestEnv(host, dao, page.parking, undefined, MINI_TERMINAL_PANE_ID);
+      await mini2.vm.start({ hostId: '', sessionId: 's-1' });
+      expect(host.paneOfSession('s-1')).assertEqual(MINI_TERMINAL_PANE_ID);
+      expect(mini2.vm.terminal === term).assertTrue();
+      expect(host.factory.terminals.length).assertEqual(1);
+    });
+
+    it('寄存处discard_断开会话时丢弃寄存并detach终端_未知会话无动作', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 3801);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      const term: FakeTerminal = env.host.factory.terminals[0];
+      env.vm.detach();
+      expect(env.parking.has('s-1')).assertTrue();
+      expect(env.parking.discard('s-1')).assertTrue();
+      expect(env.parking.has('s-1')).assertFalse();
+      expect(term.detachCount).assertEqual(1);
+      expect(env.parking.discard('s-1')).assertFalse();
+      expect(env.parking.discard('nope')).assertFalse();
     });
 
     it('多窗口_revealSession已在本页则只聚焦不新开标签', 0, async () => {
