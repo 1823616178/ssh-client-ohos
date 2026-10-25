@@ -52,6 +52,7 @@ import {
   PaneLayout,
   PaneLeaf,
   PaneRect,
+  PaneTab,
   PaneTabSet,
   SplitDirection,
   breakpointOfWidth,
@@ -1446,6 +1447,44 @@ export class TerminalViewModel {
     } else {
       this.refreshViews();
     }
+  }
+
+  canExtractPane(paneId: string): boolean {
+    if (this.disposed || paneId.length === 0) {
+      return false;
+    }
+    const tab: PaneTab | null = this.tabSet.tabOfPane(paneId);
+    return tab !== null && tab.root.kind === 'split';
+  }
+
+  /** 拆出分屏叶为独立标签：会话绑定、已装配终端与回滚均原地保留。 */
+  extractPaneAsTab(paneId: string): boolean {
+    if (!this.canExtractPane(paneId)) {
+      return false;
+    }
+    const leaf: PaneLeaf | null = this.tabSet.findLeaf(paneId);
+    if (leaf === null) {
+      return false;
+    }
+    const host: HostProfile | null = this.hostForSession(leaf.sessionId);
+    const info: TerminalSessionLike | null = this.sessionHost().getSession(leaf.sessionId);
+    const title: string = leaf.sessionId.length === 0 ? '新连接' :
+      (host !== null ? (host.name.length > 0 ? host.name : host.host) :
+        (info !== null && info.hostName.length > 0 ? info.hostName : '终端'));
+    const result = this.tabSet.extractLeafToTab(paneId, title);
+    if (result === null) {
+      return false;
+    }
+    if (this.lastFocusByTab.get(result.sourceTabId) === paneId) {
+      if (result.sourceFocusPaneId.length > 0) {
+        this.lastFocusByTab.set(result.sourceTabId, result.sourceFocusPaneId);
+      } else {
+        this.lastFocusByTab.delete(result.sourceTabId);
+      }
+    }
+    this.lastFocusByTab.set(result.newTab.tabId, paneId);
+    this.focusPane(paneId);
+    return true;
   }
 
   /** 新标签：保留原快捷键语义，默认仍按聚焦叶主机新拨一个独立会话。 */

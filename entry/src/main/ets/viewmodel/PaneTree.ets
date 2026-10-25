@@ -453,6 +453,12 @@ export interface CloseLeafResult {
   readonly nextFocusPaneId: string;
 }
 
+export interface ExtractLeafResult {
+  readonly sourceTabId: string;
+  readonly newTab: PaneTab;
+  readonly sourceFocusPaneId: string;
+}
+
 /**
  * 标签集（多标签 + 每标签一棵窗格二叉树）。
  * 纯数据结构：所有方法同步、不抛（未知 id 返回 null/false），可全量单测。
@@ -671,6 +677,31 @@ export class PaneTabSet {
       tabClosed: false,
       tabId: tab.tabId,
       nextFocusPaneId: nextFocus
+    };
+    return result;
+  }
+
+  /** 把分屏中的 Leaf 拆成独立标签；Leaf、paneId 与会话引用原样保留，新标签成为激活标签。 */
+  extractLeafToTab(paneId: string, title: string): ExtractLeafResult | null {
+    const source: PaneTab | null = this.tabOfPane(paneId);
+    if (source === null || source.root.kind === 'leaf') {
+      return null;
+    }
+    const leaf: PaneLeaf | null = findLeafInNode(source.root, paneId);
+    if (leaf === null) {
+      return null;
+    }
+    const removed: CloseLeafResult | null = this.closeLeaf(paneId);
+    if (removed === null || removed.tabClosed) {
+      return null;
+    }
+    const newTab: PaneTab = { tabId: this.ids.newTabId(), title: title, root: leaf };
+    this.tabs.push(newTab);
+    this.activeTabId = newTab.tabId;
+    const result: ExtractLeafResult = {
+      sourceTabId: removed.tabId,
+      newTab: newTab,
+      sourceFocusPaneId: removed.nextFocusPaneId
     };
     return result;
   }

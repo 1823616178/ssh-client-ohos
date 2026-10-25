@@ -88,7 +88,8 @@ import {
   TerminalViewModel,
   deriveOverlay,
   overlayPresentation,
-  parseTerminalRouteParams
+  parseTerminalRouteParams,
+  NARROW_SPLIT_WIDTH_VP,
 } from '../viewmodel/TerminalViewModel';
 
 const LOG_TAG: string = 'TerminalPage';
@@ -123,6 +124,8 @@ const FULLSCREEN_EXIT_OPACITY: number = 0.6;
 const TAB_DRAG_SPLIT_THRESHOLD_VP: number = 36;
 /** 量不到芯片宽度时的幽灵标签兜底宽。 */
 const TAB_DRAG_GHOST_WIDTH_VP: number = 148;
+/** 分屏标题拖成标签时的幽灵最大宽度：标题栏可占半屏，整块飘太笨重。 */
+const PANE_DRAG_GHOST_MAX_WIDTH_VP: number = 220;
 /** 分屏相交线视觉宽度；分隔条占位仍由布局的 divider 矩形决定，用作拖动热区。 */
 const PANE_JOIN_LINE_VP: number = 1;
 /** 分隔条最小触摸热区；视觉仍只有 1vp，热区向两侧覆盖，手机上更容易抓住。 */
@@ -134,6 +137,11 @@ interface TabChipGeom {
   x: number;
   y: number;
   w: number;
+}
+
+/** bindPopup onStateChange 回调参数（ArkTS 禁止对象字面量类型注解，故具名声明） */
+interface PopupStateEvent {
+  isVisible: boolean;
 }
 
 /**
@@ -224,15 +232,24 @@ struct TabDragGhost {
           color: this.ready ? Tokens.Color.accent : this.overlayColor
         })
         .shadow({
-          radius: 12,
+          radius: this.ready ? 18 : 10,
           color: '#4D000000',
           offsetX: 0,
-          offsetY: 4
+          offsetY: this.ready ? 6 : 3
         })
+        .scale({
+          x: this.ready ? 1.05 : 1,
+          y: this.ready ? 1.05 : 1
+        })
+        .animation({ duration: Motion.duration(Motion.FAST_MS), curve: Curve.FastOutSlowIn })
         .position({ x: 0, y: 0 })
-        .animation({ duration: 0 })
+        // 跟手段必须位于所有 .animation() 之后：属性动画只作用于其上方的属性，
+        // translate 落进任何动画段都会滞后手指（duration:0 段也不可靠）
         .translate({ x: this.x, y: this.y })
         .hitTestBehavior(HitTestMode.None)
+        .transition(TransitionEffect.OPACITY
+          .combine(TransitionEffect.scale({ x: 0.92, y: 0.92 }))
+          .animation({ duration: Motion.duration(Motion.FAST_MS), curve: Curve.FastOutSlowIn }))
       }
     }
     .width('100%')
@@ -373,10 +390,25 @@ struct TerminalPage {
   /** 正在拖的标签；空串 = 未拖。幽灵层跟手，源标签只变淡。 */
   @State private tabDragId: string = '';
   @State private tabDragReady: boolean = false;
+  /** 窗格区尺寸（vp）：拖标签落点预览的方向判定用 */
+  @State private paneAreaW: number = 0;
+  @State private paneAreaH: number = 0;
   private tabDragOriginX: number = 0;
   private tabDragOriginY: number = 0;
+  private tabDragGrabOffsetX: number = 0;
+  private tabDragGrabOffsetY: number = 0;
   private readonly tabDragBridge: TabDragBridge = new TabDragBridge();
   private readonly tabChipGeom: Map<string, TabChipGeom> = new Map();
+  /** 正在拖的分屏窗格标题；ready = 手指已进标签栏，松手即拆出独立标签。 */
+  @State private paneDragId: string = '';
+  @State private paneDragReady: boolean = false;
+  private paneDragOriginX: number = 0;
+  private paneDragOriginY: number = 0;
+  private paneDragGrabOffsetX: number = 0;
+  private paneDragGrabOffsetY: number = 0;
+  /** 窗格标题长按菜单（bindContextMenu 的 LongPress 在本机不参与手势仲裁，改用自管 popup） */
+  @State private paneMenuPaneId: string = '';
+  @State private paneMenuVisible: boolean = false;
   @State private sessions: TerminalSessionLike[] = [];
   @State private savedHosts: HostProfile[] = [];
   /** 右侧「选择连接」抽屉的搜索草稿；只过滤本面板列表。 */
@@ -1046,10 +1078,9 @@ struct TerminalPage {
     }
     if (event.fingerList.length > 0) {
       const finger = event.fingerList[0];
-      const ui: UIContext = this.getUIContext();
       return {
-        x: ui.px2vp(finger.displayX) - finger.localX,
-        y: ui.px2vp(finger.displayY) - finger.localY - this.terminalTopInsetVp,
+        x: finger.globalX - finger.localX,
+        y: finger.globalY - finger.localY - this.terminalTopInsetVp,
         w: TAB_DRAG_GHOST_WIDTH_VP
       };
     }
@@ -1057,12 +1088,29 @@ struct TerminalPage {
   }
 
   private beginTabDrag(tab: TabRenderItem, event: GestureEvent): void {
+    if (this.paneDragId.length > 0) {
+      return;
+    }
     const geom: TabChipGeom = this.tabChipPageGeom(tab.tabId, event);
     this.tabDragOriginX = geom.x - event.offsetX;
     this.tabDragOriginY = geom.y - event.offsetY;
+    this.tabDragGrabOffsetX = 0;
+    this.tabDragGrabOffsetY = 0;
+    let ghostX: number = geom.x;
+    let ghostY: number = geom.y;
+    if (event.fingerList.length > 0) {
+      const finger = event.fingerList[0];
+      // globalX/Y 是窗口 vp；offset 是相对按下点的累计位移，可还原真实抓取偏移。
+      const fingerX: number = finger.globalX;
+      const fingerY: number = finger.globalY - this.terminalTopInsetVp;
+      this.tabDragGrabOffsetX = fingerX - event.offsetX - geom.x;
+      this.tabDragGrabOffsetY = fingerY - event.offsetY - geom.y;
+      ghostX = fingerX - this.tabDragGrabOffsetX;
+      ghostY = fingerY - this.tabDragGrabOffsetY;
+    }
     this.tabDragId = tab.tabId;
     this.tabDragReady = false;
-    this.tabDragBridge.begin(tab.title, geom.x, geom.y, geom.w);
+    this.tabDragBridge.begin(tab.title, ghostX, ghostY, geom.w);
   }
 
   private updateTabDrag(event: GestureEvent): void {
@@ -1070,13 +1118,27 @@ struct TerminalPage {
       return;
     }
     const ready: boolean = event.offsetY > TAB_DRAG_SPLIT_THRESHOLD_VP;
-    this.tabDragBridge.move(
-      this.tabDragOriginX + event.offsetX,
-      this.tabDragOriginY + event.offsetY,
-      ready);
+    let ghostX: number = this.tabDragOriginX + event.offsetX;
+    let ghostY: number = this.tabDragOriginY + event.offsetY;
+    if (event.fingerList.length > 0) {
+      const finger = event.fingerList[0];
+      ghostX = finger.globalX - this.tabDragGrabOffsetX;
+      ghostY = finger.globalY - this.terminalTopInsetVp - this.tabDragGrabOffsetY;
+    }
+    this.tabDragBridge.move(ghostX, ghostY, ready);
     if (ready !== this.tabDragReady) {
       this.tabDragReady = ready;
+      if (ready) {
+        // 进入分屏落点：轻震确认，配合幽灵标签的抬升
+        vibrateLight(Motion.enabled);
+      }
     }
+  }
+
+  /** 拖标签落点方向：与 VM 的 adaptSplitDirection 同判定（窄竖屏改上下分屏） */
+  private dropPreviewVertical(): boolean {
+    return this.paneAreaW > 0 && this.paneAreaH > 0 &&
+      this.paneAreaW < NARROW_SPLIT_WIDTH_VP && this.paneAreaW < this.paneAreaH;
   }
 
   private endTabDrag(tabId: string, event: GestureEvent): void {
@@ -1091,6 +1153,99 @@ struct TerminalPage {
     this.tabDragBridge.end();
     this.tabDragId = '';
     this.tabDragReady = false;
+  }
+
+  private paneTitleOf(item: PaneRenderItem): string {
+    return item.hostName.length > 0 ? item.hostName : '终端';
+  }
+
+  /** 手指（页面 vp）是否落在标签栏；全屏或标签栏隐藏时没有可落点。 */
+  private paneDragOverTabBar(x: number, y: number): boolean {
+    if (this.fullscreen || !this.showTabBar()) {
+      return false;
+    }
+    if (x < 0 || (this.paneAreaW > 0 && x > this.paneAreaW)) {
+      return false;
+    }
+    return y >= TOP_BAR_HEIGHT_VP && y <= TOP_BAR_HEIGHT_VP + TAB_BAR_HEIGHT_VP;
+  }
+
+  private beginPaneDrag(item: PaneRenderItem, event: GestureEvent): void {
+    if (this.tabDragId.length > 0 || !this.vm.canExtractPane(item.paneId)) {
+      return;
+    }
+    let originX: number = 0;
+    let originY: number = TOP_BAR_HEIGHT_VP;
+    let fingerX: number = originX;
+    let fingerY: number = originY;
+    if (event.fingerList.length > 0) {
+      const finger = event.fingerList[0];
+      fingerX = finger.globalX;
+      fingerY = finger.globalY - this.terminalTopInsetVp;
+      // 窗口坐标 - 组件内坐标 = 标题栏锚点（与标签拖拽同一套跟手算法）
+      originX = fingerX - finger.localX;
+      originY = fingerY - finger.localY;
+    }
+    this.paneDragOriginX = originX - event.offsetX;
+    this.paneDragOriginY = originY - event.offsetY;
+    this.paneDragGrabOffsetX = fingerX - event.offsetX - originX;
+    this.paneDragGrabOffsetY = fingerY - event.offsetY - originY;
+    const width: number = item.w > 0
+      ? Math.min(item.w, PANE_DRAG_GHOST_MAX_WIDTH_VP) : TAB_DRAG_GHOST_WIDTH_VP;
+    this.paneDragId = item.paneId;
+    this.paneDragReady = false;
+    this.tabDragBridge.begin(this.paneTitleOf(item), fingerX - this.paneDragGrabOffsetX,
+      fingerY - this.paneDragGrabOffsetY, width);
+  }
+
+  private updatePaneDrag(event: GestureEvent): void {
+    if (this.paneDragId.length === 0) {
+      return;
+    }
+    let ghostX: number = this.paneDragOriginX + event.offsetX;
+    let ghostY: number = this.paneDragOriginY + event.offsetY;
+    let fingerX: number = ghostX;
+    let fingerY: number = ghostY;
+    if (event.fingerList.length > 0) {
+      const finger = event.fingerList[0];
+      fingerX = finger.globalX;
+      fingerY = finger.globalY - this.terminalTopInsetVp;
+      ghostX = fingerX - this.paneDragGrabOffsetX;
+      ghostY = fingerY - this.paneDragGrabOffsetY;
+    }
+    const ready: boolean = this.paneDragOverTabBar(fingerX, fingerY);
+    this.tabDragBridge.move(ghostX, ghostY, ready);
+    if (ready !== this.paneDragReady) {
+      this.paneDragReady = ready;
+      if (ready) {
+        vibrateLight(Motion.enabled);
+      }
+    }
+  }
+
+  private endPaneDrag(paneId: string, event: GestureEvent): void {
+    let ready: boolean = this.paneDragReady;
+    if (!ready && event.fingerList.length > 0) {
+      const finger = event.fingerList[0];
+      ready = this.paneDragOverTabBar(finger.globalX, finger.globalY - this.terminalTopInsetVp);
+    }
+    this.cancelPaneDrag();
+    if (ready) {
+      this.vm.extractPaneAsTab(paneId);
+    }
+  }
+
+  private cancelPaneDrag(): void {
+    if (this.paneDragId.length === 0 && !this.paneDragReady) {
+      return;
+    }
+    this.tabDragBridge.end();
+    this.paneDragId = '';
+    this.paneDragReady = false;
+  }
+
+  private hidePaneContextMenu(): void {
+    this.paneMenuVisible = false;
   }
 
   private colorDraftOf(kind: string): string {
@@ -1644,29 +1799,38 @@ struct TerminalPage {
           }
 
           if (this.tabDragReady) {
+            // 落点预览：高亮松手后新窗格的实际落位（宽屏右半 / 窄竖屏下半，
+            // 与 VM 的 adaptSplitDirection 同判定），提示居中跟随视线
             Column() {
               Text('松手分屏')
-                .fontSize(Tokens.fontSize.caption)
+                .fontSize(Tokens.fontSize.body)
                 .fontWeight(FontWeight.Medium)
                 .fontColor(Tokens.Color.onAccent)
                 .padding({
-                  left: Tokens.space.sm,
-                  right: Tokens.space.sm,
-                  top: Tokens.space.xs2,
-                  bottom: Tokens.space.xs2
+                  left: Tokens.space.md,
+                  right: Tokens.space.md,
+                  top: Tokens.space.xs,
+                  bottom: Tokens.space.xs
                 })
-                .borderRadius(Tokens.radius.sm)
+                .borderRadius(Tokens.radius.md)
                 .backgroundColor(Tokens.Color.accent)
-                .margin({ top: Tokens.space.sm, bottom: Tokens.space.xs })
-              Column()
-                .width(PANE_JOIN_LINE_VP)
-                .layoutWeight(1)
-                .backgroundColor(Tokens.Color.accent)
+                .shadow({ radius: 8, color: '#4D000000', offsetY: 2 })
             }
-            .width('100%')
-            .height('100%')
-            .alignItems(HorizontalAlign.Center)
+            .width(this.dropPreviewVertical() ? '100%' : '50%')
+            .height(this.dropPreviewVertical() ? '50%' : '100%')
+            .position(this.dropPreviewVertical() ? { x: 0, y: '50%' } : { x: '50%', y: 0 })
+            .justifyContent(FlexAlign.Center)
+            .backgroundColor(Tokens.Color.accentMuted)
+            .border({
+              width: this.dropPreviewVertical()
+                ? { top: PANE_JOIN_LINE_VP } : { left: PANE_JOIN_LINE_VP },
+              color: Tokens.Color.accent
+            })
             .hitTestBehavior(HitTestMode.None)
+            .transition(TransitionEffect.OPACITY.animation({
+              duration: Motion.duration(Motion.FAST_MS),
+              curve: Curve.FastOutSlowIn
+            }))
           }
         }
         .width('100%')
@@ -1678,8 +1842,9 @@ struct TerminalPage {
           [SafeAreaType.SYSTEM],
           [SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END])
         .onAreaChange((_oldArea: Area, newArea: Area) => {
-          this.vm.setPaneAreaSize(
-            areaLengthToVp(newArea.width), areaLengthToVp(newArea.height));
+          this.paneAreaW = areaLengthToVp(newArea.width);
+          this.paneAreaH = areaLengthToVp(newArea.height);
+          this.vm.setPaneAreaSize(this.paneAreaW, this.paneAreaH);
         })
 
         // T7 功能键条：有聚焦会话时挂在终端区下方；字节经 VM.sendInput 写聚焦叶
@@ -2007,6 +2172,7 @@ struct TerminalPage {
   /** md/lg 标签栏：胶囊标签 + 关闭 + 新建 + 分屏 */
   @Builder
   TabBar() {
+    Stack() {
     Row() {
       Scroll() {
         Row() {
@@ -2072,7 +2238,7 @@ struct TerminalPage {
       })
     }
     .width('100%')
-    .height(TAB_BAR_HEIGHT_VP)
+    .height('100%')
     .padding({
       left: Tokens.space.xs,
       right: Tokens.space.xs,
@@ -2080,7 +2246,42 @@ struct TerminalPage {
       bottom: Tokens.space.xs2
     })
     .backgroundColor(this.focusedAppearance().background)
-    .border({ width: { bottom: 1 }, color: this.chromeOverlay() })
+    .border({
+      width: { bottom: this.paneDragReady ? 2 : 1 },
+      color: this.paneDragReady ? Tokens.Color.accent : this.chromeOverlay()
+    })
+    .clip(true)
+
+    if (this.paneDragReady) {
+      // 分屏标题拖到标签栏：整条栏亮起并给出松手提示（与「松手分屏」同一套反馈）
+      Row() {
+        Text('松手转为独立标签')
+          .fontSize(Tokens.fontSize.caption)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.onAccent)
+          .padding({
+            left: Tokens.space.md,
+            right: Tokens.space.md,
+            top: Tokens.space.xs2,
+            bottom: Tokens.space.xs2
+          })
+          .borderRadius(Tokens.radius.sm)
+          .backgroundColor(Tokens.Color.accent)
+      }
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .backgroundColor(Tokens.Color.accentMuted)
+      .border({ width: { bottom: PANE_JOIN_LINE_VP }, color: Tokens.Color.accent })
+      .hitTestBehavior(HitTestMode.None)
+      .transition(TransitionEffect.OPACITY.animation({
+        duration: Motion.duration(Motion.FAST_MS),
+        curve: Curve.FastOutSlowIn
+      }))
+    }
+    }
+    .width('100%')
+    .height(TAB_BAR_HEIGHT_VP)
     .clip(true)
   }
 
@@ -2296,10 +2497,11 @@ struct TerminalPage {
 
       Button('+ 添加其他连接')
         .fontSize(Tokens.fontSize.body)
+        .fontWeight(FontWeight.Medium)
         .fontColor(Tokens.Color.onAccent)
         .backgroundColor(Tokens.Color.accent)
         .borderRadius(Tokens.radius.sm)
-        .height(36)
+        .height(42)
         .width('100%')
         .margin({ top: Tokens.space.sm })
         .onClick(() => {
@@ -2363,32 +2565,95 @@ struct TerminalPage {
     })
   }
 
+  /** 长按窗格标题：把当前分屏叶拆成独立标签（会话/终端原地复用）。 */
+  @Builder
+  PaneContextMenu(item: PaneRenderItem) {
+    Column() {
+      Text('转为独立标签')
+        .fontSize(Tokens.fontSize.body)
+        .fontColor(Tokens.Color.text)
+        .width('100%')
+        .constraintSize({ minHeight: 44 })
+        .maxLines(1)
+        .padding({ left: Tokens.space.md, right: Tokens.space.lg })
+        .borderRadius(Tokens.radius.sm)
+        .onClick(() => {
+          this.hidePaneContextMenu();
+          this.vm.extractPaneAsTab(item.paneId);
+        })
+    }
+    .width(148)
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.md)
+    .border({ width: 1, color: Tokens.Color.border })
+    .padding({ top: Tokens.space.xs, bottom: Tokens.space.xs })
+    .alignItems(HorizontalAlign.Start)
+  }
+
   @Builder
   PaneHeader($$: PaneSlotParams) {
     Row() {
-      Column()
-        .width(Tokens.space.xs)
-        .height(Tokens.space.xs)
-        .borderRadius(Tokens.space.xs2)
-        .backgroundColor(this.statusColorOf($$.item.state))
-      Text($$.item.hostName.length > 0 ? $$.item.hostName : '终端')
-        .fontSize(Tokens.fontSize.caption)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.appearanceForHost($$.item.hostId).foreground)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .margin({ left: Tokens.space.xs })
-      if ($$.item.endpoint.length > 0) {
-        Text($$.item.endpoint)
+      Row() {
+        Column()
+          .width(Tokens.space.xs)
+          .height(Tokens.space.xs)
+          .borderRadius(Tokens.space.xs2)
+          .backgroundColor(this.statusColorOf($$.item.state))
+        Text($$.item.hostName.length > 0 ? $$.item.hostName : '终端')
           .fontSize(Tokens.fontSize.caption)
-          .fontColor(this.appearanceDimForHost($$.item.hostId))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.appearanceForHost($$.item.hostId).foreground)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
           .margin({ left: Tokens.space.xs })
-      } else {
-        Blank()
+        if ($$.item.endpoint.length > 0) {
+          Text($$.item.endpoint)
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(this.appearanceDimForHost($$.item.hostId))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+            .margin({ left: Tokens.space.xs })
+        } else {
+          Blank()
+        }
       }
+      .height('100%')
+      .layoutWeight(1)
+      .opacity(this.paneDragId === $$.item.paneId ? 0.35 : 1)
+      .gesture(
+        GestureGroup(GestureMode.Exclusive,
+          LongPressGesture({ repeat: false, duration: 500 })
+            .onAction(() => {
+              this.paneMenuPaneId = $$.item.paneId;
+              this.paneMenuVisible = true;
+            }),
+          PanGesture({ fingers: 1, direction: PanDirection.All })
+            .onActionStart((event: GestureEvent) => {
+              this.beginPaneDrag($$.item, event);
+            })
+            .onActionUpdate((event: GestureEvent) => {
+              this.updatePaneDrag(event);
+            })
+            .onActionEnd((event: GestureEvent) => {
+              this.endPaneDrag($$.item.paneId, event);
+            })
+            .onActionCancel(() => {
+              this.cancelPaneDrag();
+            })
+        )
+      )
+      .bindPopup(this.paneMenuVisible && this.paneMenuPaneId === $$.item.paneId, {
+        builder: (): void => {
+          this.PaneContextMenu($$.item);
+        },
+        enableArrow: false,
+        onStateChange: (state: PopupStateEvent): void => {
+          if (!state.isVisible) {
+            this.paneMenuVisible = false;
+          }
+        }
+      })
       if (this.panes.length > 1) {
         Text('×')
           .fontSize(Tokens.fontSize.body)
@@ -2842,6 +3107,12 @@ struct TerminalPage {
       }
       .width('100%')
 
+      Text('打开方式')
+        .fontSize(Tokens.fontSize.caption)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.Color.textDim)
+        .width('100%')
+        .margin({ top: Tokens.space.md })
       Row({ space: Tokens.space.xs }) {
         this.ConnectionModeButton('切换', 'replace')
         this.ConnectionModeButton('新标签', 'tab')
@@ -2849,7 +3120,7 @@ struct TerminalPage {
         this.ConnectionModeButton('下分屏', 'column')
       }
       .width('100%')
-      .margin({ top: Tokens.space.md, bottom: Tokens.space.sm })
+      .margin({ top: Tokens.space.xs2, bottom: Tokens.space.sm })
 
       // 会话工具：从顶栏收拢的次级入口，仍一键可达
       Row({ space: Tokens.space.xs }) {
@@ -2898,12 +3169,26 @@ struct TerminalPage {
 
       Scroll() {
         Column() {
-          Text('活跃会话')
-            .fontSize(Tokens.fontSize.caption)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Tokens.Color.textDim)
-            .width('100%')
-            .margin({ top: Tokens.space.xs, bottom: Tokens.space.xs })
+          Row() {
+            Text('活跃会话')
+              .fontSize(Tokens.fontSize.caption)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(Tokens.Color.textDim)
+            Text(`${this.filteredSessions().length}`)
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(Tokens.Color.textFaint)
+              .backgroundColor(Tokens.Color.surfaceHover)
+              .borderRadius(Tokens.radius.xs)
+              .padding({
+                left: Tokens.space.xs,
+                right: Tokens.space.xs,
+                top: Tokens.space.xs2,
+                bottom: Tokens.space.xs2
+              })
+              .margin({ left: Tokens.space.xs })
+          }
+          .width('100%')
+          .margin({ top: Tokens.space.xs, bottom: Tokens.space.xs })
 
           if (this.filteredSessions().length === 0) {
             Text(this.connectionSearchText.trim().length > 0 ? '没有匹配的活跃会话' : '暂无活跃会话')
@@ -2918,12 +3203,26 @@ struct TerminalPage {
             `${item.sessionId}|${item.state}|${item.hostName}|${item.sessionId === this.currentSessionId}`)
           }
 
-          Text('已保存连接')
-            .fontSize(Tokens.fontSize.caption)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Tokens.Color.textDim)
-            .width('100%')
-            .margin({ top: Tokens.space.md, bottom: Tokens.space.xs })
+          Row() {
+            Text('已保存连接')
+              .fontSize(Tokens.fontSize.caption)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(Tokens.Color.textDim)
+            Text(`${this.filteredSavedHosts().length}`)
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(Tokens.Color.textFaint)
+              .backgroundColor(Tokens.Color.surfaceHover)
+              .borderRadius(Tokens.radius.xs)
+              .padding({
+                left: Tokens.space.xs,
+                right: Tokens.space.xs,
+                top: Tokens.space.xs2,
+                bottom: Tokens.space.xs2
+              })
+              .margin({ left: Tokens.space.xs })
+          }
+          .width('100%')
+          .margin({ top: Tokens.space.md, bottom: Tokens.space.xs })
 
           if (this.filteredSavedHosts().length === 0) {
             Text(this.connectionSearchText.trim().length > 0 ? '没有匹配的已保存连接' : '暂无已保存连接')
@@ -2982,33 +3281,66 @@ struct TerminalPage {
       })
   }
 
-  /** 抽屉会话行：状态点 + 主机名 +「当前」标记；点击聚焦已有叶或替换聚焦叶 */
+  /** 抽屉会话行：状态徽章 + 名称/状态两行 +「当前」chip；点击聚焦已有叶或替换聚焦叶 */
   @Builder
   SessionRow($$: SessionRowParams) {
     Row() {
-      Column()
-        .width(Tokens.space.xs)
-        .height(Tokens.space.xs)
-        .borderRadius(Tokens.space.xs2)
-        .backgroundColor(this.statusColorOf($$.item.state))
-      Text($$.item.hostName.length > 0 ? $$.item.hostName : '未命名会话')
-        .fontSize(Tokens.fontSize.body)
-        .fontColor(Tokens.Color.text)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .layoutWeight(1)
-        .margin({ left: Tokens.space.sm })
+      Row() {
+        Column()
+          .width(8)
+          .height(8)
+          .borderRadius(Tokens.space.xs2)
+          .backgroundColor(this.statusColorOf($$.item.state))
+      }
+      .width(24)
+      .height(24)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .backgroundColor(Tokens.Color.surfaceHover)
+      .borderRadius(12)
+
+      Column() {
+        Text($$.item.hostName.length > 0 ? $$.item.hostName : '未命名会话')
+          .fontSize(Tokens.fontSize.body)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.Color.text)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(this.sessionStateLabelOf($$.item.state))
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(Tokens.Color.textDim)
+          .maxLines(1)
+          .margin({ top: Tokens.space.xs2 })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .margin({ left: Tokens.space.sm })
+
       if ($$.item.sessionId === this.currentSessionId) {
         Text('当前')
           .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.accent)
-          .margin({ left: Tokens.space.xs })
+          .fontColor(Tokens.Color.onAccent)
+          .backgroundColor(Tokens.Color.accent)
+          .borderRadius(Tokens.radius.xs)
+          .padding({
+            left: Tokens.space.xs,
+            right: Tokens.space.xs,
+            top: Tokens.space.xs2,
+            bottom: Tokens.space.xs2
+          })
       }
     }
     .width('100%')
+    .constraintSize({ minHeight: 48 })
+    .alignItems(VerticalAlign.Center)
     .padding(Tokens.space.sm)
     .backgroundColor(
-      $$.item.sessionId === this.currentSessionId ? Tokens.Color.surfaceHover : Tokens.Color.surface)
+      $$.item.sessionId === this.currentSessionId ? Tokens.Color.accentMuted : Tokens.Color.surface)
+    .border({
+      width: 1,
+      color: $$.item.sessionId === this.currentSessionId
+        ? Tokens.Color.accent : Tokens.Color.border
+    })
     .borderRadius(Tokens.radius.sm)
     .margin({ bottom: Tokens.space.xs })
     .clickEffect(Motion.pressEffect())
@@ -3018,14 +3350,43 @@ struct TerminalPage {
     })
   }
 
+  /** 会话状态中文标签（抽屉行副标题用；与顶栏 statusLabel 同词表） */
+  private sessionStateLabelOf(state: string): string {
+    switch (state) {
+      case 'connecting':
+        return '连接中 · 点按切换';
+      case 'handshaking':
+        return '握手中 · 点按切换';
+      case 'authenticating':
+        return '认证中 · 点按切换';
+      case 'established':
+        return '运行中 · 点按切换';
+      case 'disconnected':
+        return '已断开 · 点按恢复';
+      case 'error':
+        return '连接异常 · 点按恢复';
+      default:
+        return '点按切换';
+    }
+  }
+
   @Builder
   HostRow($$: HostRowParams) {
     Row() {
-      Column()
-        .width(Tokens.space.xs)
-        .height(Tokens.space.xs)
-        .borderRadius(Tokens.space.xs2)
-        .backgroundColor(Tokens.Color.textFaint)
+      Row() {
+        Column()
+          .width(8)
+          .height(8)
+          .borderRadius(Tokens.space.xs2)
+          .backgroundColor(Tokens.Color.textFaint)
+      }
+      .width(24)
+      .height(24)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .backgroundColor(Tokens.Color.surfaceHover)
+      .borderRadius(12)
+
       Column() {
         Text($$.item.name.length > 0 ? $$.item.name : $$.item.host)
           .fontSize(Tokens.fontSize.body)
@@ -3043,13 +3404,25 @@ struct TerminalPage {
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       .margin({ left: Tokens.space.sm })
-      Text('打开')
+
+      Text(this.authTypeLabelOf($$.item))
         .fontSize(Tokens.fontSize.caption)
         .fontColor(Tokens.Color.accent)
+        .backgroundColor(Tokens.Color.accentMuted)
+        .borderRadius(Tokens.radius.xs)
+        .padding({
+          left: Tokens.space.xs,
+          right: Tokens.space.xs,
+          top: Tokens.space.xs2,
+          bottom: Tokens.space.xs2
+        })
     }
     .width('100%')
+    .constraintSize({ minHeight: 48 })
+    .alignItems(VerticalAlign.Center)
     .padding(Tokens.space.sm)
-    .backgroundColor(Tokens.Color.surfaceHover)
+    .backgroundColor(Tokens.Color.surface)
+    .border({ width: 1, color: Tokens.Color.border })
     .borderRadius(Tokens.radius.sm)
     .margin({ bottom: Tokens.space.xs })
     .clickEffect(Motion.pressEffect())
@@ -3061,6 +3434,18 @@ struct TerminalPage {
         Logger.error(`打开保存连接失败：${JSON.stringify(err)}`, LOG_TAG);
       });
     })
+  }
+
+  /** 认证方式徽标文案（与主机列表行一致） */
+  private authTypeLabelOf(host: HostProfile): string {
+    switch (host.authType) {
+      case 'password':
+        return '密码';
+      case 'key':
+        return '密钥';
+      default:
+        return 'Agent';
+    }
   }
 
   @Builder

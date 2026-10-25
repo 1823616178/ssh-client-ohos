@@ -173,6 +173,38 @@ export default function paneTreeTest() {
       expect(set.tabs.length).assertEqual(0);
     });
 
+    it('拆分屏叶为独立标签_原Leaf与paneId保留_兄弟上提并激活新标签', 0, () => {
+      const set: PaneTabSet = makeSet();
+      const a = set.addTab('A');
+      expect(set.extractLeafToTab(a.leaf.paneId, '单叶')).assertNull();
+      const b: PaneLeaf = createPaneLeaf(set.newPaneId());
+      const c: PaneLeaf = createPaneLeaf(set.newPaneId());
+      set.splitLeaf(a.leaf.paneId, 'row', b);
+      set.splitLeaf(b.paneId, 'column', c);
+      a.leaf.sessionId = 's-a';
+      b.sessionId = 's-b';
+      c.sessionId = 's-c';
+
+      const result = set.extractLeafToTab(b.paneId, '主机B');
+      expect(result !== null).assertTrue();
+      expect(result?.sourceTabId).assertEqual(a.tab.tabId);
+      expect(result?.sourceFocusPaneId).assertEqual(c.paneId);
+      expect(result?.newTab.root).assertEqual(b);
+      expect(result?.newTab.title).assertEqual('主机B');
+      expect(set.tabs.length).assertEqual(2);
+      expect(set.activeTabId).assertEqual(result?.newTab.tabId);
+      expect(set.tabOfPane(b.paneId)).assertEqual(result?.newTab);
+      expect(set.findLeaf(b.paneId)).assertEqual(b);
+      expect(b.sessionId).assertEqual('s-b');
+      const sourceRoot: PaneSplit = a.tab.root as PaneSplit;
+      expect(sourceRoot.childA).assertEqual(a.leaf);
+      expect(sourceRoot.childB).assertEqual(c);
+      expect(leavesOf(a.tab.root).length).assertEqual(2);
+      expect(set.extractLeafToTab(b.paneId, '再次')).assertNull();
+      expect(set.extractLeafToTab('ghost', '未知')).assertNull();
+      expect(set.tabs.length).assertEqual(2);
+    });
+
     it('关根叶且是激活标签_焦点落到邻居首叶', 0, () => {
       const set: PaneTabSet = makeSet();
       const first = set.addTab('A');

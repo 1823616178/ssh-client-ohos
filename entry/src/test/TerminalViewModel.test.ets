@@ -874,6 +874,57 @@ export default function terminalViewModelTest() {
       expect(env.host.ops.indexOf(`unbind:${newPaneId}:true`) >= 0).assertTrue();
     });
 
+    it('分屏叶拆为独立标签_复用会话与终端_无重连无换绑', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.addSession('s-1', 'h1', '主机h1', 'established', 1051);
+      await env.vm.start({ hostId: '', sessionId: 's-1' });
+      env.vm.setViewportWidth(900);
+      env.vm.setPaneAreaSize(900, 400);
+      // 根叶（未分屏）不能拆
+      expect(env.vm.canExtractPane(TERMINAL_MAIN_PANE_ID)).assertFalse();
+      expect(env.vm.extractPaneAsTab(TERMINAL_MAIN_PANE_ID)).assertFalse();
+
+      await env.vm.splitFocused('row');
+      const splitSessionId: string = env.vm.currentSessionId;
+      const splitPaneId: string = env.vm.focusedPaneId;
+      env.host.emit(splitSessionId, stateChange('established'));
+      const sourceTabId: string = env.vm.activeTabId;
+      const terminalBefore: TerminalLike | null = env.vm.visiblePanes[1].terminal;
+      expect(terminalBefore !== null).assertTrue();
+      const opsBefore: number = env.host.ops.length;
+      const connectsBefore: number = env.host.connectCalls.length;
+
+      expect(env.vm.canExtractPane(splitPaneId)).assertTrue();
+      expect(env.vm.extractPaneAsTab(splitPaneId)).assertTrue();
+      expect(env.vm.tabs.length).assertEqual(2);
+      expect(env.vm.activeTabId !== sourceTabId).assertTrue();
+      expect(env.vm.leafCount()).assertEqual(2);
+      expect(env.vm.focusedPaneId).assertEqual(splitPaneId);
+      expect(env.vm.currentSessionId).assertEqual(splitSessionId);
+      expect(env.vm.visiblePanes.length).assertEqual(1);
+      expect(env.vm.visiblePanes[0].paneId).assertEqual(splitPaneId);
+      expect(env.vm.visiblePanes[0].sessionId).assertEqual(splitSessionId);
+      expect(env.vm.visiblePanes[0].terminal).assertEqual(terminalBefore);
+      expect(env.vm.tabs[1].title).assertEqual('主机h1');
+      // 拆出只动树：不重连、不换绑、不关会话、不重建终端
+      expect(env.host.connectCalls.length).assertEqual(connectsBefore);
+      expect(env.host.ops.length).assertEqual(opsBefore);
+
+      // 源标签兄弟上提，记忆焦点回落到剩余叶；会话绑定原样保留
+      env.vm.activateTab(sourceTabId);
+      expect(env.vm.visiblePanes.length).assertEqual(1);
+      expect(env.vm.visiblePanes[0].paneId).assertEqual(TERMINAL_MAIN_PANE_ID);
+      expect(env.vm.currentSessionId).assertEqual('s-1');
+
+      // 拆出的标签已成根叶，不可再次拆分
+      env.vm.activateTab(env.vm.tabs[1].tabId);
+      expect(env.vm.canExtractPane(splitPaneId)).assertFalse();
+      expect(env.vm.extractPaneAsTab(splitPaneId)).assertFalse();
+      expect(env.vm.tabs.length).assertEqual(2);
+      expect(env.vm.leafCount()).assertEqual(2);
+    });
+
     it('新标签_独立会话_切回原标签恢复聚焦叶', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.dao.put(sampleHost('h1'));
