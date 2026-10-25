@@ -498,6 +498,12 @@ export const sftpList: (sftpHandle: number, path: string) => boolean;
 export const sftpStat: (sftpHandle: number, path: string) => boolean;
 
 /**
+ * 解析路径为绝对路径（"." 按用户 home 解析）；结果经 sftpOpDone
+ * （op = "realpath"，path = 解析后的绝对路径）
+ */
+export const sftpRealpath: (sftpHandle: number, path: string) => boolean;
+
+/**
  * 下载远端文件到本地路径（应用沙箱内 POSIX 路径）。
  * transferId 由上层分配（与 TransferQueue 对齐）；进度/终态经
  * sftpProgress / sftpTransferDone

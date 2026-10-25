@@ -14,7 +14,7 @@ export const APP_BREAKPOINT_SM_MAX_VP: number = 600;
 export const APP_BREAKPOINT_MD_MAX_VP: number = 840;
 
 /** lg 右侧面板展开宽度（vp） */
-export const RIGHT_PANEL_OPEN_WIDTH_VP: number = 260;
+export const RIGHT_PANEL_OPEN_WIDTH_VP: number = 320;
 /** lg 右侧面板折叠后只留开关条宽度（vp） */
 export const RIGHT_PANEL_COLLAPSED_WIDTH_VP: number = 36;
 

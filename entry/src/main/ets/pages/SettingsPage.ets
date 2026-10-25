@@ -15,6 +15,7 @@
  */
 
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { PageHeader } from '../view/PageHeader';
 import { Logger } from '../common/utils/Logger';
 import { KeepScreenOnMode, SettingsRepository } from '../repository/SettingsRepository';
@@ -71,6 +72,23 @@ struct SettingsPage {
     Logger.info(
       `后台设置已更新：保活=${this.keepAliveInBackground} 息屏断开=${this.screenOffMinutes}min`,
       LOG_TAG);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
   }
 
   build() {
@@ -247,6 +265,7 @@ struct SettingsPage {
     .padding({ top: Tokens.space.sm, bottom: Tokens.space.sm })
     .accessibilityText(title)
     .accessibilityDescription(subtitle)
+    .clickEffect(Motion.pressEffect())
     .onClick(() => {
       this.getUIContext().getRouter().pushUrl({ url: url });
     })
@@ -271,6 +290,7 @@ struct SettingsPage {
             bottom: Tokens.space.xs2
           })
           .margin({ right: Tokens.space.xs })
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.screenOffMinutes = screenOffMinutesOf(index);
             this.applyBackgroundSettings();
@@ -299,6 +319,7 @@ struct SettingsPage {
             bottom: Tokens.space.xs2
           })
           .margin({ right: Tokens.space.xs })
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.keepScreenOnMode = keepScreenOnModeOf(index);
             this.applyKeepScreenOn();

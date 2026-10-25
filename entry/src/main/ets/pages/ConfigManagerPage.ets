@@ -21,6 +21,7 @@ import {
   Snippet
 } from '../common/model/models';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
 import { ConfigManagerViewModel, ConfigTabType } from '../viewmodel/ConfigManagerViewModel';
 import { Logger } from '../common/utils/Logger';
@@ -39,6 +40,8 @@ const ACTION_BTN_HEIGHT_VP: number = 32;
 @Entry
 @ComponentV2
 struct ConfigManagerPage {
+  /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
+  @Local private introDone: boolean = !Motion.enabled;
   private readonly vm: ConfigManagerViewModel = new ConfigManagerViewModel();
   @Local private newGroupName: string = '';
   @Local private showAddGroupDialog: boolean = false;
@@ -51,6 +54,7 @@ struct ConfigManagerPage {
   }
 
   aboutToAppear(): void {
+    this.openIntroWindow();
     this.vm.reload();
   }
 
@@ -94,6 +98,33 @@ struct ConfigManagerPage {
         }
       }
     ];
+  }
+
+  /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
+  private openIntroWindow(): void {
+    if (this.introDone) {
+      return;
+    }
+    setTimeout(() => {
+      this.introDone = true;
+    }, Motion.INTRO_WINDOW_MS);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
   }
 
   build() {
@@ -203,6 +234,8 @@ struct ConfigManagerPage {
     .backgroundColor(this.vm.currentTab === tab ? Tokens.Color.accent : Tokens.Color.surface)
     .borderRadius(Tokens.radius.sm)
     .margin({ right: Tokens.space.xs })
+    .animation(Motion.colorAnim()) // 选中态颜色过渡
+    .clickEffect(Motion.pressEffect())
     .onClick(() => {
       this.vm.setTab(tab);
     })
@@ -236,7 +269,7 @@ struct ConfigManagerPage {
       } else if (this.vm.filteredHosts().length === 0) {
         this.EmptyCard('无匹配主机', `未找到与「${this.vm.searchText.trim()}」相关的主机配置`)
       } else {
-        ForEach(this.vm.filteredHosts(), (host: HostProfile) => {
+        ForEach(this.vm.filteredHosts(), (host: HostProfile, index: number) => {
           Column() {
             Row() {
               Column() {
@@ -320,6 +353,8 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.md)
           .width('100%')
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (host: HostProfile) => host.id)
       }
     }
@@ -406,6 +441,7 @@ struct ConfigManagerPage {
         .borderRadius(Tokens.radius.md)
         .width('100%')
         .margin({ bottom: Tokens.space.sm })
+        .transition(Motion.riseTransition())
       }
 
       if (this.vm.groups.length === 0) {
@@ -413,7 +449,7 @@ struct ConfigManagerPage {
       } else if (this.vm.filteredGroups().length === 0) {
         this.EmptyCard('无匹配分组', `未找到与「${this.vm.searchText.trim()}」相关的分组`)
       } else {
-        ForEach(this.vm.filteredGroups(), (group: HostGroup) => {
+        ForEach(this.vm.filteredGroups(), (group: HostGroup, index: number) => {
           Row() {
             Column() {
               Text(group.name)
@@ -446,6 +482,8 @@ struct ConfigManagerPage {
           .backgroundColor(Tokens.Color.surface)
           .borderRadius(Tokens.radius.md)
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (group: HostGroup) => group.id)
       }
     }
@@ -471,7 +509,7 @@ struct ConfigManagerPage {
       } else if (this.vm.filteredForwards().length === 0) {
         this.EmptyCard('无匹配端口转发', `未找到与「${this.vm.searchText.trim()}」相关的端口转发规则`)
       } else {
-        ForEach(this.vm.filteredForwards(), (rule: PortForwardRule) => {
+        ForEach(this.vm.filteredForwards(), (rule: PortForwardRule, index: number) => {
           Column() {
             Row() {
               Text(rule.type.toUpperCase())
@@ -535,6 +573,8 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.md)
           .width('100%')
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (rule: PortForwardRule) => rule.id)
       }
     }
@@ -569,7 +609,7 @@ struct ConfigManagerPage {
       } else if (this.vm.filteredAppearances().length === 0) {
         this.EmptyCard('无匹配外观主题', `未找到与「${this.vm.searchText.trim()}」相关的主题`)
       } else {
-        ForEach(this.vm.filteredAppearances(), (app: AppearanceProfile) => {
+        ForEach(this.vm.filteredAppearances(), (app: AppearanceProfile, index: number) => {
           Column() {
             Row() {
               Column() {
@@ -620,6 +660,8 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.md)
           .width('100%')
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (app: AppearanceProfile) => app.id)
       }
     }
@@ -720,6 +762,7 @@ struct ConfigManagerPage {
         .borderRadius(Tokens.radius.md)
         .width('100%')
         .margin({ bottom: Tokens.space.sm })
+        .transition(Motion.riseTransition())
       }
 
       if (this.vm.snippets.length === 0) {
@@ -727,7 +770,7 @@ struct ConfigManagerPage {
       } else if (this.vm.filteredSnippets().length === 0) {
         this.EmptyCard('无匹配命令片段', `未找到与「${this.vm.searchText.trim()}」相关的命令片段`)
       } else {
-        ForEach(this.vm.filteredSnippets(), (snippet: Snippet) => {
+        ForEach(this.vm.filteredSnippets(), (snippet: Snippet, index: number) => {
           Column() {
             Row() {
               Text(snippet.name)
@@ -779,6 +822,8 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.md)
           .width('100%')
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (snippet: Snippet) => snippet.id)
       }
     }
@@ -804,7 +849,7 @@ struct ConfigManagerPage {
       } else if (this.vm.filteredKnownHosts().length === 0) {
         this.EmptyCard('无匹配主机指纹', `未找到与「${this.vm.searchText.trim()}」相关的指纹记录`)
       } else {
-        ForEach(this.vm.filteredKnownHosts(), (entry: KnownHostEntry) => {
+        ForEach(this.vm.filteredKnownHosts(), (entry: KnownHostEntry, index: number) => {
           Column() {
             Row() {
               Column() {
@@ -846,6 +891,8 @@ struct ConfigManagerPage {
           .borderRadius(Tokens.radius.md)
           .width('100%')
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (entry: KnownHostEntry) => entry.id)
       }
     }
@@ -872,5 +919,6 @@ struct ConfigManagerPage {
     .borderRadius(Tokens.radius.md)
     .alignItems(HorizontalAlign.Center)
     .justifyContent(FlexAlign.Center)
+    .transition(Motion.fadeTransition())
   }
 }

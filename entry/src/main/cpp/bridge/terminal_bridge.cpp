@@ -347,10 +347,13 @@ napi_value AttachTerminal(napi_env env, napi_callback_info info)
         rows > 1000) {
         return MakeHandleValue(env, 0);
     }
-    auto sh = LookupLive(sessionHandle);
-    if (!sh || !sh->session) {
+    // Q3：LookupLiveCall 在途租约——下方在 ArkTS 线程直接构造 SshChannel(*sh->session)
+    // 并 openShell，期间 teardown 线程不得 session.reset()（等租约排空）
+    LiveSessionCall call = LookupLiveCall(sessionHandle);
+    if (!call.ok() || !call.sh->session) {
         return MakeHandleValue(env, 0);
     }
+    const std::shared_ptr<SessionHandle> &sh = call.sh;
 
     auto th = std::make_shared<TerminalHandle>();
     th->env = env;
@@ -404,9 +407,17 @@ napi_value DetachTerminal(napi_env env, napi_callback_info info)
     }
     th->closing.store(true, std::memory_order_relaxed);
     // 本体留在会话 terminals 表：通道 close 的终态回调里编排 Core 销毁；
-    // 会话已 teardown 的场景由 terminals.clear() 兜底（internal.h 头注）
+    // 会话已 teardown 的场景由 terminals.clear() 兜底（internal.h 头注）。
+    // Q3：channel->close() 会经 SshSession 投递，必须持在途租约——会话正在 teardown
+    // 时不再触碰通道（teardown 自会关闭全部通道），避免与 session.reset() 竞态
+    LiveSessionCall call = LookupLiveCall(th->sessionHandleId);
+    if (!call.ok()) {
+        return MakeBool(env, true);
+    }
     if (auto core = th->coreCopy()) {
-        core->channel->close(); // 任意线程可调、幂等
+        if (core->channel) {
+            core->channel->close(); // 任意线程可调、幂等
+        }
     }
     return MakeBool(env, true);
 }
@@ -622,6 +633,11 @@ napi_value WriteTerminal(napi_env env, napi_callback_info info)
     }
     auto th = LookupTerminal(h);
     if (!th || th->closing.load(std::memory_order_relaxed)) {
+        return MakeBool(env, false);
+    }
+    // Q3：channel->write 经 SshSession 投递，持在途租约防 teardown 并发 session.reset()
+    LiveSessionCall call = LookupLiveCall(th->sessionHandleId);
+    if (!call.ok()) {
         return MakeBool(env, false);
     }
     auto core = th->coreCopy();

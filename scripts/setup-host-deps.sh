@@ -329,6 +329,8 @@ PidFile $auth_dir/sshd.pid
 X11Forwarding no
 PrintMotd no
 LogLevel VERBOSE
+# N14 SFTP 集成测试需要 sftp subsystem（internal-sftp 内建于 sshd，不依赖外部路径）
+Subsystem sftp internal-sftp
 EOF
 
   # 常驻 sshd（daemon 模式，每连接 fork；与免 root 的 sshd -d 单连接模式不同）

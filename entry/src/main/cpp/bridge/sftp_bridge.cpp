@@ -200,10 +200,12 @@ napi_value SftpOpen(napi_env env, napi_callback_info info)
     if (argc < 1 || !GetHandleArg(env, argv[0], sessionHandle)) {
         return MakeBool(env, false);
     }
-    auto sh = LookupLive(sessionHandle);
-    if (!sh || !sh->session) {
+    // Q3：在途租约——下方在 ArkTS 线程构造 SshSftp(*sh->session)，teardown 须等本调用结束
+    LiveSessionCall call = LookupLiveCall(sessionHandle);
+    if (!call.ok() || !call.sh->session) {
         return MakeBool(env, false);
     }
+    const std::shared_ptr<SessionHandle> &sh = call.sh;
     if (sh->session->state() != ssh::SshSessionState::kEstablished) {
         return MakeBool(env, false);
     }
@@ -256,6 +258,8 @@ napi_value SftpClose(napi_env env, napi_callback_info info)
     }
     th->closing.store(true);
     if (th->sftp) {
+        // close 投递的任务捕获 SshSftp 自引用（sftp.h 头注）：本函数返回、th 析构后，
+        // 循环线程上排队的 open/list/closeOnLoop 仍访问存活对象（修复快速切换主机闪退的 UAF）
         th->sftp->close();
     }
     if (th->session) {
@@ -280,6 +284,23 @@ napi_value SftpList(napi_env env, napi_callback_info info)
         return MakeBool(env, false);
     }
     return MakeBool(env, th->sftp->list(std::move(path)));
+}
+
+napi_value SftpRealpath(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t id = 0;
+    std::string path;
+    if (argc < 2 || !GetHandleArg(env, argv[0], id) || !GetStringArg(env, argv[1], path)) {
+        return MakeBool(env, false);
+    }
+    auto th = RequireSftp(id);
+    if (!th) {
+        return MakeBool(env, false);
+    }
+    return MakeBool(env, th->sftp->realpath(std::move(path)));
 }
 
 napi_value SftpStat(napi_env env, napi_callback_info info)
@@ -474,6 +495,7 @@ void RegisterSftpBridge(napi_env env, napi_value exports)
         {"sftpOpen", nullptr, SftpOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sftpClose", nullptr, SftpClose, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sftpList", nullptr, SftpList, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sftpRealpath", nullptr, SftpRealpath, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sftpStat", nullptr, SftpStat, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sftpDownload", nullptr, SftpDownload, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sftpUpload", nullptr, SftpUpload, nullptr, nullptr, nullptr, napi_default, nullptr},

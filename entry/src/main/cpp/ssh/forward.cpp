@@ -440,7 +440,8 @@ bool SshForwardChannel::drainReads()
         if (n > 0) {
             progress = true;
             if (callbacks_.onData) {
-                callbacks_.onData(std::string(buf, static_cast<size_t>(n)));
+                readChunk_.assign(buf, static_cast<size_t>(n));
+                callbacks_.onData(readChunk_);
             }
             continue;
         }

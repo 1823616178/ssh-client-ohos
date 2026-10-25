@@ -10,9 +10,11 @@
 #include "sftp.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <poll.h>
 #include <unistd.h>
 #include <utility>
 
@@ -340,6 +342,60 @@ void FillEntryBasics(SftpEntry *out, const std::string &path, const std::string 
     out->permissions = formatSftpPermissions(mode);
 }
 
+/** EAGAIN 泵送：单次 poll 切片与默认总预算（头注承诺的「短忙等泵送上限」） */
+constexpr int kPumpSliceMs = 50;
+constexpr int kPumpBudgetMs = 30000;
+
+/**
+ * 非阻塞会话上的 EAGAIN 续驱。会话固定非阻塞（session.cpp 的
+ * libssh2_session_set_blocking(session_, 0)），任何需要网络往返的
+ * libssh2_sftp_* 首调几乎必然 EAGAIN；按 libssh2 约定以同参重入，
+ * 两次重试之间按 libssh2_session_block_directions 声明的方向 poll 短等。
+ *
+ * fn() 返回 true = 已落定（成功或真实错误，结果由 fn 捕获）；false = EAGAIN。
+ * 超过预算、fd 失效或 cancel 置位（SshSftp::close 已请求）返回 false，
+ * 调用方按 kIoError（超时/对端无响应/已关闭）处理。cancel 可为 nullptr（收尾路径不可取消）。
+ * 仅事件循环线程调用；pump 期间会话线程串行——与传输循环既有语义一致
+ *（完整非阻塞状态机留 M6）。
+ */
+template <typename Fn>
+bool pumpEagain(LIBSSH2_SESSION *session, int fd, const std::atomic<bool> *cancel, Fn &&fn,
+                int budgetMs = kPumpBudgetMs)
+{
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+    for (;;) {
+        if (fn()) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline || fd < 0) {
+            return false;
+        }
+        if (cancel != nullptr && cancel->load(std::memory_order_acquire)) {
+            return false; // close 已请求：不再为即将关闭的 SFTP 占住循环线程
+        }
+        const int dirs = ::libssh2_session_block_directions(session);
+        short events = 0;
+        if ((dirs & LIBSSH2_SESSION_BLOCK_INBOUND) != 0) {
+            events |= POLLIN;
+        }
+        if ((dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND) != 0) {
+            events |= POLLOUT;
+        }
+        if (events == 0) {
+            events = POLLIN; // 方向未知：防御性等可读
+        }
+        struct pollfd pfd {};
+        pfd.fd = fd;
+        pfd.events = events;
+        const auto remainMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const int slice = remainMs < kPumpSliceMs ? static_cast<int>(remainMs) : kPumpSliceMs;
+        ::poll(&pfd, 1, slice > 0 ? slice : 1);
+    }
+}
+
 } // namespace
 
 SshSftp::SshSftp(SshSession &session, SftpCallbacks callbacks)
@@ -377,7 +433,9 @@ bool SshSftp::open()
     if (!openAdmitted_.compare_exchange_strong(expected, true)) {
         return false; // 已有 open 在途
     }
-    session_.thread_.post([this] {
+    // 捕获自引用：持有方先释放时排队任务仍保活本对象（shared_ptr 持有时；见 sftp.h 头注）
+    session_.thread_.post([this, self = weak_from_this().lock()] {
+        (void)self;
         ensureOpenOnLoop();
         if (!opened_.load(std::memory_order_acquire)) {
             // ensureOpen 失败时 finishOpen 已回报；此处仅复位受理位供重试
@@ -399,7 +457,7 @@ bool SshSftp::admit(PendingOp op)
     // 路径类操作做一次归一化校验（纯逻辑，受理线程完成，失败立即回报）
     if (op.kind != OpKind::kUpload && op.kind != OpKind::kDownload) {
         const std::string norm = sftpNormalizePath(op.path);
-        if (norm.empty() && op.kind != OpKind::kList) {
+        if (norm.empty() && op.kind != OpKind::kList && op.kind != OpKind::kRealpath) {
             if (callbacks_.onOp) {
                 SftpOpResult r;
                 r.success = false;
@@ -432,7 +490,8 @@ bool SshSftp::admit(PendingOp op)
         op.path2 = sftpNormalizePath(op.path2);
     }
 
-    session_.thread_.post([this, op = std::move(op)]() mutable {
+    session_.thread_.post([this, self = weak_from_this().lock(), op = std::move(op)]() mutable {
+        (void)self;
         ensureOpenOnLoop();
         if (!opened_.load(std::memory_order_acquire)) {
             if (op.kind == OpKind::kList) {
@@ -491,6 +550,14 @@ bool SshSftp::stat(std::string path)
 {
     PendingOp op;
     op.kind = OpKind::kStat;
+    op.path = std::move(path);
+    return admit(std::move(op));
+}
+
+bool SshSftp::realpath(std::string path)
+{
+    PendingOp op;
+    op.kind = OpKind::kRealpath;
     op.path = std::move(path);
     return admit(std::move(op));
 }
@@ -575,11 +642,19 @@ bool SshSftp::readlink(std::string path)
 void SshSftp::close()
 {
     closeRequested_.store(true, std::memory_order_release);
-    session_.thread_.post([this] { closeOnLoop(); });
+    session_.thread_.post([this, self = weak_from_this().lock()] {
+        (void)self;
+        closeOnLoop();
+    });
 }
 
 void SshSftp::ensureOpenOnLoop()
 {
+    if (closeRequested_.load(std::memory_order_acquire) && sftp_ == nullptr) {
+        // 已请求关闭：不再为排队中的 open/操作发起新的 sftp_init 往返
+        finishOpen(SftpError::kCancelled, "SFTP 已关闭");
+        return;
+    }
     if (opened_.load(std::memory_order_acquire) || sftp_ != nullptr) {
         if (sftp_ != nullptr) {
             opened_.store(true, std::memory_order_release);
@@ -590,10 +665,19 @@ void SshSftp::ensureOpenOnLoop()
         finishOpen(SftpError::kNotEstablished, "会话未 established");
         return;
     }
-    LIBSSH2_SFTP *sftp = ::libssh2_sftp_init(session_.session_);
+    LIBSSH2_SFTP *sftp = nullptr;
+    // sftp_init 需要 channel open 往返，非阻塞会话首调几乎必然 EAGAIN——泵送续驱
+    const bool settled = pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+        sftp = ::libssh2_sftp_init(session_.session_);
+        if (sftp != nullptr) {
+            return true;
+        }
+        return ::libssh2_session_last_errno(session_.session_) != LIBSSH2_ERROR_EAGAIN;
+    });
     if (sftp == nullptr) {
         const int err = ::libssh2_session_last_errno(session_.session_);
-        finishOpen(mapLibssh2Errno(err), lastLibssh2Error());
+        finishOpen(settled ? mapLibssh2Errno(err) : SftpError::kIoError,
+                   settled ? lastLibssh2Error() : "SFTP 打开超时（对端无响应）");
         return;
     }
     sftp_ = sftp;
@@ -646,11 +730,18 @@ void SshSftp::doList(const std::string &path)
         }
         return;
     }
-    LIBSSH2_SFTP_HANDLE *h = ::libssh2_sftp_opendir(sftp_, path.c_str());
+    LIBSSH2_SFTP_HANDLE *h = nullptr;
+    const bool opened = pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+        h = ::libssh2_sftp_opendir(sftp_, path.c_str());
+        if (h != nullptr) {
+            return true;
+        }
+        return ::libssh2_session_last_errno(session_.session_) != LIBSSH2_ERROR_EAGAIN;
+    });
     if (h == nullptr) {
         const int err = ::libssh2_session_last_errno(session_.session_);
-        result.error = mapLibssh2Errno(err);
-        result.message = lastLibssh2Error();
+        result.error = opened ? mapLibssh2Errno(err) : SftpError::kIoError;
+        result.message = opened ? lastLibssh2Error() : "列目录超时（对端无响应）";
         if (result.error == SftpError::kNone) {
             result.error = SftpError::kIoError;
         }
@@ -664,10 +755,23 @@ void SshSftp::doList(const std::string &path)
         char nameBuf[512];
         char longBuf[512];
         LIBSSH2_SFTP_ATTRIBUTES attrs {};
-        const ssize_t n = ::libssh2_sftp_readdir_ex(h, nameBuf, sizeof(nameBuf), longBuf,
-                                                     sizeof(longBuf), &attrs);
-        if (n == LIBSSH2_ERROR_EAGAIN) {
-            continue;
+        ssize_t n = 0;
+        const bool settled = pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            n = ::libssh2_sftp_readdir_ex(h, nameBuf, sizeof(nameBuf), longBuf,
+                                          sizeof(longBuf), &attrs);
+            return n != LIBSSH2_ERROR_EAGAIN;
+        });
+        if (!settled) {
+            // 读取中途对端死亡：尽力关闭后按 IO 错误收尾，不再无限忙等
+            pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+                return ::libssh2_sftp_closedir(h) != LIBSSH2_ERROR_EAGAIN;
+            });
+            result.error = SftpError::kIoError;
+            result.message = "列目录超时（读取中断）";
+            if (callbacks_.onList) {
+                callbacks_.onList(result);
+            }
+            return;
         }
         if (n <= 0) {
             break;
@@ -681,7 +785,10 @@ void SshSftp::doList(const std::string &path)
         FillEntryBasics(&e, child, name, mode, size, mtime);
         raw.push_back(std::move(e));
     }
-    ::libssh2_sftp_closedir(h);
+    // closedir 同样可能 EAGAIN：尽力泵送收尾，避免句柄滞留 libssh2 内部
+    pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+        return ::libssh2_sftp_closedir(h) != LIBSSH2_ERROR_EAGAIN;
+    });
     result.entries = sftpFilterDotEntries(std::move(raw));
     std::sort(result.entries.begin(), result.entries.end(), sftpEntryLess);
     result.success = true;
@@ -703,7 +810,11 @@ void SshSftp::doStat(const std::string &path)
         return;
     }
     LIBSSH2_SFTP_ATTRIBUTES attrs {};
-    const int rc = ::libssh2_sftp_stat(sftp_, path.c_str(), &attrs);
+    int rc = -1;
+    pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+        rc = ::libssh2_sftp_stat(sftp_, path.c_str(), &attrs);
+        return rc != LIBSSH2_ERROR_EAGAIN;
+    });
     if (rc != 0) {
         result.error = mapLibssh2Errno(rc);
         result.message = lastLibssh2Error();
@@ -722,7 +833,11 @@ void SshSftp::doStat(const std::string &path)
     // symlink 读目标（失败不影响 stat 成功）
     if (result.entry.type == SftpEntryType::kSymlink) {
         char linkBuf[1024];
-        const ssize_t ln = ::libssh2_sftp_readlink(sftp_, path.c_str(), linkBuf, sizeof(linkBuf));
+        ssize_t ln = -1;
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            ln = ::libssh2_sftp_readlink(sftp_, path.c_str(), linkBuf, sizeof(linkBuf));
+            return ln != LIBSSH2_ERROR_EAGAIN;
+        });
         if (ln > 0) {
             result.entry.linkTarget.assign(linkBuf, static_cast<size_t>(ln));
         }
@@ -749,38 +864,58 @@ void SshSftp::doOp(const PendingOp &op)
     switch (op.kind) {
     case OpKind::kRename:
         r.op = "rename";
-        rc = ::libssh2_sftp_rename_ex(sftp_, op.path.c_str(), static_cast<unsigned>(op.path.size()),
-                                       op.path2.c_str(), static_cast<unsigned>(op.path2.size()),
-                                       LIBSSH2_SFTP_RENAME_OVERWRITE |
-                                           LIBSSH2_SFTP_RENAME_ATOMIC |
-                                           LIBSSH2_SFTP_RENAME_NATIVE);
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            rc = ::libssh2_sftp_rename_ex(sftp_, op.path.c_str(),
+                                          static_cast<unsigned>(op.path.size()),
+                                          op.path2.c_str(),
+                                          static_cast<unsigned>(op.path2.size()),
+                                          LIBSSH2_SFTP_RENAME_OVERWRITE |
+                                              LIBSSH2_SFTP_RENAME_ATOMIC |
+                                              LIBSSH2_SFTP_RENAME_NATIVE);
+            return rc != LIBSSH2_ERROR_EAGAIN;
+        });
         break;
     case OpKind::kMkdir:
         r.op = "mkdir";
-        rc = ::libssh2_sftp_mkdir(sftp_, op.path.c_str(), op.mode);
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            rc = ::libssh2_sftp_mkdir(sftp_, op.path.c_str(), op.mode);
+            return rc != LIBSSH2_ERROR_EAGAIN;
+        });
         break;
     case OpKind::kRmdir:
         r.op = "rmdir";
-        rc = ::libssh2_sftp_rmdir(sftp_, op.path.c_str());
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            rc = ::libssh2_sftp_rmdir(sftp_, op.path.c_str());
+            return rc != LIBSSH2_ERROR_EAGAIN;
+        });
         break;
     case OpKind::kUnlink:
         r.op = "unlink";
-        rc = ::libssh2_sftp_unlink(sftp_, op.path.c_str());
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            rc = ::libssh2_sftp_unlink(sftp_, op.path.c_str());
+            return rc != LIBSSH2_ERROR_EAGAIN;
+        });
         break;
     case OpKind::kChmod: {
         r.op = "chmod";
         // libssh2 无 chmod 包装，走 setstat + ATTR_PERMISSIONS
-        LIBSSH2_SFTP_ATTRIBUTES attrs {};
-        attrs.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
-        attrs.permissions = op.mode;
-        rc = ::libssh2_sftp_setstat(sftp_, op.path.c_str(), &attrs);
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            LIBSSH2_SFTP_ATTRIBUTES attrs {};
+            attrs.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
+            attrs.permissions = op.mode;
+            rc = ::libssh2_sftp_setstat(sftp_, op.path.c_str(), &attrs);
+            return rc != LIBSSH2_ERROR_EAGAIN;
+        });
         break;
     }
     case OpKind::kReadlink: {
         r.op = "readlink";
         char linkBuf[1024];
-        const ssize_t ln =
-            ::libssh2_sftp_readlink(sftp_, op.path.c_str(), linkBuf, sizeof(linkBuf));
+        ssize_t ln = -1;
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            ln = ::libssh2_sftp_readlink(sftp_, op.path.c_str(), linkBuf, sizeof(linkBuf));
+            return ln != LIBSSH2_ERROR_EAGAIN;
+        });
         if (ln > 0) {
             r.success = true;
             r.error = SftpError::kNone;
@@ -791,6 +926,27 @@ void SshSftp::doOp(const PendingOp &op)
             return;
         }
         rc = static_cast<int>(ln);
+        break;
+    }
+    case OpKind::kRealpath: {
+        // 相对路径（如 "."）由服务端按用户 home 解析，返回绝对路径
+        r.op = "realpath";
+        char resolved[1024];
+        ssize_t ln = -1;
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            ln = ::libssh2_sftp_realpath(sftp_, op.path.c_str(), resolved, sizeof(resolved));
+            return ln != LIBSSH2_ERROR_EAGAIN;
+        });
+        if (ln > 0) {
+            r.success = true;
+            r.error = SftpError::kNone;
+            r.path.assign(resolved, static_cast<size_t>(ln));
+            if (callbacks_.onOp) {
+                callbacks_.onOp(r);
+            }
+            return;
+        }
+        rc = -1;
         break;
     }
     default:
@@ -836,7 +992,11 @@ void SshSftp::doTransfer(const PendingOp &op)
 
     LIBSSH2_SFTP_HANDLE *h = nullptr;
     if (download) {
-        h = ::libssh2_sftp_open(sftp_, remotePath.c_str(), LIBSSH2_FXF_READ, 0);
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            h = ::libssh2_sftp_open(sftp_, remotePath.c_str(), LIBSSH2_FXF_READ, 0);
+            return h != nullptr ||
+                   ::libssh2_session_last_errno(session_.session_) != LIBSSH2_ERROR_EAGAIN;
+        });
     } else {
         // 本地源文件大小（用于进度总量）
         std::ifstream in(localPath, std::ios::binary | std::ios::ate);
@@ -848,13 +1008,19 @@ void SshSftp::doTransfer(const PendingOp &op)
             }
             return;
         }
-        h = ::libssh2_sftp_open(sftp_, remotePath.c_str(),
-                                LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, 0644);
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            h = ::libssh2_sftp_open(sftp_, remotePath.c_str(),
+                                    LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+                                    0644);
+            return h != nullptr ||
+                   ::libssh2_session_last_errno(session_.session_) != LIBSSH2_ERROR_EAGAIN;
+        });
     }
     if (h == nullptr) {
         const int err = ::libssh2_session_last_errno(session_.session_);
         r.error = mapLibssh2Errno(err);
-        r.message = lastLibssh2Error();
+        r.message = err == LIBSSH2_ERROR_EAGAIN ? "打开远端文件超时（对端无响应）"
+                                                : lastLibssh2Error();
         if (r.error == SftpError::kNone) {
             r.error = SftpError::kIoError;
         }
@@ -864,10 +1030,22 @@ void SshSftp::doTransfer(const PendingOp &op)
         return;
     }
 
-    constexpr size_t kChunk = 32 * 1024;
-    std::vector<char> buf(kChunk);
+    std::vector<char> buf(kTransferBufBytes);
     uint64_t transferred = 0;
     uint64_t lastReport = 0;
+    auto lastReportAt = std::chrono::steady_clock::now();
+    // 字节阈值 + 时间间隔双条件（kProgressMinIntervalMs 注释）；终值由收尾统一上报
+    auto progressDue = [&]() -> bool {
+        if (transferred - lastReport < kProgressReportBytes || !callbacks_.onProgress) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReportAt < std::chrono::milliseconds(kProgressMinIntervalMs)) {
+            return false;
+        }
+        lastReportAt = now;
+        return true;
+    };
     SftpError err = SftpError::kNone;
     std::string msg;
 
@@ -884,13 +1062,24 @@ void SshSftp::doTransfer(const PendingOp &op)
         }
         // 试探远端大小
         LIBSSH2_SFTP_ATTRIBUTES attrs {};
-        if (::libssh2_sftp_fstat(h, &attrs) == 0 && attrs.filesize > 0) {
+        int fstatRc = -1;
+        pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+            fstatRc = ::libssh2_sftp_fstat(h, &attrs);
+            return fstatRc != LIBSSH2_ERROR_EAGAIN;
+        });
+        if (fstatRc == 0 && attrs.filesize > 0) {
             r.total = static_cast<uint64_t>(attrs.filesize);
         }
         for (;;) {
-            const ssize_t n = ::libssh2_sftp_read(h, buf.data(), buf.size());
-            if (n == LIBSSH2_ERROR_EAGAIN) {
-                continue;
+            ssize_t n = 0;
+            const bool settled = pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+                n = ::libssh2_sftp_read(h, buf.data(), buf.size());
+                return n != LIBSSH2_ERROR_EAGAIN;
+            });
+            if (!settled) {
+                err = SftpError::kIoError;
+                msg = "读取超时（对端无响应）";
+                break;
             }
             if (n < 0) {
                 err = mapLibssh2Errno(static_cast<int>(n));
@@ -907,7 +1096,7 @@ void SshSftp::doTransfer(const PendingOp &op)
                 break;
             }
             transferred += static_cast<uint64_t>(n);
-            if (transferred - lastReport >= kProgressReportBytes && callbacks_.onProgress) {
+            if (progressDue()) {
                 lastReport = transferred;
                 SftpTransferProgress p;
                 p.transferId = op.transferId;
@@ -941,10 +1130,16 @@ void SshSftp::doTransfer(const PendingOp &op)
             }
             size_t off = 0;
             while (off < static_cast<size_t>(got)) {
-                const ssize_t n = ::libssh2_sftp_write(
-                    h, buf.data() + off, static_cast<size_t>(got) - off);
-                if (n == LIBSSH2_ERROR_EAGAIN) {
-                    continue;
+                ssize_t n = 0;
+                const bool settled = pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+                    n = ::libssh2_sftp_write(h, buf.data() + off,
+                                             static_cast<size_t>(got) - off);
+                    return n != LIBSSH2_ERROR_EAGAIN;
+                });
+                if (!settled) {
+                    err = SftpError::kIoError;
+                    msg = "写入超时（对端无响应）";
+                    break;
                 }
                 if (n < 0) {
                     err = mapLibssh2Errno(static_cast<int>(n));
@@ -957,7 +1152,7 @@ void SshSftp::doTransfer(const PendingOp &op)
             if (err != SftpError::kNone) {
                 break;
             }
-            if (transferred - lastReport >= kProgressReportBytes && callbacks_.onProgress) {
+            if (progressDue()) {
                 lastReport = transferred;
                 SftpTransferProgress p;
                 p.transferId = op.transferId;
@@ -968,7 +1163,10 @@ void SshSftp::doTransfer(const PendingOp &op)
         }
     }
 
-    ::libssh2_sftp_close(h);
+    // close 同样可能 EAGAIN：尽力泵送收尾，避免句柄滞留 libssh2 内部
+    pumpEagain(session_.session_, session_.fd_, &closeRequested_, [&]() -> bool {
+        return ::libssh2_sftp_close(h) != LIBSSH2_ERROR_EAGAIN;
+    });
     r.transferred = transferred;
     if (err == SftpError::kNone) {
         r.success = true;
@@ -995,7 +1193,10 @@ void SshSftp::closeOnLoop()
     opened_.store(false, std::memory_order_release);
     openAdmitted_.store(false, std::memory_order_release);
     if (sftp_ != nullptr && session_.session_ != nullptr) {
-        ::libssh2_sftp_shutdown(sftp_);
+        // 收尾路径短预算泵送：对端已死时 poll 立即返回错误，不会在 2s 上空转
+        pumpEagain(session_.session_, session_.fd_, nullptr, [&]() -> bool {
+            return ::libssh2_sftp_shutdown(sftp_) != LIBSSH2_ERROR_EAGAIN;
+        }, 2000);
     }
     sftp_ = nullptr;
 }

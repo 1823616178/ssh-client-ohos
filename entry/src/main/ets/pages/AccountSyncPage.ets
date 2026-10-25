@@ -6,6 +6,7 @@
  */
 
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { PageHeader } from '../view/PageHeader';
 import { DeviceItem } from '../service/sync/ApiTypes';
 import { RevisionItem } from '../service/sync/ApiTypes';
@@ -22,6 +23,8 @@ import { AccountSyncViewModel } from '../viewmodel/AccountSyncViewModel';
 @Entry
 @ComponentV2
 struct AccountSyncPage {
+  /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
+  @Local private introDone: boolean = !Motion.enabled;
   @Local private isSyncing: boolean = false;
   private readonly vm: AccountSyncViewModel = SyncRuntime.get().createViewModel();
 
@@ -41,6 +44,7 @@ struct AccountSyncPage {
   }
 
   aboutToAppear(): void {
+    this.openIntroWindow();
     // start() 是 fire-and-forget；这里等一次 hydrate 完成，避免冷启动瞬间读到空 token
     // 而误判「未登录」（token 落 asset，读取是异步的）
     void this.refreshAfterHydrate();
@@ -49,6 +53,33 @@ struct AccountSyncPage {
   private async refreshAfterHydrate(): Promise<void> {
     await SyncRuntime.get().ensureHydrated();
     this.vm.refreshFromAuth();
+  }
+
+  /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
+  private openIntroWindow(): void {
+    if (this.introDone) {
+      return;
+    }
+    setTimeout(() => {
+      this.introDone = true;
+    }, Motion.INTRO_WINDOW_MS);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
   }
 
   build() {
@@ -861,7 +892,7 @@ struct AccountSyncPage {
       .width('100%')
 
       Column() {
-        ForEach(this.vm.conflicts, (item: SyncConflict) => {
+        ForEach(this.vm.conflicts, (item: SyncConflict, index: number) => {
           Row() {
             Column()
               .width(6)
@@ -876,6 +907,8 @@ struct AccountSyncPage {
           }
           .width('100%')
           .padding({ top: Tokens.space.xs, bottom: Tokens.space.xs })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (item: SyncConflict) => `${item.entity}:${item.id}:${item.kind}`)
       }
       .width('100%')
@@ -939,6 +972,7 @@ struct AccountSyncPage {
             .fontColor(Tokens.Color.textFaint)
         }
         .padding({ top: Tokens.space.sm, bottom: Tokens.space.sm })
+        .transition(Motion.fadeTransition())
       } else {
         Column() {
           ForEach(this.vm.devices, (d: DeviceItem, index: number) => {
@@ -1000,6 +1034,8 @@ struct AccountSyncPage {
               .padding({ top: Tokens.space.sm, bottom: Tokens.space.sm })
             }
             .width('100%')
+            // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+            .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
           }, (d: DeviceItem) => d.id)
         }
         .width('100%')
@@ -1073,6 +1109,7 @@ struct AccountSyncPage {
             .fontColor(Tokens.Color.textFaint)
         }
         .padding({ top: Tokens.space.sm, bottom: Tokens.space.sm })
+        .transition(Motion.fadeTransition())
       } else {
         Column() {
           ForEach(this.vm.revisions, (item: RevisionItem, index: number) => {
@@ -1112,6 +1149,8 @@ struct AccountSyncPage {
               .padding({ top: Tokens.space.sm, bottom: Tokens.space.sm })
             }
             .width('100%')
+            // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+            .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
           }, (item: RevisionItem) => item.revision)
         }
         .width('100%')

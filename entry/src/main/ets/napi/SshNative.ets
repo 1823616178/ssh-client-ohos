@@ -77,6 +77,7 @@ export interface LibSshCoreModule {
   sftpClose(sftpHandle: number): boolean;
   sftpList(sftpHandle: number, path: string): boolean;
   sftpStat(sftpHandle: number, path: string): boolean;
+  sftpRealpath(sftpHandle: number, path: string): boolean;
   sftpDownload(sftpHandle: number, transferId: number, remotePath: string,
     localPath: string): boolean;
   sftpUpload(sftpHandle: number, transferId: number, localPath: string,
@@ -523,6 +524,10 @@ export class SshNativeSftp {
 
   stat(path: string): boolean {
     return this.alive && native.sftpStat(this.handle, path);
+  }
+
+  realpath(path: string): boolean {
+    return this.alive && native.sftpRealpath(this.handle, path);
   }
 
   download(transferId: number, remotePath: string, localPath: string): boolean {

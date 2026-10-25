@@ -9,6 +9,7 @@
  */
 
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
 import { Logger } from '../common/utils/Logger';
 import { PortForwardRule } from '../common/model/models';
@@ -100,6 +101,8 @@ interface ForwardRouteParams {
 @Entry
 @Component
 struct PortForwardPage {
+  /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
+  @State private introDone: boolean = !Motion.enabled;
   @State rows: PortForwardRow[] = [];
   @State logs: ForwardRuntimeLog[] = [];
   @State error: string = '';
@@ -114,6 +117,7 @@ struct PortForwardPage {
   private listenerBound: boolean = false;
 
   aboutToAppear(): void {
+    this.openIntroWindow();
     const params: ForwardRouteParams = this.readRouteParams();
     this.hostId = params.hostId ?? '';
     this.hostLabel = params.hostName ?? (this.hostId.length > 0 ? this.hostId : '全部主机');
@@ -235,6 +239,33 @@ struct PortForwardPage {
     ];
   }
 
+  /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
+  private openIntroWindow(): void {
+    if (this.introDone) {
+      return;
+    }
+    setTimeout(() => {
+      this.introDone = true;
+    }, Motion.INTRO_WINDOW_MS);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+  }
+
   build() {
     Column() {
       PageHeader({
@@ -263,12 +294,15 @@ struct PortForwardPage {
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.textFaint)
           .margin({ top: Tokens.space.lg })
+        .transition(Motion.fadeTransition())
       } else {
         List() {
-          ForEach(this.rows, (row: PortForwardRow) => {
+          ForEach(this.rows, (row: PortForwardRow, index: number) => {
             ListItem() {
               this.RuleRow(row)
             }
+            // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+            .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
           }, (row: PortForwardRow) =>
           `${row.rule.id}|${row.status?.state ?? 'idle'}|${row.status?.connections ?? 0}|` +
             `${row.status?.bytesIn ?? 0}|${row.status?.bytesOut ?? 0}|${row.status?.listenLabel ?? ''}`)

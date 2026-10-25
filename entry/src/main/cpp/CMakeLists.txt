@@ -42,6 +42,21 @@ set(NATIVE_SOURCES
 
 add_library(ssh_core SHARED ${NATIVE_SOURCES})
 
+# P2 性能：终端数据热路径（vterm 回调 / 网格 / 回滚 / 帧发布）在 Debug 构建下也按 -O2 编译。
+# hvigor 默认 debug 构建 = ohos.toolchain.cmake 的 -O0，而 cat 大文件时每个字节都要经过
+# term/ 的 libvterm 回调与网格转换；宿主实测同一代码 -O0→-O2 吞吐 +28%。保留 -g 便于调试；
+# 需要逐行单步 term/ 代码时在 build-profile.json5 的 arguments 加 -DSSH_CORE_HOTPATH_O2=OFF。
+# Release 构建由工具链统一给 -O2，这里不重复设置；LTO 未开启（见交付说明）。
+option(SSH_CORE_HOTPATH_O2 "Debug 构建下 term/ 热路径仍用 -O2 编译" ON)
+if(SSH_CORE_HOTPATH_O2 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set_source_files_properties(
+        term/grid.cpp
+        term/vterm_screen.cpp
+        term/scrollback.cpp
+        term/frame_sync.cpp
+        PROPERTIES COMPILE_OPTIONS "-O2")
+endif()
+
 # 预编译静态依赖（scripts/build-deps.sh 交叉编译产物，全部 -fPIC），
 # 按当前 ABI（OHOS_ARCH 由 ohos.toolchain.cmake 注入）选择 prebuilt 目录。
 set(PREBUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/prebuilt/${OHOS_ARCH})

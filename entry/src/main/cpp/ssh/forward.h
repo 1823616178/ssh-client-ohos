@@ -227,6 +227,7 @@ private:
     std::vector<std::string> writeQueue_;
     size_t writeQueueHeadOffset_ = 0;
     bool eofSeen_ = false;
+    std::string readChunk_; // P2：drainReads 回调载体复用（assign 复用容量，稳态零堆分配）
     bool localCloseRequested_ = false;
     bool openFailed_ = false;
     bool closeCompleted_ = false;

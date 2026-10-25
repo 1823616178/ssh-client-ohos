@@ -61,6 +61,7 @@
 #include <deque>
 #include <functional>
 #include <optional>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -236,6 +237,13 @@ private:
     bool closeCompleted_ = false;      // libssh2_channel_close 已返回 0
     int exitStatus_ = 0;               // collectExitInfo 采集结果
     std::string exitSignal_;
+    // P2 读路径：堆上读缓冲（首次 drainReads 时分配一次）+ 复用的回调载体字符串
+    //（assign 复用容量，稳态零堆分配）。libssh2_channel_read_ex 一次调用会跨多个已到达
+    // 数据包拷贝直到填满缓冲，128 KiB 让大流量输出的回调/vterm feed 次数降为 1/4。
+    // onData 的 data 仅回调内有效（SshChannelCallbacks 契约），复用安全。
+    static constexpr size_t kReadBufBytes = 128 * 1024;
+    std::unique_ptr<char[]> readBuf_;
+    std::string readChunk_;
 };
 
 const char *toString(ChannelState state);

@@ -37,6 +37,7 @@ export interface SftpGateway {
   close(sftpHandle: number): void;
   list(sftpHandle: number, path: string): boolean;
   stat(sftpHandle: number, path: string): boolean;
+  realpath(sftpHandle: number, path: string): boolean;
   download(sftpHandle: number, transferId: number, remotePath: string, localPath: string): boolean;
   upload(sftpHandle: number, transferId: number, localPath: string, remotePath: string): boolean;
   mkdir(sftpHandle: number, path: string, mode: number): boolean;
@@ -58,6 +59,10 @@ export class NullSftpGateway implements SftpGateway {
   }
 
   stat(_sftpHandle: number, _path: string): boolean {
+    return false;
+  }
+
+  realpath(_sftpHandle: number, _path: string): boolean {
     return false;
   }
 
@@ -171,6 +176,8 @@ export class SftpViewModel {
   sessionId: string = '';
   sftpHandle: number = 0;
   currentDir: string = '/';
+  /** 首次列目录前的 home 解析中：sftpOpen 事件到达时不预列 '/'，等 realpath 结果 */
+  homeResolvePending: boolean = false;
   loading: boolean = false;
   error: string = '';
   /** native 未就绪 / 会话未建立时为 true（UI 空状态文案） */
@@ -205,7 +212,13 @@ export class SftpViewModel {
     this.sftpHandle = sftp;
     this.nativeUnavailable = false;
     this.error = '';
-    this.refresh('/');
+    // 首列从用户 home 开始："." 由服务端按登录用户解析；失败/未受理回落根目录
+    this.currentDir = '/';
+    this.homeResolvePending = true;
+    if (!this.gateway.realpath(this.sftpHandle, '.')) {
+      this.homeResolvePending = false;
+      this.refresh('/');
+    }
     return true;
   }
 
@@ -321,16 +334,32 @@ export class SftpViewModel {
   }
 
   /**
+   * 事件是否属于本 VM 的 SFTP 通道：同一条 SSH 会话上可能同时存在多个
+   * SFTP 消费者（终端页弹窗 / 全页文件传输 / 首页右栏面板），sftp 事件
+   * 随会话广播。不按句柄过滤时，别的通道的 sftpOpen 会覆盖本 VM 的
+   * sftpHandle，随后 detach 误关他人通道（全页「永远加载中」即此因）。
+   */
+  ownsChannel(fields: SftpNativeEventFields): boolean {
+    const eventHandle: number = fields.sftp ?? 0;
+    return eventHandle === 0 || eventHandle === this.sftpHandle;
+  }
+
+  /**
    * 转发 native SFTP 事件（SshEvent 上 type 以 sftp 开头）。
    * Page 层从 SessionManager 事件监听调用本方法。
    */
   handleNativeEvent(type: string, fields: SftpNativeEventFields): void {
+    if (!this.ownsChannel(fields)) {
+      return; // 其他 SFTP 消费者通道的事件，与本 VM 无关
+    }
     if (type === 'sftpOpen') {
       if (fields.success === true && (fields.sftp ?? 0) > 0) {
         this.sftpHandle = fields.sftp ?? this.sftpHandle;
         this.nativeUnavailable = false;
         this.error = '';
-        this.refresh(this.currentDir);
+        if (!this.homeResolvePending) {
+          this.refresh(this.currentDir);
+        }
       } else {
         this.nativeUnavailable = true;
         this.error = '文件通道打开失败，请重试';
@@ -364,6 +393,17 @@ export class SftpViewModel {
       return;
     }
     if (type === 'sftpOpDone') {
+      if (fields.op === 'realpath') {
+        this.homeResolvePending = false;
+        const resolved: string = typeof fields.path === 'string' ? fields.path : '';
+        if (fields.success === true && resolved.startsWith('/')) {
+          this.currentDir = resolved;
+          this.refresh(resolved);
+        } else {
+          this.refresh('/');
+        }
+        return;
+      }
       if (fields.success === true && fields.op === 'mkdir') {
         this.refresh(this.currentDir);
       }
@@ -420,6 +460,10 @@ export class NativeSftpGateway implements SftpGateway {
   }
 
   stat(_sftpHandle: number, _path: string): boolean {
+    return false;
+  }
+
+  realpath(_sftpHandle: number, _path: string): boolean {
     return false;
   }
 

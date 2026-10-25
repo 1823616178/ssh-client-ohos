@@ -166,9 +166,13 @@ VtermBridge::~VtermBridge()
 
 size_t VtermBridge::feed(const char *data, size_t len)
 {
+    feeding_ = true;
     const size_t consumed = vterm_input_write(vt_, data, len);
     // DAMAGE_ROW 合并模式下最后一行的 damage 处于挂起态，flush 保证脏行立即可见
     vterm_screen_flush_damage(screen_);
+    feeding_ = false;
+    // 本次 feed 内累计的脏行按最终缓冲一次性重读（P2：滚动不再逐行全屏重读）
+    applyPendingDamage();
     syncRowWrapFlags();
     probeModes();
     return consumed;
@@ -282,7 +286,12 @@ void VtermBridge::setDefaultColors(uint32_t fgArgb, uint32_t bgArgb)
 
 int VtermBridge::onDamage(VTermRect rect, void *user)
 {
-    self(user)->convertRect(rect.start_row, rect.start_col, rect.end_row, rect.end_col);
+    VtermBridge *b = self(user);
+    if (b->feeding_) {
+        b->markDamageRows(rect.start_row, rect.end_row); // feed 末尾统一重读
+        return 1;
+    }
+    b->convertRect(rect.start_row, rect.start_col, rect.end_row, rect.end_col);
     return 1;
 }
 
@@ -330,7 +339,12 @@ int VtermBridge::onSetTermProp(VTermProp prop, VTermValue *val, void *user)
         // 屏幕层在本回调之前已完成缓冲切换；库在切入/切出时的 damage 覆盖
         // 依赖内部时序（切入靠 erase 的 damage、切出靠 damagescreen），
         // 这里直接全屏重读一次，两个方向都确定性地落到新缓冲内容
-        b->convertRect(0, 0, b->grid_.rows(), b->grid_.cols());
+        // （feed 内则记全屏脏行，feed 末尾按最终缓冲重读，结果相同）
+        if (b->feeding_) {
+            b->markDamageRows(0, b->grid_.rows());
+        } else {
+            b->convertRect(0, 0, b->grid_.rows(), b->grid_.cols());
+        }
         return 1;
     case VTERM_PROP_CURSORVISIBLE:
         b->cursorVisible_ = val->boolean != 0;
@@ -466,6 +480,53 @@ void VtermBridge::convertRect(int startRow, int startCol, int endRow, int endCol
             grid_.putCell(row, col, convertCell(vc));
         }
     }
+}
+
+void VtermBridge::markDamageRows(int startRow, int endRow)
+{
+    startRow = std::max(startRow, 0);
+    endRow = std::min(endRow, grid_.rows());
+    if (startRow >= endRow) {
+        return;
+    }
+    if (pendingDamageRows_.size() < static_cast<size_t>(grid_.rows())) {
+        pendingDamageRows_.resize(static_cast<size_t>(grid_.rows()), 0);
+    }
+    std::fill(pendingDamageRows_.begin() + startRow, pendingDamageRows_.begin() + endRow, 1);
+    hasPendingDamage_ = true;
+}
+
+void VtermBridge::applyPendingDamage()
+{
+    if (!hasPendingDamage_) {
+        return;
+    }
+    hasPendingDamage_ = false;
+    const int rows = std::min(grid_.rows(), static_cast<int>(pendingDamageRows_.size()));
+    const int cols = grid_.cols();
+    for (int row = 0; row < rows; ++row) {
+        if (pendingDamageRows_[static_cast<size_t>(row)] == 0) {
+            continue;
+        }
+        pendingDamageRows_[static_cast<size_t>(row)] = 0;
+        for (int col = 0; col < cols; ++col) {
+            VTermPos pos = {row, col};
+            VTermScreenCell vc;
+            if (!vterm_screen_get_cell(screen_, pos, &vc))
+                continue;
+            const Cell next = convertCell(vc);
+            const Cell *cur = grid_.cellAt(row, col);
+            // 只比内容字段（reserved 的软换行位由 syncRowWrapFlags 随后同步）：
+            // 未变化的格不写，避免整屏无谓抬 revision / 标脏行（渲染层少画）
+            if (cur->codepoint == next.codepoint && cur->fgArgb == next.fgArgb &&
+                cur->bgArgb == next.bgArgb && cur->attrs == next.attrs) {
+                continue;
+            }
+            grid_.putCell(row, col, next);
+        }
+    }
+    // 网格行数缩小（理论上 feed 内不会）时丢弃越界的残留标记
+    std::fill(pendingDamageRows_.begin(), pendingDamageRows_.end(), 0);
 }
 
 Cell VtermBridge::convertCell(const VTermScreenCell &vc) const

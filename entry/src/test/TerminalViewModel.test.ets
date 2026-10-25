@@ -24,7 +24,7 @@
 
 import { describe, it, expect } from '@ohos/hypium';
 import { HostProfile, createDefaultHostProfile } from '../main/ets/common/model/models';
-import { SshErrorCode } from '../main/ets/common/SshError';
+import { SshError, SshErrorCode } from '../main/ets/common/SshError';
 import { SshEvent } from '../main/ets/napi/SshNative';
 import {
   NativeSessionHandleLike,
@@ -36,7 +36,6 @@ import {
   TerminalHostDaoLike,
   TerminalLike,
   TerminalRouteParams,
-  TerminalSecretWriterLike,
   TerminalSessionEventListener,
   TerminalSessionHostLike,
   TerminalSessionLike,
@@ -130,7 +129,11 @@ class FakeSessionHost implements TerminalSessionHostLike {
   }
 
   connectCalls: HostProfile[] = [];
+  connectPasswords: (string | undefined)[] = [];
   reconnectNowLog: string[] = [];
+  reconnectPasswords: (string | undefined)[] = [];
+  reconnectAccepted: boolean = true;
+  credentialMissing: boolean = false;
   cancelLog: string[] = [];
   connectError: Error | null = null;
   private idSeq: number = 0;
@@ -154,8 +157,12 @@ class FakeSessionHost implements TerminalSessionHostLike {
     this.handles.set(sessionId, new FakeHandle(handle));
   }
 
-  connect(host: HostProfile): Promise<TerminalSessionLike> {
+  connect(host: HostProfile, password?: string): Promise<TerminalSessionLike> {
     this.connectCalls.push(host);
+    this.connectPasswords.push(password);
+    if (this.credentialMissing && password === undefined) {
+      return Promise.reject(new SshError(SshErrorCode.CREDENTIAL_MISSING, '本机还没有保存该主机的凭据'));
+    }
     if (this.connectError !== null) {
       return Promise.reject(this.connectError);
     }
@@ -226,8 +233,12 @@ class FakeSessionHost implements TerminalSessionHostLike {
     return handle === undefined ? null : handle;
   }
 
-  reconnectNow(sessionId: string): boolean {
+  reconnectNow(sessionId: string, password?: string): boolean {
     this.reconnectNowLog.push(sessionId);
+    this.reconnectPasswords.push(password);
+    if (!this.reconnectAccepted) {
+      return false;
+    }
     const info: FakeSessionInfo | undefined = this.byId.get(sessionId);
     if (info !== undefined) {
       info.state = 'connecting';
@@ -243,6 +254,14 @@ class FakeSessionHost implements TerminalSessionHostLike {
       info.reconnectCountdownSec = 0;
     }
     return true;
+  }
+
+  resubmitLog: string[] = [];
+  resubmitAccepted: boolean = true;
+
+  resubmitPassword(sessionId: string, password: string): boolean {
+    this.resubmitLog.push(`${sessionId}:${password}`);
+    return this.resubmitAccepted;
   }
 
   addEventListener(listener: TerminalSessionEventListener): void {
@@ -318,19 +337,9 @@ class FakeHostDao implements TerminalHostDaoLike {
 
 // ---------- 测试环境 ----------
 
-class FakeSecretWriter implements TerminalSecretWriterLike {
-  readonly saved: string[] = [];
-
-  savePassword(hostId: string, password: string): Promise<void> {
-    this.saved.push(`${hostId}:${password.length}`);
-    return Promise.resolve();
-  }
-}
-
 class TestEnv {
   readonly host: FakeSessionHost;
   readonly dao: FakeHostDao;
-  readonly secrets: FakeSecretWriter = new FakeSecretWriter();
   readonly parking: TerminalParkingLot;
   vibrateCount: number = 0;
   dirtyCount: number = 0;
@@ -355,7 +364,6 @@ class TestEnv {
       sessionHost: this.host,
       hostDao: this.dao,
       terminalFactory: this.host.factory.factory,
-      secretWriter: this.secrets,
       parking: this.parking,
       now: (): number => this.clock,
       onBell: (paneId: string): void => {
@@ -434,6 +442,16 @@ export default function terminalViewModelTest() {
       expect(deriveOverlay(overlayInput('authenticating')).detail).assertEqual('正在进行身份认证');
       expect(deriveOverlay(overlayInput('')).detail).assertEqual('正在准备连接');
 
+      // authResult 事件形状（认证被拒、无 errorCode 只有 error 码名）也要能判为可补录
+      expect(isPasswordRetryError({
+        type: 'authResult', method: 'password', success: false,
+        error: 'auth_failed_password', message: 'Authentication failed', attemptsLeft: 2
+      })).assertTrue();
+      expect(isPasswordRetryError({
+        type: 'authResult', method: 'publickey', success: false,
+        error: 'auth_failed_key', message: 'x', attemptsLeft: 0
+      })).assertFalse();
+
       // 已有画面的 connecting（重连受理后新一次拨号）：置灰 + 重新连接文案
       const dialWithTerminal: OverlayInput = {
         state: 'connecting', reconnectCountdownSec: 0, reconnectAttempt: 1, errorMessage: '',
@@ -489,6 +507,34 @@ export default function terminalViewModelTest() {
       expect(o.dimmed).assertFalse();
       expect(o.showReconnectNow).assertTrue();
       expect(o.showClose).assertTrue();
+
+      // error + 退避倒计时（拨号失败后自动重连已排程）→ reconnecting + 失败原因 + 取消
+      const errorCountdown: OverlayInput = {
+        state: 'error', reconnectCountdownSec: 2, reconnectAttempt: 1,
+        errorMessage: 'TCP 连接超时', hasTerminal: false, terminalClosed: false, startError: ''
+      };
+      o = deriveOverlay(errorCountdown);
+      expect(o.kind).assertEqual('reconnecting');
+      expect(o.title).assertEqual('连接失败');
+      expect(o.detail).assertEqual('TCP 连接超时 · 2 秒后第 1 次重试');
+      expect(o.dimmed).assertFalse();
+      expect(o.showCancelReconnect).assertTrue();
+      expect(o.showReconnectNow).assertFalse();
+      expect(o.showClose).assertFalse();
+
+      // 重连循环中的再次拨号（attempt > 0，无画面）：如实标注失败与重试，不伪装首次连接
+      const redialNoTerminal: OverlayInput = {
+        state: 'connecting', reconnectCountdownSec: 0, reconnectAttempt: 2,
+        errorMessage: 'TCP 连接超时', hasTerminal: false, terminalClosed: false, startError: ''
+      };
+      o = deriveOverlay(redialNoTerminal);
+      expect(o.kind).assertEqual('connecting');
+      expect(o.dimmed).assertFalse();
+      expect(o.title).assertEqual('连接失败，正在重试');
+      expect(o.detail).assertEqual('正在建立连接 · 第 2 次重试 · 上次失败：TCP 连接超时');
+      expect(o.showCancelReconnect).assertFalse();
+      expect(o.showReconnectNow).assertFalse();
+      expect(o.showClose).assertFalse();
 
       // closing / closed / terminalClosed 标记 → closed 蒙层
       const closedState: OverlayInput = overlayInput('closed');
@@ -1175,10 +1221,156 @@ export default function terminalViewModelTest() {
       expect(env.vm.passwordPrompt.error.indexOf('密码') >= 0).assertTrue();
       expect(env.host.cancelLog.indexOf(sid) >= 0).assertTrue();
 
+      await env.vm.submitPassword('');
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      expect(env.vm.passwordPrompt.error).assertEqual('请输入登录密码');
+      expect(env.host.reconnectNowLog.length).assertEqual(0);
+      expect(env.host.connectCalls.length).assertEqual(1);
+
       await env.vm.submitPassword('secret');
-      expect(env.secrets.saved.length).assertEqual(1);
+      expect(env.host.reconnectNowLog.length).assertEqual(1);
+      expect(env.host.reconnectNowLog[0]).assertEqual(sid);
+      expect(env.host.reconnectPasswords[0]).assertEqual('secret');
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.vm.currentSessionId).assertEqual(sid);
       expect(env.vm.passwordPrompt.visible).assertFalse();
-      expect(env.host.reconnectNowLog.indexOf(sid) >= 0).assertTrue();
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      expect(env.vm.passwordPrompt.error).assertEqual('');
+      expect(env.vm.overlay.kind).assertEqual('connecting');
+      await env.vm.submitPassword('duplicate');
+      expect(env.host.reconnectNowLog.length).assertEqual(1);
+      expect(env.host.connectCalls.length).assertEqual(1);
+    });
+
+    it('缺凭据补录_原样透传密码发起新连接_空密码与重复提交不拨号', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      const host: HostProfile = sampleHost('h1');
+      env.dao.put(host);
+      env.host.credentialMissing = true;
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      expect(env.vm.passwordPrompt.hostName).assertEqual('主机h1');
+      expect(env.vm.currentSessionId).assertEqual('');
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.host.connectPasswords[0] === undefined).assertTrue();
+      expect(env.host.ops.length).assertEqual(0);
+
+      await env.vm.submitPassword('');
+      expect(env.vm.passwordPrompt.error).assertEqual('请输入登录密码');
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.host.reconnectNowLog.length).assertEqual(0);
+
+      const beforeUi: number = env.uiCount;
+      const submitted: Promise<void> = env.vm.submitPassword(' test-password ');
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      expect(env.vm.passwordPrompt.busy).assertTrue();
+      expect(env.vm.passwordPrompt.error).assertEqual('');
+      expect(env.uiCount > beforeUi).assertTrue();
+      await env.vm.submitPassword('duplicate');
+      await submitted;
+      expect(env.host.connectCalls.length).assertEqual(2);
+      expect(env.host.connectCalls[1]).assertEqual(host);
+      expect(env.host.connectPasswords[1]).assertEqual(' test-password ');
+      expect(env.host.reconnectNowLog.length).assertEqual(0);
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      const sid: string = env.vm.currentSessionId;
+      expect(sid.length > 0).assertTrue();
+      expect(env.host.ops[0]).assertEqual(`bind:${sid}:${TERMINAL_MAIN_PANE_ID}`);
+      expect(env.vm.overlay.kind).assertEqual('connecting');
+      env.host.emit(sid, stateChange('established'));
+      expect(env.vm.overlay.kind).assertEqual('none');
+      expect(env.vm.terminal !== null).assertTrue();
+    });
+
+    it('补录连接受理失败_保留主机和弹窗_可修改密码重试', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.credentialMissing = true;
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      env.host.connectError = new Error('连接发起失败，请重试');
+      await env.vm.submitPassword('first-password');
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      expect(env.vm.passwordPrompt.error).assertEqual('连接发起失败，请重试');
+      expect(env.vm.currentSessionId).assertEqual('');
+      expect(env.host.connectPasswords[1]).assertEqual('first-password');
+      expect(env.host.ops.length).assertEqual(0);
+
+      env.host.connectError = null;
+      await env.vm.submitPassword('second-password');
+      expect(env.host.connectCalls.length).assertEqual(3);
+      expect(env.host.connectCalls[2].id).assertEqual('h1');
+      expect(env.host.connectPasswords[2]).assertEqual('second-password');
+      expect(env.host.reconnectNowLog.length).assertEqual(0);
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+      expect(env.vm.currentSessionId.length > 0).assertTrue();
+    });
+
+    it('补录重连拒绝_保留弹窗与待重试会话_再次受理后才隐藏', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      const sid: string = env.vm.currentSessionId;
+      env.host.emit(sid, {
+        type: 'stateChange', to: 'disconnected', errorCode: SshErrorCode.AUTH_TIMEOUT
+      });
+      env.host.reconnectAccepted = false;
+      const beforeUi: number = env.uiCount;
+      await env.vm.submitPassword('first-password');
+      expect(env.host.reconnectNowLog.length).assertEqual(1);
+      expect(env.host.reconnectNowLog[0]).assertEqual(sid);
+      expect(env.host.reconnectPasswords[0]).assertEqual('first-password');
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      expect(env.vm.passwordPrompt.hostName).assertEqual('主机h1');
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      expect(env.vm.passwordPrompt.error).assertEqual('重连未被受理，请重试');
+      expect(env.uiCount > beforeUi).assertTrue();
+      expect(env.vm.currentSessionId).assertEqual(sid);
+      expect(env.host.connectCalls.length).assertEqual(1);
+
+      env.host.reconnectAccepted = true;
+      await env.vm.submitPassword('second-password');
+      expect(env.host.reconnectNowLog.length).assertEqual(2);
+      expect(env.host.reconnectNowLog[1]).assertEqual(sid);
+      expect(env.host.reconnectPasswords[1]).assertEqual('second-password');
+      expect(env.host.connectCalls.length).assertEqual(1);
+      expect(env.vm.currentSessionId).assertEqual(sid);
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+      expect(env.vm.passwordPrompt.busy).assertFalse();
+      expect(env.vm.passwordPrompt.error).assertEqual('');
+      expect(env.vm.overlay.kind).assertEqual('connecting');
+    });
+
+    it('补录时退出_后续提交忽略_受理中的新会话关闭且不绑定', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.credentialMissing = true;
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      const submitted: Promise<void> = env.vm.submitPassword('test-password');
+      env.vm.dispose();
+      await submitted;
+      expect(env.host.connectCalls.length).assertEqual(2);
+      expect(env.host.ops.length).assertEqual(1);
+      expect(env.host.ops[0]).assertEqual('close:s-new-1');
+      expect(env.vm.currentSessionId).assertEqual('');
+      expect(env.vm.leafCount()).assertEqual(0);
+      await env.vm.submitPassword('ignored-password');
+      expect(env.host.connectCalls.length).assertEqual(2);
+      expect(env.host.reconnectNowLog.length).assertEqual(0);
+
+      const env2: TestEnv = new TestEnv();
+      env2.dao.put(sampleHost('h2'));
+      await env2.vm.start({ hostId: 'h2', sessionId: '' });
+      env2.host.emit(env2.vm.currentSessionId, {
+        type: 'stateChange', to: 'error', errorCode: SshErrorCode.AUTH_PASSWORD_FAILED
+      });
+      env2.vm.dispose();
+      await env2.vm.submitPassword('ignored-password');
+      expect(env2.host.connectCalls.length).assertEqual(1);
+      expect(env2.host.reconnectNowLog.length).assertEqual(0);
     });
 
     it('认证超时同样弹密码框_公钥认证不弹', 0, async () => {

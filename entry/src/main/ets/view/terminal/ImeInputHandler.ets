@@ -150,6 +150,10 @@ export struct ImeInputSink {
         if (event !== undefined) {
           event.keepEditableState();
         }
+        if (this.composing) {
+          // 组合输入中的回车用于拼音上屏（onChange 随后提交增量），不能发 CR
+          return;
+        }
         this.onEnter();
       })
       .onKeyPreIme((event: KeyEvent): boolean => {

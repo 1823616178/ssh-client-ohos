@@ -9,6 +9,10 @@
  *   sendFunctionKey(enter)  → 回车
  *   moveCursor(dir)         → 软键盘方向键/光标滑动
  *   sendKeyboardStatus      → 软键盘显隐
+ *   setPreviewText/finishTextPreview (17+) → 拼音候选期的预上屏文本；必须在
+ *     attach 前订阅（框架据此判定 isTextPreviewSupported）。组合输入中按回车时，
+ *     输入法先发 sendFunctionKey 再发 finishTextPreview——宿主须把这次回车当作
+ *     「上屏」而非 CR，否则会先换行、拼音永远上不了屏。
  * 并且 TextConfig.capitalizeMode=NONE 关闭首字母自动大写（`ls` 不会变成 `Ls`）。
  *
  * 进程内只有一个 InputMethodController：本模块做成单例，事件回调只投递给「当前
@@ -39,6 +43,16 @@ export interface TerminalImeClient {
   onCopy(): void;
   onPaste(): void;
   onKeyboardShown(shown: boolean): void;
+  /**
+   * 组合输入（拼音候选）预览内容变化：'' = 预览结束/取消。
+   * 终端不显示预览（避免把未上屏的拼音发到远端），只据此判定 Enter 语义。
+   */
+  onPreviewText(text: string): void;
+  /**
+   * 组合输入结束：输入法以「结束预览」代替 insertText 提交（拼音回车直接上屏），
+   * 宿主应把最后一次预览文本按正常提交写入通道。
+   */
+  onFinishPreview(): void;
   /** IME 联想上下文（左侧文本）；终端拿不到远端行内容，返回本地回显 */
   leftText(length: number): string;
 }
@@ -237,6 +251,21 @@ export class TerminalImeEditor {
       controller.on('sendFunctionKey', (_key: inputMethod.FunctionKey): void => {
         if (this.client !== null) {
           this.client.onEnter();
+        }
+      });
+      /**
+       * 预览文本（API 17+）：拼音候选期的未上屏文本。必须在 attach 前订阅，
+       * 输入法才会认为本编辑框支持预上屏；否则中文输入法按回车时只会发
+       * sendFunctionKey（宿主误发 CR），而拼音本身永远不会上屏。
+       */
+      controller.on('setPreviewText', (text: string, _range: inputMethod.Range): void => {
+        if (this.client !== null) {
+          this.client.onPreviewText(text);
+        }
+      });
+      controller.on('finishTextPreview', (): void => {
+        if (this.client !== null) {
+          this.client.onFinishPreview();
         }
       });
       controller.on('moveCursor', (direction: inputMethod.Direction): void => {

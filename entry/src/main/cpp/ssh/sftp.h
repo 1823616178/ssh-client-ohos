@@ -188,7 +188,7 @@ struct SftpStatResult {
 struct SftpOpResult {
     bool success = false;
     SftpError error = SftpError::kNone;
-    std::string op; // "rename"|"mkdir"|"rmdir"|"unlink"|"chmod"|"readlink"
+    std::string op; // "rename"|"mkdir"|"rmdir"|"unlink"|"chmod"|"readlink"|"realpath"
     std::string path;
     std::string message;
     std::string linkTarget; // 仅 readlink 成功时有效
@@ -224,11 +224,24 @@ struct SftpCallbacks {
  *
  * 线程：open/list/stat/download/upload/op* 任意线程可调（受理即 post）；
  * close 幂等；析构约定与 SshChannel 一致——回调发完后才可析构。
+ *
+ * 寿命（UAF 修复）：生产路径一律由 std::shared_ptr 持有（sftp_bridge make_shared）。
+ * open/admit/close 投递到循环线程的任务捕获 shared_ptr 自引用，持有方（ArkTS 线程
+ * sftpClose）先释放也不会让排队中的任务访问已析构对象——对象在最后一个任务跑完后
+ * 才在循环线程析构。非 shared_ptr 持有（单测栈对象）时退化为裸 this，调用方自保寿命。
+ * close() 置 closeRequested_ 后，循环线程上进行中的 EAGAIN 泵送在下一个切片内退出。
  */
-class SshSftp {
+class SshSftp : public std::enable_shared_from_this<SshSftp> {
 public:
     // 进度回调最小间隔（字节）：避免每个 read 都打事件（UI 进度条足够）
     static constexpr uint64_t kProgressReportBytes = 64 * 1024;
+    // P2：进度事件节流——同时满足字节阈值与最小时间间隔才上报（完成时另有终值上报）。
+    // 局域网 200+ MB/s 时旧策略每 64 KiB 一次 = 每秒数千个 NAPI 事件挤占 ArkTS 线程
+    static constexpr int64_t kProgressMinIntervalMs = 100;
+    // P2：单次 libssh2_sftp_read/write 的缓冲。libssh2 1.11 下载预读 = 4×缓冲（上限 8 MiB）、
+    // 上传按 30000 B 切片一次性全部发出——缓冲即在途窗口。旧 32 KiB 只有 128 KiB 预读，
+    // 50 ms RTT 下理论上限约 2.5 MB/s；1 MiB → 4 MiB 预读，同 RTT 约 80 MB/s
+    static constexpr size_t kTransferBufBytes = 1024 * 1024;
 
     SshSftp(SshSession &session, SftpCallbacks callbacks);
     ~SshSftp();
@@ -247,6 +260,7 @@ public:
     bool unlink(std::string path);
     bool chmod(std::string path, uint32_t mode);
     bool readlink(std::string path);
+    bool realpath(std::string path);
     void close(); // 幂等
 
     bool isOpened() const { return opened_.load(std::memory_order_acquire); }
@@ -260,6 +274,7 @@ private:
     enum class OpKind {
         kList,
         kStat,
+        kRealpath,
         kRename,
         kMkdir,
         kRmdir,

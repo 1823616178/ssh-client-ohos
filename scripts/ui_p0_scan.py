@@ -19,6 +19,7 @@ owned = [
     'ConfigManagerPage.ets', 'OpenSourceLicensesPage.ets', 'SftpPage.ets',
     'PortForwardPage.ets', 'SettingsPage.ets', 'AccountSyncPage.ets',
     'HostEditPage.ets', 'TerminalPage.ets', 'TerminalPaneEmbed.ets',
+    'SnippetSidePanel.ets', 'PortForwardSidePanel.ets', 'SftpSidePanel.ets',
 ]
 for name in owned:
     paths = list(root.rglob(name))

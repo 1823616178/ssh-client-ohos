@@ -10,6 +10,7 @@
 import { ConfigurationConstant, common } from '@kit.AbilityKit';
 import { AppearanceProfile, CursorStyle } from '../common/model/models';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { Logger } from '../common/utils/Logger';
 import {
   AppThemeMode,
@@ -46,6 +47,8 @@ export function applyThemeColorMode(colorModeName: ColorModeName, context: commo
 @Entry
 @ComponentV2
 struct AppearancePage {
+  /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
+  @Local private introDone: boolean = !Motion.enabled;
   private readonly vm: AppearanceViewModel = new AppearanceViewModel();
   @Local private pickerVisible: boolean = false;
   @Local private pickerSlot: number = 0;
@@ -55,6 +58,7 @@ struct AppearancePage {
   @Local private bgPathDraft: string = '';
 
   aboutToAppear(): void {
+    this.openIntroWindow();
     this.vm.reload();
     this.vm.reloadThemeMode();
   }
@@ -100,6 +104,33 @@ struct AppearancePage {
         }
       }
     ];
+  }
+
+  /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
+  private openIntroWindow(): void {
+    if (this.introDone) {
+      return;
+    }
+    setTimeout(() => {
+      this.introDone = true;
+    }, Motion.INTRO_WINDOW_MS);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
   }
 
   build() {
@@ -180,6 +211,7 @@ struct AppearancePage {
             })
             .margin({ right: Tokens.space.xs })
             .textAlign(TextAlign.Center)
+            .clickEffect(Motion.pressEffect())
             .onClick(() => {
               this.applyThemeModeAndToast(mode);
             })
@@ -207,7 +239,7 @@ struct AppearancePage {
         .fontColor(Tokens.Color.textDim)
         .margin({ top: Tokens.space.xs2, bottom: Tokens.space.sm })
       Flex({ wrap: FlexWrap.Wrap }) {
-        ForEach(this.vm.presets, (preset: ThemePreset) => {
+        ForEach(this.vm.presets, (preset: ThemePreset, index: number) => {
           Button(preset.name)
             .fontSize(Tokens.fontSize.caption)
             .fontColor(preset.dark ? Tokens.Color.text : Tokens.Color.appBg)
@@ -223,6 +255,8 @@ struct AppearancePage {
                 this.toast(`已创建 ${preset.name}`);
               }
             })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (preset: ThemePreset) => preset.id)
       }
       .width('100%')
@@ -246,8 +280,9 @@ struct AppearancePage {
         Text('暂无自定义主题，点上方预设创建。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textFaint)
+        .transition(Motion.fadeTransition())
       } else {
-        ForEach(this.vm.profiles, (profile: AppearanceProfile) => {
+        ForEach(this.vm.profiles, (profile: AppearanceProfile, index: number) => {
           Row() {
             Column() {
               Text(profile.name)
@@ -273,6 +308,7 @@ struct AppearancePage {
             }
             .alignItems(HorizontalAlign.Start)
             .layoutWeight(1)
+            .clickEffect(Motion.pressEffect())
             .onClick(() => {
               this.vm.select(profile.id);
               if (this.vm.draft !== null) {
@@ -295,6 +331,8 @@ struct AppearancePage {
             ? Tokens.Color.surfaceHover : Tokens.Color.surface)
           .borderRadius(Tokens.radius.sm)
           .margin({ bottom: Tokens.space.xs })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (profile: AppearanceProfile) => profile.id)
       }
       Button('新建自定义主题')
@@ -408,6 +446,7 @@ struct AppearancePage {
               })
               .margin({ right: Tokens.space.xs })
               .textAlign(TextAlign.Center)
+              .clickEffect(Motion.pressEffect())
               .onClick(() => {
                 this.vm.setCursorStyle(style as CursorStyle);
               })
@@ -479,6 +518,7 @@ struct AppearancePage {
             .alignItems(HorizontalAlign.Center)
             .justifyContent(FlexAlign.Start)
             .margin({ right: Tokens.space.xs, bottom: Tokens.space.xs })
+            .clickEffect(Motion.pressEffect())
             .onClick(() => {
               this.pickerSlot = index;
               this.pickerValue = this.vm.colorSlot(index);

@@ -6,6 +6,7 @@
  * 光谱色是 HSV 定义本身，不是页面主题 Token。
  */
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { areaLengthToVp } from './terminal/TerminalLayout';
 import {
   HsvColor,
@@ -303,9 +304,13 @@ export struct ColorPickerSheet {
         .onClick(() => {
           // 吃掉卡片点击，避免落到遮罩上取消
         })
+        // 弹层卡片：淡入 + 上浮 + 轻缩放（Motion.sheetTransition）
+        .transition(Motion.sheetTransition())
       }
       .width('100%')
       .height('100%')
+      // 遮罩随整层淡入淡出
+      .transition(Motion.fadeTransition())
     }
   }
 }

@@ -412,7 +412,10 @@ bool SshChannel::flushWrites()
 bool SshChannel::drainReads()
 {
     bool progress = false;
-    char buf[32768]; // LIBSSH2_CHANNEL_PACKET_DEFAULT 粒度，栈上缓冲即可
+    if (!readBuf_) {
+        readBuf_.reset(new char[kReadBufBytes]);
+    }
+    char *const buf = readBuf_.get();
     // 双流交替直到双双 EAGAIN：EXTENDED_DATA_NORMAL（默认）模式下 stderr 独立成流，
     // 只抽 stdout 会让 stderr 积压抑制窗口回补，进而卡死 stdout
     for (;;) {
@@ -420,13 +423,14 @@ bool SshChannel::drainReads()
         for (const int stream : {0, SSH_EXTENDED_DATA_STDERR}) {
             for (;;) {
                 const ssize_t n =
-                    ::libssh2_channel_read_ex(channel_, stream, buf, sizeof(buf));
+                    ::libssh2_channel_read_ex(channel_, stream, buf, kReadBufBytes);
                 if (n > 0) {
                     progress = true;
                     roundProgress = true;
                     if (callbacks_.onData) {
+                        readChunk_.assign(buf, static_cast<size_t>(n)); // 复用容量，无堆分配
                         callbacks_.onData(
-                            std::string(buf, static_cast<size_t>(n)),
+                            readChunk_,
                             stream == 0 ? ChannelStream::kStdout : ChannelStream::kStderr);
                     }
                     continue;

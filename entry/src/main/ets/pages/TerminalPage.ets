@@ -56,11 +56,13 @@ import { ScreenAwake } from '../service/ScreenAwake';
 import { SessionManager } from '../service/SessionManager';
 import { notifyConfigSaved } from '../service/sync/SyncHooks';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { isHexColor, normalizeHexColor, uniqueHexColors } from '../common/utils/HexColor';
 import { ColorPickerSheet } from '../view/ColorPickerSheet';
 import { KeyBar, keyFaceOverlayForBackground } from '../view/KeyBar';
 import { TerminalActionHub, TerminalClipboardAction } from '../view/terminal/TerminalActionHub';
 import { TerminalCanvas } from '../view/TerminalCanvas';
+import { SftpSidePanel } from '../view/sidepanel/SftpSidePanel';
 import { FrameScheduler } from '../view/FrameScheduler';
 import { FocusManager } from '../view/terminal/FocusManager';
 import { areaLengthToVp } from '../view/terminal/TerminalLayout';
@@ -288,6 +290,11 @@ interface DividerHandleParams {
   item: DividerRect;
 }
 
+/** bindPopup onStateChange 回调参数（ArkTS 禁止对象字面量类型注解，故具名声明） */
+interface SftpPopupStateEvent {
+  isVisible: boolean;
+}
+
 interface StatusOverlayParams {
   model: OverlayModel;
   sessionId: string;
@@ -338,6 +345,8 @@ class PageFocusHost implements TerminalFocusHostLike {
 struct TerminalPage {
   /** 自管右侧抽屉展开态。 */
   @State private showSideBar: boolean = false;
+  /** 顶栏 📁 文件弹窗：内嵌 SFTP 面板，从当前会话用户 home 起列 */
+  @State private sftpPanelVisible: boolean = false;
   @State private sidePanelMode: TerminalSidePanelMode = 'connections';
   @State private connectionOpenMode: ConnectionOpenMode = 'tab';
   /**
@@ -575,6 +584,10 @@ struct TerminalPage {
   /** 从主机编辑页返回时刷新已保存连接；终端画布与会话本身不重建。 */
   onPageShow(): void {
     this.pageVisible = true;
+    // 被 push 的页面（文件传输等）不做状态栏避让：本页离开时已把窗口恢复普通
+    // 布局，返回时重新应用终端沉浸式布局与底色
+    this.applyTerminalWindowLayout();
+    this.syncTerminalChromeColor();
     this.vm.reloadConnections();
     // 从键位编辑页返回：重新读布局
     try {
@@ -591,6 +604,26 @@ struct TerminalPage {
     // 页面被盖住 / 应用退后台：画布停绘（FrameScheduler setVisible false），光标停闪
     this.pageVisible = false;
     ScreenAwake.forWindow(this.windowKey).setTerminalVisible(false);
+    // 终端沉浸式布局只在本页前台有效：push 上来的页面（文件传输等）没有做
+    // 状态栏避让，保持全屏布局会把它们的顶栏压在系统状态栏下面
+    this.releaseTerminalWindowLayout();
+  }
+
+  /** 恢复普通窗口布局与默认系统栏（onPageHide / aboutToDisappear 共用） */
+  private releaseTerminalWindowLayout(): void {
+    const win: window.Window | null = this.terminalWindow;
+    if (win === null) {
+      return;
+    }
+    if (this.fullscreen) {
+      win.setSpecificSystemBarEnabled('status', true).catch((err: Object) => {
+        Logger.warn(`恢复状态栏失败：${JSON.stringify(err)}`, LOG_TAG);
+      });
+    }
+    this.restoreWindowChrome(win);
+    win.setWindowLayoutFullScreen(false).catch((err: Object) => {
+      Logger.warn(`恢复普通窗口布局失败：${JSON.stringify(err)}`, LOG_TAG);
+    });
   }
 
   /**
@@ -753,20 +786,9 @@ struct TerminalPage {
     this.terminalTopInsetVp = 0;
     this.dragSplitId = '';
     this.dividerDragging = false;
-    const win: window.Window | null = this.terminalWindow;
+    this.releaseTerminalWindowLayout();
     this.terminalWindow = null;
     this.appliedChromeBackground = '';
-    if (win !== null) {
-      if (this.fullscreen) {
-        win.setSpecificSystemBarEnabled('status', true).catch((err: Object) => {
-          Logger.warn(`恢复状态栏失败：${JSON.stringify(err)}`, LOG_TAG);
-        });
-      }
-      this.restoreWindowChrome(win);
-      win.setWindowLayoutFullScreen(false).catch((err: Object) => {
-        Logger.warn(`恢复普通窗口布局失败：${JSON.stringify(err)}`, LOG_TAG);
-      });
-    }
     try {
       this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     } catch (err) {
@@ -941,6 +963,37 @@ struct TerminalPage {
     const params: Record<string, Object> = {};
     params['sessionId'] = sid;
     this.getUIContext().getRouter().pushUrl({ url: 'pages/SftpPage', params: params });
+  }
+
+  /** SFTP 文件弹窗的目标主机（当前会话所属；快速连接的临时主机也有快照） */
+  private sftpPopupHost(): HostProfile | null {
+    const sid: string = this.currentSessionId.length > 0
+      ? this.currentSessionId
+      : this.vm.currentSessionId;
+    return sid.length > 0 ? SessionManager.get().hostOf(sid) : null;
+  }
+
+  /** 顶栏 📁 弹窗：内嵌首页侧面板同款 SFTP 组件，从用户 home 目录起列 */
+  @Builder
+  SftpFilesPopup() {
+    Column() {
+      SftpSidePanel({
+        hostId: this.sftpPopupHost()?.id ?? '',
+        hostName: this.sftpPopupHost()?.name ?? '',
+        onOpenFullPage: (): void => {
+          this.sftpPanelVisible = false;
+          this.openSftpForCurrentSession();
+        }
+      })
+        .width('100%')
+        .height('100%')
+    }
+    // popup 内容不能依赖无界百分比（会塌缩成 0），一律固定 vp
+    .width(this.isCompact() ? 320 : 420)
+    .height(this.isCompact() ? 480 : 560)
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.md)
+    .clip(true)
   }
 
   /** M6：当前会话主机 → PortForwardPage */
@@ -1493,6 +1546,23 @@ struct TerminalPage {
 
   // ---------------------------------------------------------------- 视图
 
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopEnd }) {
       // Stack 包一层，好把密码补录框盖在整页之上。
@@ -1567,6 +1637,7 @@ struct TerminalPage {
               .position({ x: '100%', y: 0 })
               .translate({ x: -TOUCH_TARGET_VP - 8, y: 8 })
               .accessibilityText('退出全屏')
+              .clickEffect(Motion.pressEffect())
               .onClick(() => {
                 this.setFullscreen(false);
               })
@@ -1768,6 +1839,7 @@ struct TerminalPage {
         .borderRadius(Tokens.radius.sm)
         .backgroundColor(this.chromeOverlay())
         .accessibilityText('返回主机列表，会话保持在后台')
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.onBack();
         })
@@ -1828,6 +1900,7 @@ struct TerminalPage {
           .backgroundColor(this.chromeOverlay())
           .margin({ left: Tokens.space.xs })
           .accessibilityText('显示或隐藏软键盘')
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.toggleSoftKeyboard();
           })
@@ -1843,9 +1916,38 @@ struct TerminalPage {
         .backgroundColor(this.chromeOverlay())
         .margin({ left: Tokens.space.xs })
         .accessibilityText('全屏')
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.setFullscreen(true);
         })
+
+      if (this.sessionState === 'established' && this.currentSessionId.length > 0) {
+        Text('📁')
+          .fontSize(Tokens.fontSize.title)
+          .fontColor(this.chromeText())
+          .width(TOP_ACTION_SIZE_VP)
+          .height(TOP_ACTION_SIZE_VP)
+          .textAlign(TextAlign.Center)
+          .borderRadius(Tokens.radius.sm)
+          .backgroundColor(this.chromeOverlay())
+          .margin({ left: Tokens.space.xs })
+          .accessibilityText('打开文件列表')
+          .clickEffect(Motion.pressEffect())
+          .onClick(() => {
+            this.sftpPanelVisible = true;
+          })
+          .bindPopup(this.sftpPanelVisible, {
+            builder: (): void => {
+              this.SftpFilesPopup();
+            },
+            enableArrow: false,
+            onStateChange: (state: SftpPopupStateEvent): void => {
+              if (!state.isVisible) {
+                this.sftpPanelVisible = false;
+              }
+            }
+          })
+      }
 
       Text('⚙')
         .fontSize(Tokens.fontSize.title)
@@ -1857,6 +1959,7 @@ struct TerminalPage {
         .backgroundColor(this.chromeOverlay())
         .margin({ left: Tokens.space.xs })
         .accessibilityText('终端外观与功能键设置')
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.openAppearancePanel();
         })
@@ -1884,6 +1987,7 @@ struct TerminalPage {
       .borderRadius(Tokens.radius.sm)
       .backgroundColor(this.chromeOverlay())
       .margin({ left: Tokens.space.xs })
+      .clickEffect(Motion.pressEffect())
       .onClick(() => {
         this.openConnectionsPanel('tab');
       })
@@ -1928,6 +2032,7 @@ struct TerminalPage {
         .backgroundColor(this.chromeOverlay())
         .margin({ left: Tokens.space.xs2 })
         .accessibilityText('新建标签')
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.closeSidePanel();
           this.vm.openConnectionTab();
@@ -1961,6 +2066,7 @@ struct TerminalPage {
       .margin({ left: Tokens.space.xs2 })
       .accessibilityGroup(true)
       .accessibilityText('分屏打开连接')
+      .clickEffect(Motion.pressEffect())
       .onClick(() => {
         this.openConnectionsPanel('row');
       })
@@ -2042,6 +2148,7 @@ struct TerminalPage {
             height: TOUCH_TARGET_VP
           })
           .accessibilityText(`在新窗口打开 ${$$.tab.title}`)
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.moveTabToNewWindow($$.tab.tabId);
           })
@@ -2061,6 +2168,7 @@ struct TerminalPage {
           height: TOUCH_TARGET_VP
         })
         .accessibilityText(`关闭标签 ${$$.tab.title}`)
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.onTabClose($$.tab.tabId);
         })
@@ -2247,6 +2355,7 @@ struct TerminalPage {
     .border({ width: 1, color: Tokens.Color.border })
     .borderRadius(Tokens.radius.sm)
     .margin({ bottom: Tokens.space.xs })
+    .clickEffect(Motion.pressEffect())
     .onClick(() => {
       this.vm.openHost($$.item.id, 'replace').catch((err: Object) => {
         Logger.error(`在新标签打开连接失败：${JSON.stringify(err)}`, LOG_TAG);
@@ -2296,6 +2405,7 @@ struct TerminalPage {
             height: TOUCH_TARGET_VP
           })
           .accessibilityText(`关闭窗格 ${$$.item.hostName}`)
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.onPaneClose($$.item.paneId);
           })
@@ -2306,6 +2416,7 @@ struct TerminalPage {
     .padding({ left: Tokens.space.sm, right: Tokens.space.xs })
     .backgroundColor(this.appearanceForHost($$.item.hostId).background)
     .border({ width: { bottom: 1 }, color: this.chromeOverlay() })
+    .clickEffect(Motion.pressEffect())
     .onClick(() => {
       this.vm.focusPane($$.item.paneId);
     })
@@ -2508,6 +2619,8 @@ struct TerminalPage {
       .padding(Tokens.space.lg)
       .backgroundColor(Tokens.Color.surface)
       .borderRadius(Tokens.radius.md)
+      // 补录卡片：淡入 + 上浮 + 轻缩放
+      .transition(Motion.sheetTransition())
       }
       .width('100%')
       .height('100%')
@@ -2516,6 +2629,8 @@ struct TerminalPage {
     }
     .width('100%')
     .height('100%')
+    // 遮罩随整层淡入淡出
+    .transition(Motion.fadeTransition())
   }
 
   /** 状态蒙层：连接中 / 重连倒计时 / 错误与操作按钮 / 会话已结束 */
@@ -2608,6 +2723,7 @@ struct TerminalPage {
     .padding(Tokens.space.xs)
     .position({ x: 0, y: 0 })
     .accessibilityGroup(true)
+    .transition(Motion.riseTransition())
   }
 
   @Builder
@@ -2683,6 +2799,7 @@ struct TerminalPage {
     .height('100%')
     .justifyContent(FlexAlign.Center)
     .padding(Tokens.space.lg)
+    .transition(Motion.fadeTransition())
   }
 
   /** 横屏右侧面板：会话/连接选择与终端外观共用容器，内容始终从顶部开始。 */
@@ -2717,6 +2834,7 @@ struct TerminalPage {
           .width(TOP_ACTION_SIZE_VP)
           .height(TOP_ACTION_SIZE_VP)
           .textAlign(TextAlign.Center)
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.cancelAppearancePreviewIfNeeded();
             this.showSideBar = false;
@@ -2893,6 +3011,7 @@ struct TerminalPage {
       $$.item.sessionId === this.currentSessionId ? Tokens.Color.surfaceHover : Tokens.Color.surface)
     .borderRadius(Tokens.radius.sm)
     .margin({ bottom: Tokens.space.xs })
+    .clickEffect(Motion.pressEffect())
     .onClick(() => {
       this.vm.openSession($$.item.sessionId, this.connectionOpenMode);
       this.showSideBar = false;
@@ -2933,6 +3052,7 @@ struct TerminalPage {
     .backgroundColor(Tokens.Color.surfaceHover)
     .borderRadius(Tokens.radius.sm)
     .margin({ bottom: Tokens.space.xs })
+    .clickEffect(Motion.pressEffect())
     .onClick(() => {
       const hostId: string = $$.item.id;
       const mode: ConnectionOpenMode = this.connectionOpenMode;
@@ -2965,6 +3085,7 @@ struct TerminalPage {
           .width(TOP_ACTION_SIZE_VP)
           .height(TOP_ACTION_SIZE_VP)
           .textAlign(TextAlign.Center)
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.cancelAppearancePreviewIfNeeded();
             this.showSideBar = false;
@@ -3152,6 +3273,8 @@ struct TerminalPage {
         .clip(true)
         .backgroundColor(isHexColor($$.value) ? $$.value : Tokens.Color.surfaceHover)
         .border({ width: 1, color: Tokens.Color.border })
+        .animation(Motion.colorAnim()) // 选中态颜色过渡
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.openColorPicker($$.kind, false);
         })

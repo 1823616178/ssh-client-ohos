@@ -118,7 +118,7 @@ import {
   TerminalActionExecutor,
   TerminalClipboardAction
 } from './terminal/TerminalActionHub';
-import { isModifierKeyCode, isPrintableKeyCode, mapKeyEvent } from './terminal/KeyMap';
+import { isModifierKeyCode, isPrintableKeyCode, KEY_ENTER, mapKeyEvent } from './terminal/KeyMap';
 import { StickyModifiers } from './terminal/StickyModifiers';
 import { ImeInputSink } from './terminal/ImeInputHandler';
 import {
@@ -399,7 +399,7 @@ class TerminalAbsReader implements SelectionGridReader {
 
 /** 自绘编辑器事件（CanvasImeClient → 画布单一入口） */
 type ImeEventKind = 'insert' | 'deleteLeft' | 'deleteRight' | 'enter' | 'move' | 'selectAll' |
-  'copy' | 'paste' | 'keyboard';
+  'copy' | 'paste' | 'keyboard' | 'preview' | 'previewCommit';
 
 /** TerminalImeClient 适配（struct 不能 implements 接口，与 CanvasClipboardExecutor 同理） */
 class CanvasImeClient implements TerminalImeClient {
@@ -446,6 +446,14 @@ class CanvasImeClient implements TerminalImeClient {
 
   onKeyboardShown(shown: boolean): void {
     this.dispatch('keyboard', '', shown ? 1 : 0);
+  }
+
+  onPreviewText(text: string): void {
+    this.dispatch('preview', text, 0);
+  }
+
+  onFinishPreview(): void {
+    this.dispatch('previewCommit', '', 0);
   }
 
   leftText(length: number): string {
@@ -531,6 +539,10 @@ export struct TerminalCanvas {
     (length: number): string => this.imeEcho.leftText(length));
   /** IME 联想用本地回显上下文 */
   private readonly imeEcho: ImeEchoContext = new ImeEchoContext();
+  /** 自绘编辑器：拼音候选期（setPreviewText 非空 → finishTextPreview 前） */
+  private imePreviewActive: boolean = false;
+  /** 最近一次未上屏的预览文本（回车结束预览时按提交写入通道） */
+  private imePreviewText: string = '';
   /** true = 自绘编辑器通路；false = 隐藏 TextInput 兜底（attach 失败后切换） */
   @State private useCustomIme: boolean = TerminalImeEditor.get().isAvailable();
   private unsubscribeImeAvailability: () => void = () => {};
@@ -757,6 +769,8 @@ export struct TerminalCanvas {
   }
 
   aboutToDisappear(): void {
+    // 页面离开时丢弃未上屏的拼音：detach 触发的 finishTextPreview 不得把半截输入写进通道
+    this.clearImePreview();
     if (this.inputFocusTimer >= 0) {
       clearTimeout(this.inputFocusTimer);
       this.inputFocusTimer = -1;
@@ -784,6 +798,9 @@ export struct TerminalCanvas {
       return;
     }
     this.paneFocused = focused;
+    if (!focused) {
+      this.clearImePreview(); // 失焦后组合态不再可信（输入法已跟到别的窗格）
+    }
     this.needsFullRedraw = true;
     this.syncBlinkWakeTimer();
     if (focused && this.visible) {
@@ -1220,6 +1237,11 @@ export struct TerminalCanvas {
     if (!this.isInputTarget()) {
       return false; // 非聚焦窗格：物理输入不投递（路由验收标准）
     }
+    if (!preIme && this.imePreviewActive && event.keyCode === KEY_ENTER) {
+      // 组合输入中的物理回车：输入法用于上屏（随后 finishTextPreview 提交预览文本），
+      // 不能映射成 CR——否则拼音还没上屏就先执行了空命令/半截命令。
+      return true;
+    }
     const action: ShortcutAction | null =
       matchShortcut(this.shortcutBindings, event.keyCode, ctrl, alt, shift, meta);
     if (action !== null) {
@@ -1314,6 +1336,12 @@ export struct TerminalCanvas {
     if (kind === 'keyboard') {
       return; // 软键盘显隐：目前无需额外处理（状态由 TerminalImeEditor 记录）
     }
+    if (kind === 'preview') {
+      // 拼音候选中的预览文本：只记状态，绝不发给远端（未上屏的拼音不能漏进命令）
+      this.imePreviewText = text;
+      this.imePreviewActive = text.length > 0;
+      return;
+    }
     if (kind === 'selectAll') {
       this.selectAllBuffer();
       return;
@@ -1329,10 +1357,16 @@ export struct TerminalCanvas {
     if (!this.isInputTarget()) {
       return;
     }
+    if (kind === 'previewCommit') {
+      this.commitImePreview();
+      return;
+    }
     const snap = this.stickyModifiers.snapshot();
     let bytes: Uint8Array | null = null;
     switch (kind) {
       case 'insert':
+        // 输入法直接提交文本（候选词 / 英文）：预览由它自己收尾，避免重复上屏
+        this.clearImePreview();
         bytes = imeInsertToBytes(text, snap);
         this.imeEcho.insert(text);
         break;
@@ -1344,6 +1378,11 @@ export struct TerminalCanvas {
         bytes = imeDeleteRightToBytes(value);
         break;
       case 'enter':
+        if (this.imePreviewActive) {
+          // 组合输入中的回车 = 拼音上屏（随后 finishTextPreview 提交预览文本），绝不发 CR
+          this.stickyModifiers.consume();
+          return;
+        }
         bytes = imeEnterBytes();
         this.imeEcho.clear();
         break;
@@ -1357,6 +1396,30 @@ export struct TerminalCanvas {
     if (bytes !== null) {
       this.sendInputBytes(bytes);
     }
+  }
+
+  /**
+   * 组合输入结束：输入法可能不另发 insertText，而是用 finishTextPreview 让编辑框
+   * 把预览文本转为正式提交（中文输入法拼音回车即走此路）。此时按正常文本写入。
+   */
+  private commitImePreview(): void {
+    const text: string = this.imePreviewText;
+    this.clearImePreview();
+    if (text.length === 0) {
+      return;
+    }
+    const snap = this.stickyModifiers.snapshot();
+    const bytes = imeInsertToBytes(text, snap);
+    this.stickyModifiers.consume();
+    if (bytes !== null) {
+      this.imeEcho.insert(text);
+      this.sendInputBytes(bytes);
+    }
+  }
+
+  private clearImePreview(): void {
+    this.imePreviewActive = false;
+    this.imePreviewText = '';
   }
 
   /**
@@ -2373,6 +2436,7 @@ export struct TerminalCanvas {
     this.lastGridCols = 0;
     this.lastGridRows = 0;
     this.needsFullRedraw = true;
+    this.clearImePreview();
     // T8/T9：旧终端的选择会话与回滚偏移一并作废（网格语义已不属于新终端）
     this.exitSelectionMode();
     this.clickTracker.reset();

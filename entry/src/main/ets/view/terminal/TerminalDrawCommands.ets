@@ -23,6 +23,7 @@ import {
   ATTR_STRIKE,
   ATTR_UNDERLINE,
   ATTR_WIDE,
+  CELL_BYTES,
   DecodedCell,
   WIDE_CONTINUATION,
   decodeCellAt
@@ -172,6 +173,22 @@ export function generateRowsCommands(view: DataView, startRow: number, rowCount:
     let bgArgb = 0;
     let run: TextRun | null = null;
     for (let c = 0; c < cols; c++) {
+      // P2 快路径：空白格（码点 0、无反色、映射后为默认底色）在慢路径里只会「收尾背景段 +
+      // 打断文本段」，这里直接读原始字段走同一结果，免掉每格两次对象分配
+      // （decodeCellAt + resolveStyle）。典型屏幕 60%+ 是空白格。
+      const off = (r * cols + c) * CELL_BYTES;
+      if (view.getUint32(off, true) === 0 && (view.getUint16(off + 12, true) & ATTR_REVERSE) === 0) {
+        const rawBg = view.getUint32(off + 8, true);
+        const blankBg = rawBg === NATIVE_DEFAULT_BG_ARGB ? env.defaultBgArgb : rawBg;
+        if (blankBg === env.defaultBgArgb) {
+          if (bgStart >= 0) {
+            result.backgrounds.push(makeBgRun(bgStart, c, rowY, rowBottom, bgArgb, env));
+            bgStart = -1;
+          }
+          run = null;
+          continue;
+        }
+      }
       const cell = decodeCellAt(view, r * cols + c);
       const style = resolveStyle(cell, env);
       // ---- 背景合并：默认背景段不出指令（整行已由组件清底）----

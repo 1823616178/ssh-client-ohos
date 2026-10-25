@@ -26,8 +26,8 @@
  * 主机密钥 TOFU（§7.1）：native 的 hostKey 事件（fingerprintSha256 / randomart）
  * 本类只做透传（事件监听器可收到），确认/拒绝交互与 known_hosts 入库归 U2/U4。
  *
- * 安全纪律（沿袭 C2）：凭据只在 connect/重连的调用栈内短暂持有（局部变量），
- * 不写入 SessionInfo、不缓存、不进日志；日志只记录 sessionId 与主机名。
+ * 安全纪律：补录密码仅暂存至认证结束，成功后写入 ASSET，失败或关闭即释放。
+ * 凭据不写入 SessionInfo、不进日志；日志只记录 sessionId 与主机名。
  *
  * 用法：
  *   const info = await SessionManager.get().connect(host);  // HostProfile（C1 模型）
@@ -211,6 +211,7 @@ export class SystemReconnectScheduler implements ReconnectScheduler {
 export interface SessionManagerDeps {
   createNativeSession?: NativeSessionFactory;
   getSecret?: SecretProvider;
+  savePassword?: (hostId: string, password: string) => Promise<void>;
   scheduler?: ReconnectScheduler;
   newSessionId?: () => string;
   /** N9：应用内 agent（缺省 = NativeAgentAuthPort） */
@@ -281,12 +282,21 @@ interface SessionRecord {
   /** 已发起的重连次数（established 归零；nextReconnectDelaySec 的 attempt 依据） */
   reconnectAttempt: number;
   /**
+   * 本次会话生命周期内是否连上过（stateChange → established）。
+   * 自动退避重连只服务「连上后掉线」（网络抖动 / keepalive 判死）；
+   * 首拨就失败（不可达 / 拒认 / 超时）重试同一配置只会让用户干等
+   * 退避全程（1+2+5+10+20+30 s × 拨号超时），故 never-established 不重试、
+   * 立即落 error 终态交用户处置（重连 / 改配置）。
+   */
+  everEstablished: boolean;
+  /**
    * 待提交的认证材料。connect() 是受理语义，返回时会话还在 connecting，
    * 而 native 只在 authenticating 态受理认证请求（见 cpp/ssh/auth.cpp）——
    * 故材料先暂存，等 stateChange → authenticating 再提交，提交即置 null。
    * 安全：只在「拨号 → 进入 authenticating」这一窗口内存在，绝不进 SessionInfo/日志。
    */
   pendingAuth: AuthMaterial | null;
+  passwordToSave: string | null;
   /**
    * P1：因后台保活策略被断开（不是用户关的、也不是链路失败）。
    * 记录与窗格绑定都保留，回前台由 resumeAllSuspended() 原地重连；
@@ -323,6 +333,8 @@ export class SessionManager implements SessionControl {
 
   private readonly createNativeSession: NativeSessionFactory;
   private readonly getSecret: SecretProvider;
+  private readonly savePassword: (hostId: string, password: string) => Promise<void>;
+  private readonly passwordSaves: Map<string, Promise<void>> = new Map();
   private readonly scheduler: ReconnectScheduler;
   private readonly newSessionId: () => string;
   private readonly agentAuth: AgentAuthPort;
@@ -350,6 +362,9 @@ export class SessionManager implements SessionControl {
     this.getSecret = deps?.getSecret ??
       ((hostId: string, kind: CredentialKind): Promise<string | null> =>
         CredentialStore.getSecret(hostId, kind));
+    this.savePassword = deps?.savePassword ??
+      ((hostId: string, password: string): Promise<void> =>
+        CredentialStore.setSecret(hostId, 'password', password));
     this.scheduler = deps?.scheduler ?? new SystemReconnectScheduler();
     this.newSessionId = deps?.newSessionId ?? ((): string => util.generateRandomUUID());
     this.agentAuth = deps?.agentAuth ?? new NativeAgentAuthPort();
@@ -385,11 +400,11 @@ export class SessionManager implements SessionControl {
    *     5. native 具备 connectViaJumpChannel 时走串联路径（当前生产恒无）。
    *   缺口注记：SshNative.proxyJumpTransportNotes() / ssh/forward.h。
    */
-  async connect(host: HostProfile): Promise<SessionInfo> {
+  async connect(host: HostProfile, password?: string): Promise<SessionInfo> {
     // 取凭据要走 ASSET 系统服务（异步）；这两条日志把「卡在取凭据」和
     // 「卡在拨号」区分开——只记方法名与主机名，不碰凭据本体
     Logger.info(`读取凭据（主机=${host.name}, authType=${host.authType}）`, LOG_TAG);
-    const auth: AuthMaterial = await this.prepareAuth(host);
+    const auth: AuthMaterial = await this.prepareAuth(host, password);
     Logger.info(`凭据就绪（method=${auth.method}），开始拨号`, LOG_TAG);
     const info: SessionInfo = new SessionInfo(this.newSessionId(), host.id, host.name);
     const record: SessionRecord = {
@@ -398,7 +413,9 @@ export class SessionManager implements SessionControl {
       nativeSession: null,
       reconnectTimerId: -1,
       reconnectAttempt: 0,
+      everEstablished: false,
       pendingAuth: null,
+      passwordToSave: null,
       policySuspended: false
     };
     // 先入表再拨号：事件（理论上）最早可在 connect 受理后到达
@@ -420,7 +437,7 @@ export class SessionManager implements SessionControl {
           return info;
         }
       }
-      this.dialNative(record, auth);
+      this.dialNative(record, auth, password);
     } catch (err) {
       this.sessions.delete(info.sessionId);
       if (err instanceof Error) {
@@ -577,6 +594,7 @@ export class SessionManager implements SessionControl {
     this.cancelReconnect(record);
     // 未及提交的认证材料随会话一起丢弃，不留在内存里
     record.pendingAuth = null;
+    record.passwordToSave = null;
     if (record.nativeSession !== null) {
       record.nativeSession.close();
       record.nativeSession = null;
@@ -656,7 +674,7 @@ export class SessionManager implements SessionControl {
    * 旧句柄（error 终态保留的那只），随后按原主机配置立即重新拨号（sessionId 不变、
    * native 句柄换新，与自动重连同通路）。仅 disconnected / error 态受理，其余返回 false。
    */
-  reconnectNow(sessionId: string): boolean {
+  reconnectNow(sessionId: string, password?: string): boolean {
     const record: SessionRecord | undefined = this.sessions.get(sessionId);
     if (record === undefined) {
       return false;
@@ -667,6 +685,7 @@ export class SessionManager implements SessionControl {
     }
     this.cancelReconnect(record);
     record.pendingAuth = null;
+    record.passwordToSave = null;
     if (record.nativeSession !== null) {
       record.nativeSession.close();
       record.nativeSession = null;
@@ -675,7 +694,7 @@ export class SessionManager implements SessionControl {
     record.policySuspended = false;
     record.info.reconnectCountdownSec = 0;
     Logger.info(`会话 ${sessionId} 手动重连受理`, LOG_TAG);
-    this.startReconnect(record);
+    this.startReconnect(record, password);
     return true;
   }
 
@@ -778,6 +797,7 @@ export class SessionManager implements SessionControl {
       }
       this.cancelReconnect(record);
       record.pendingAuth = null;
+      record.passwordToSave = null;
       if (record.nativeSession !== null) {
         record.nativeSession.close();
         record.nativeSession = null;
@@ -934,11 +954,20 @@ export class SessionManager implements SessionControl {
   // ---------------------------------------------------------------- 内部：拨号与认证
 
   /** 按 authType 取凭据；凭据缺失抛 SshError，不建任何资源 */
-  private async prepareAuth(host: HostProfile): Promise<AuthMaterial> {
+  private async prepareAuth(host: HostProfile, suppliedPassword?: string): Promise<AuthMaterial> {
     switch (host.authType) {
       case 'password': {
-        const password: string | null = await this.getSecret(host.id, 'password');
-        if (password === null) {
+        let password: string | null;
+        if (suppliedPassword !== undefined) {
+          password = suppliedPassword;
+        } else {
+          const saving: Promise<void> | undefined = this.passwordSaves.get(host.id);
+          if (saving !== undefined) {
+            await saving;
+          }
+          password = await this.getSecret(host.id, 'password');
+        }
+        if (password === null || password.length === 0) {
           // CREDENTIAL_MISSING 而非 AUTH_PASSWORD_FAILED：上层据此弹框补录密码，
           // 而不是把它当成「服务器拒绝了密码」的终态失败
           throw new SshError(SshErrorCode.CREDENTIAL_MISSING,
@@ -998,7 +1027,7 @@ export class SessionManager implements SessionControl {
    * 早期版本在此同步调 authenticate*，必然被拒并抛「密码认证请求未被受理」，
    * 结果是任何主机都连不上。材料改为暂存，由 onStateChange 在进入 authenticating 时提交。
    */
-  private dialNative(record: SessionRecord, auth: AuthMaterial): void {
+  private dialNative(record: SessionRecord, auth: AuthMaterial, password?: string): void {
     const host: HostProfile = record.host;
     const sessionId: string = record.info.sessionId;
     const holder: NativeSessionHolder = { current: null };
@@ -1011,6 +1040,7 @@ export class SessionManager implements SessionControl {
     record.nativeSession = session;
     // connect 之前就位：握手快时 authenticating 事件可能在 connect() 返回前就投递上来
     record.pendingAuth = auth;
+    record.passwordToSave = auth.method === 'password' ? password ?? null : null;
     try {
       session.setKeepalive(host.keepalive, KEEPALIVE_MAX_MISSES);
       session.setReconnectPolicy([], DEFAULT_RECONNECT_MAX_ATTEMPTS);
@@ -1023,6 +1053,7 @@ export class SessionManager implements SessionControl {
       }
     } catch (err) {
       record.pendingAuth = null;
+      record.passwordToSave = null;
       session.close();
       record.nativeSession = null;
       if (err instanceof Error) {
@@ -1058,9 +1089,39 @@ export class SessionManager implements SessionControl {
     }
     const code: SshErrorCode = auth.method === 'password'
       ? SshErrorCode.AUTH_PASSWORD_FAILED : SshErrorCode.AUTH_PUBLICKEY_FAILED;
+    record.passwordToSave = null;
     record.info.state = 'error';
     record.info.errorMessage = SshError.toUserMessage(code);
     Logger.error(`会话 ${record.info.sessionId} 认证请求未被受理（method=${auth.method}）`, LOG_TAG);
+  }
+
+  private saveVerifiedPassword(record: SessionRecord): void {
+    const password: string | null = record.passwordToSave;
+    record.passwordToSave = null;
+    if (password === null) {
+      return;
+    }
+    const hostId: string = record.info.hostId;
+    // 同一主机的写入串行化，下一次连接须等写入完成再读取凭据。
+    const saving: Promise<void> = this.writeVerifiedPassword(hostId, password, this.passwordSaves.get(hostId));
+    this.passwordSaves.set(hostId, saving);
+    saving.then(() => {
+      if (this.passwordSaves.get(hostId) === saving) {
+        this.passwordSaves.delete(hostId);
+      }
+    });
+  }
+
+  private async writeVerifiedPassword(hostId: string, password: string,
+    previous: Promise<void> | undefined): Promise<void> {
+    try {
+      if (previous !== undefined) {
+        await previous;
+      }
+      await this.savePassword(hostId, password);
+    } catch (_err) {
+      Logger.error(`登录成功但密码保存失败（hostId=${hostId}）`, LOG_TAG);
+    }
   }
 
   // ---------------------------------------------------------------- 内部：事件路由
@@ -1074,10 +1135,12 @@ export class SessionManager implements SessionControl {
     if (record === undefined || record.nativeSession === null || record.nativeSession !== source) {
       return;
     }
-    this.forwardEvent(record, event);
     switch (event.type) {
       case 'stateChange':
         this.onStateChange(record, event);
+        break;
+      case 'authResult':
+        this.onAuthResult(record, event);
         break;
       case 'channelOpen':
         record.info.channelId = event.channelId ?? null;
@@ -1091,6 +1154,9 @@ export class SessionManager implements SessionControl {
         // hostKey / authResult / channelData / terminal* 等仅透传（TOFU 交互归 U2/U4）
         break;
     }
+    // 广播放在状态落库之后：监听器（蒙层派生 / 状态点）在回调里重读 SessionInfo，
+    // 若先广播后落库会永远读到上一个状态——「正在连接」卡死不进「连接失败」即此因
+    this.forwardEvent(record, event);
   }
 
   /** 全量事件透传给事件监听器；输出类事件同步触发 dirty 唤醒（T4 硬依赖通路） */
@@ -1129,6 +1195,48 @@ export class SessionManager implements SessionControl {
     }
   }
 
+  /**
+   * authResult（native 单次认证尝试的结论，会话不一定离开 authenticating）：
+   *   - 密码认证被拒：保持 authenticating —— native 等下一次尝试，上层
+   *     （TerminalViewModel）据此弹补录框，经 resubmitPassword 原地重试；
+   *   - 密钥 / Agent 被拒：没有「改一下再试」的交互（私钥要重新导入），
+   *     直接落 error 终态，避免会话永远停在「正在进行身份认证」。
+   */
+  private onAuthResult(record: SessionRecord, event: SshEvent): void {
+    if (event.success === true) {
+      return;
+    }
+    const method: string = event.method !== undefined ? event.method : '';
+    const terminalMethods: string[] = ['publickey', 'agent'];
+    if (terminalMethods.indexOf(method) < 0 || record.info.state !== 'authenticating') {
+      return;
+    }
+    record.info.state = 'error';
+    record.info.errorMessage = event.message !== undefined && event.message.length > 0
+      ? event.message : '认证失败，请检查密钥配置';
+    record.info.errorCodeName = event.error !== undefined ? event.error : '';
+    Logger.error(
+      `会话 ${record.info.sessionId} ${method} 认证失败，落终态: ${record.info.errorMessage}`,
+      LOG_TAG);
+  }
+
+  /**
+   * 会话内补交密码：认证被拒但会话仍在 authenticating（native 等下一次尝试）时，
+   * 用新密码原地发起下一次认证；其余状态不受理（由调用方改走重连/新拨）。
+   */
+  resubmitPassword(sessionId: string, password: string): boolean {
+    const record: SessionRecord | undefined = this.sessions.get(sessionId);
+    if (record === undefined || record.nativeSession === null ||
+      record.info.state !== 'authenticating') {
+      return false;
+    }
+    const accepted: boolean = record.nativeSession.authenticatePassword(password);
+    if (accepted) {
+      Logger.info(`会话 ${sessionId} 已用新密码重试认证`, LOG_TAG);
+    }
+    return accepted;
+  }
+
   /** 状态迁移本体：终态错误映射 + 重连 hint 编排 */
   private applyStateChange(record: SessionRecord, event: SshEvent): void {
     const to: string | undefined = event.to;
@@ -1144,12 +1252,18 @@ export class SessionManager implements SessionControl {
     }
     if (to === 'established') {
       // （重）连成功：重连计数/倒计时/错误信息全部复位
+      record.everEstablished = true;
       record.reconnectAttempt = 0;
       info.reconnectAttempt = 0;
       info.reconnectCountdownSec = 0;
       info.errorMessage = '';
       info.errorCodeName = '';
+      this.saveVerifiedPassword(record);
       return;
+    }
+    if (to === 'closing' || to === 'closed' || to === 'disconnected' || to === 'error') {
+      record.pendingAuth = null;
+      record.passwordToSave = null;
     }
     if (to !== 'disconnected' && to !== 'error') {
       return;
@@ -1163,14 +1277,22 @@ export class SessionManager implements SessionControl {
       }
     }
     if (event.reconnectHint === true) {
-      this.scheduleReconnect(record);
+      if (record.everEstablished) {
+        this.scheduleReconnect(record);
+      } else {
+        // 首拨失败：保持 error 终态，不进退避重连（用户点「重连」或改配置后再试）
+        Logger.info(
+          `会话 ${record.info.sessionId} 首拨失败（${info.errorCodeName}），不自动重连`,
+          LOG_TAG);
+      }
     }
   }
 
   // ---------------------------------------------------------------- 内部：重连编排（§7.1）
 
   /**
-   * 断线 hint → 退避重连：向旧句柄取建议秒数（-1 = 超上限，进 error 终态），
+   * 断线 hint → 退避重连（仅 everEstablished 的会话；首拨失败在 applyStateChange
+   * 里已被拦下不进这里）：向旧句柄取建议秒数（-1 = 超上限，进 error 终态），
    * 然后关闭旧句柄（sessionId 面孔保持），按秒倒计时到期后新建 native 会话重连。
    */
   private scheduleReconnect(record: SessionRecord): void {
@@ -1216,10 +1338,10 @@ export class SessionManager implements SessionControl {
   }
 
   /** 发起重连：同主机配置新建 native 会话（sessionId 保持、句柄换新） */
-  private startReconnect(record: SessionRecord): void {
+  private startReconnect(record: SessionRecord, password?: string): void {
     record.info.state = 'connecting';
     record.info.reconnectCountdownSec = 0;
-    this.reconnectAsync(record).then(() => {
+    this.reconnectAsync(record, password).then(() => {
       Logger.info(`会话 ${record.info.sessionId} 重连已受理`, LOG_TAG);
     }).catch((err: Object) => {
       if (this.sessions.get(record.info.sessionId) !== record) {
@@ -1232,12 +1354,12 @@ export class SessionManager implements SessionControl {
     });
   }
 
-  private async reconnectAsync(record: SessionRecord): Promise<void> {
-    const auth: AuthMaterial = await this.prepareAuth(record.host);
-    if (this.sessions.get(record.info.sessionId) !== record) {
-      return; // 等待凭据期间会话已被关闭
+  private async reconnectAsync(record: SessionRecord, password?: string): Promise<void> {
+    const auth: AuthMaterial = await this.prepareAuth(record.host, password);
+    if (this.sessions.get(record.info.sessionId) !== record || record.policySuspended) {
+      return;
     }
-    this.dialNative(record, auth);
+    this.dialNative(record, auth, password);
   }
 
   /** 单条会话是否「活着」：连接中/已建立，或正在退避倒计时；策略挂起的不算 */

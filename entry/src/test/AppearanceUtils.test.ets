@@ -199,7 +199,7 @@ export default function appearanceAndUtilsTest() {
       expect(showRightPanel('lg', true)).assertTrue();
       expect(showRightPanel('lg', false)).assertFalse();
       expect(showRightPanel('md', true)).assertFalse();
-      expect(rightPanelWidthVp(true)).assertEqual(260);
+      expect(rightPanelWidthVp(true)).assertEqual(320);
       expect(rightPanelWidthVp(false)).assertEqual(36);
       // sm：无侧栏无面板
       const sm = resolveLayoutRegions('sm', true, true, true);
@@ -217,7 +217,7 @@ export default function appearanceAndUtilsTest() {
       const lgOpen = resolveLayoutRegions('lg', true, true, true);
       expect(lgOpen.rightPanel).assertTrue();
       expect(lgOpen.rightPanelOpen).assertTrue();
-      expect(lgOpen.rightPanelWidthVp).assertEqual(260);
+      expect(lgOpen.rightPanelWidthVp).assertEqual(320);
       const lgCollapsed = resolveLayoutRegions('lg', true, false, true);
       expect(lgCollapsed.rightPanel).assertTrue();
       expect(lgCollapsed.rightPanelOpen).assertFalse();

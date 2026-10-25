@@ -54,6 +54,11 @@ export class SftpNativeGateway implements SftpGateway {
     return sftp !== null && sftp.stat(path);
   }
 
+  realpath(sftpHandle: number, path: string): boolean {
+    const sftp: SshNativeSftp | null = this.get(sftpHandle);
+    return sftp !== null && sftp.realpath(path);
+  }
+
   download(sftpHandle: number, transferId: number, remotePath: string,
     localPath: string): boolean {
     const sftp: SshNativeSftp | null = this.get(sftpHandle);

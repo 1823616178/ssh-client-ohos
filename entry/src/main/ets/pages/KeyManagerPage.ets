@@ -8,6 +8,7 @@
  */
 
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { Logger } from '../common/utils/Logger';
 import { KeyEntryMeta } from '../common/utils/KeyManagerLogic';
 import { KeyManagerViewModel } from '../viewmodel/KeyManagerViewModel';
@@ -18,6 +19,8 @@ const LOG_TAG: string = 'KeyManagerPage';
 @Entry
 @ComponentV2
 struct KeyManagerPage {
+  /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
+  @Local private introDone: boolean = !Motion.enabled;
   private readonly vm: KeyManagerViewModel = new KeyManagerViewModel();
   @Local private nameDraft: string = '';
   @Local private privateKeyDraft: string = '';
@@ -31,6 +34,7 @@ struct KeyManagerPage {
   @Local private exportText: string = '';
 
   aboutToAppear(): void {
+    this.openIntroWindow();
     this.vm.reload();
   }
 
@@ -40,6 +44,33 @@ struct KeyManagerPage {
     } catch (err) {
       Logger.warn(`Toast 失败: ${JSON.stringify(err)}`, LOG_TAG);
     }
+  }
+
+  /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
+  private openIntroWindow(): void {
+    if (this.introDone) {
+      return;
+    }
+    setTimeout(() => {
+      this.introDone = true;
+    }, Motion.INTRO_WINDOW_MS);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
   }
 
   build() {
@@ -214,6 +245,7 @@ struct KeyManagerPage {
     .backgroundColor(Tokens.Color.surface)
     .borderRadius(Tokens.radius.md)
     .margin({ bottom: Tokens.space.sm })
+    .transition(Motion.riseTransition())
   }
 
   @Builder
@@ -307,6 +339,7 @@ struct KeyManagerPage {
     .backgroundColor(Tokens.Color.surface)
     .borderRadius(Tokens.radius.md)
     .margin({ bottom: Tokens.space.sm })
+    .transition(Motion.riseTransition())
   }
 
   @Builder
@@ -351,8 +384,9 @@ struct KeyManagerPage {
         Text('暂无私钥。导入或生成后可用于主机的密钥 / Agent 认证。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textFaint)
+        .transition(Motion.fadeTransition())
       } else {
-        ForEach(this.vm.entries, (entry: KeyEntryMeta) => {
+        ForEach(this.vm.entries, (entry: KeyEntryMeta, index: number) => {
           Column() {
             Text(entry.name)
               .fontSize(Tokens.fontSize.title)
@@ -412,6 +446,8 @@ struct KeyManagerPage {
           .backgroundColor(Tokens.Color.surface)
           .borderRadius(Tokens.radius.md)
           .margin({ bottom: Tokens.space.sm })
+          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
         }, (entry: KeyEntryMeta) => entry.id)
       }
     }

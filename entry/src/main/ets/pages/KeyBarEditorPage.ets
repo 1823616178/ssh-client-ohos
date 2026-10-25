@@ -11,6 +11,7 @@
 import { Logger } from '../common/utils/Logger';
 import { SettingsRepository } from '../repository/SettingsRepository';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { PageHeader } from '../view/PageHeader';
 import { accessibilityNameOf } from '../view/KeyBar';
 import {
@@ -123,6 +124,23 @@ struct KeyBarEditorPage {
       Logger.error(`键条布局保存失败：${JSON.stringify(err)}`, LOG_TAG);
       this.message = '保存失败，请稍后重试';
     }
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
   }
 
   build() {
@@ -264,6 +282,8 @@ struct KeyBarEditorPage {
         .height(TOUCH_VP)
         .textAlign(TextAlign.Center)
         .accessibilityText(`上移 ${accessibilityNameOf($$.spec)}`)
+        .animation(Motion.colorAnim()) // 选中态颜色过渡
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           if ($$.index > 0) {
             this.setKeys(moveKeyBarKey(this.keys, $$.index, $$.index - 1));
@@ -276,6 +296,8 @@ struct KeyBarEditorPage {
         .height(TOUCH_VP)
         .textAlign(TextAlign.Center)
         .accessibilityText(`下移 ${accessibilityNameOf($$.spec)}`)
+        .animation(Motion.colorAnim()) // 选中态颜色过渡
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           if ($$.index < this.keys.length - 1) {
             this.setKeys(moveKeyBarKey(this.keys, $$.index, $$.index + 1));
@@ -288,6 +310,8 @@ struct KeyBarEditorPage {
         .height(TOUCH_VP)
         .textAlign(TextAlign.Center)
         .accessibilityText(`删除 ${accessibilityNameOf($$.spec)}`)
+        .animation(Motion.colorAnim()) // 选中态颜色过渡
+        .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.setKeys(removeKeyBarKey(this.keys, $$.index));
         })
@@ -354,6 +378,7 @@ struct KeyBarEditorPage {
       .backgroundColor(Tokens.Color.surface)
       .margin({ right: Tokens.space.xs, bottom: Tokens.space.xs })
       .accessibilityText(`添加 ${accessibilityNameOf(spec)}`)
+      .clickEffect(Motion.pressEffect())
       .onClick(() => {
         if (this.keys.length >= KEY_BAR_MAX_KEYS) {
           this.message = `最多 ${KEY_BAR_MAX_KEYS} 个键`;
@@ -375,6 +400,7 @@ struct KeyBarEditorPage {
       .backgroundColor(Tokens.Color.surface)
       .margin({ right: Tokens.space.xs, bottom: Tokens.space.xs })
       .accessibilityText(`添加字符 ${ch}`)
+      .clickEffect(Motion.pressEffect())
       .onClick(() => {
         const spec: KeyBarKeySpec | null = makeKeyBarCharKey(ch);
         if (spec === null) {

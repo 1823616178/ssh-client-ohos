@@ -24,6 +24,7 @@
 import { AuthType, PortForwardType } from '../common/model/models';
 import { Logger } from '../common/utils/Logger';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { PageHeader } from '../view/PageHeader';
 import {
   CredentialDraft,
@@ -271,6 +272,23 @@ struct HostEditPage {
 
   // ---------------------------------------------------------------- 视图
 
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+  }
+
   build() {
     Column() {
       PageHeader({
@@ -283,6 +301,7 @@ struct HostEditPage {
             .fontSize(Tokens.fontSize.body)
             .fontColor(Tokens.Color.textDim)
             .margin({ top: Tokens.space.lg })
+          .transition(Motion.fadeTransition())
         } else if (this.vm.loadError.length > 0) {
           Text(this.vm.loadError)
             .fontSize(Tokens.fontSize.body)
@@ -597,6 +616,7 @@ struct HostEditPage {
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.accent)
           .margin({ top: Tokens.space.xs })
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.vm.addRuleForm();
           })
@@ -630,6 +650,7 @@ struct HostEditPage {
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.danger)
           .margin({ left: Tokens.space.sm })
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.vm.removeRuleForm(index);
           })
@@ -732,6 +753,7 @@ struct HostEditPage {
               .fontSize(Tokens.fontSize.body)
               .fontColor(Tokens.Color.accent)
               .margin({ top: Tokens.space.xs })
+              .clickEffect(Motion.pressEffect())
               .onClick(() => {
                 if (this.vm.trustTestedHostKey()) {
                   this.toast('指纹已入库');
@@ -828,6 +850,8 @@ struct HostEditPage {
             bottom: Tokens.space.xs2
           })
           .margin({ right: Tokens.space.xs })
+          .animation(Motion.colorAnim()) // 选中态颜色过渡
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             onSelect(index);
           })
@@ -857,6 +881,7 @@ struct HostEditPage {
           .fontColor(Tokens.Color.danger)
           .margin({ left: Tokens.space.sm })
           .accessibilityText('清除已保存凭据')
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.vm.markCredentialCleared(kind);
             if (kind === 'password') {

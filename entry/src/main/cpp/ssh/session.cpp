@@ -60,6 +60,54 @@ void ensureLibssh2Init()
     });
 }
 
+// P2：对称加密算法偏好重排——AES-GCM 置顶，其余保持 libssh2 内置顺序。
+// libssh2 1.11.1 默认把 chacha20-poly1305@openssh.com 排第一，而它的实现是库内自带的
+// 纯 C 参考实现（chacha.c / poly1305.c，不走 OpenSSL）；OpenSSH 服务端按客户端顺序选第一个
+// 共同算法，于是几乎所有会话都落到最慢的软件实现。AES-GCM 走 OpenSSL EVP，ARMv8 Crypto
+// Extensions / x86 AES-NI 硬件加速。只重排、不删减：与任何服务端的可协商集合与改前完全相同。
+void preferHardwareCiphers(LIBSSH2_SESSION *session)
+{
+    static const char *const kPreferred[] = {"aes128-gcm@openssh.com", "aes256-gcm@openssh.com"};
+    for (const int type : {LIBSSH2_METHOD_CRYPT_CS, LIBSSH2_METHOD_CRYPT_SC}) {
+        const char **algs = nullptr;
+        const int n = ::libssh2_session_supported_algs(session, type, &algs);
+        if (n <= 0 || algs == nullptr) {
+            continue; // 取不到就保持默认偏好
+        }
+        std::string pref;
+        auto append = [&pref](const char *name) {
+            if (!pref.empty()) {
+                pref += ',';
+            }
+            pref += name;
+        };
+        for (const char *want : kPreferred) {
+            for (int i = 0; i < n; ++i) {
+                if (algs[i] != nullptr && std::strcmp(algs[i], want) == 0) {
+                    append(want);
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            if (algs[i] == nullptr) {
+                continue;
+            }
+            bool preferred = false;
+            for (const char *want : kPreferred) {
+                preferred = preferred || std::strcmp(algs[i], want) == 0;
+            }
+            if (!preferred) {
+                append(algs[i]);
+            }
+        }
+        ::libssh2_free(session, algs);
+        if (!pref.empty() && ::libssh2_session_method_pref(session, type, pref.c_str()) != 0) {
+            SSH_LOG("设置加密算法偏好失败（type=%d），沿用 libssh2 默认", type);
+        }
+    }
+}
+
 // 创建非阻塞 + CLOEXEC 的 TCP socket；失败返回 -1
 int createTcpSocket(int family, int protocol)
 {
@@ -493,10 +541,10 @@ void SshSession::beginHandshake()
     }
     ::libssh2_session_set_blocking(session_, 0);
 
-    // 算法协商：不调用 libssh2_session_method_pref，用 libssh2 1.11 内置默认偏好——
-    // 默认集已覆盖 aes256-gcm@openssh.com / aes128-gcm / aes256-ctr、
-    // curve25519-sha256 / ecdh-sha2-nistp* 、ssh-ed25519 / ecdsa-sha2-nistp256 /
-    // rsa-sha2-512 等主流算法；chacha20-poly1305 不在其中（风险 R-7 已知，备选后端兜底）。
+    // 算法协商：kex / hostkey / MAC 用 libssh2 1.11.1 内置默认偏好（curve25519-sha256 /
+    // ecdh-sha2-nistp*、ssh-ed25519 / ecdsa-sha2-nistp256 / rsa-sha2-512 等）；
+    // 对称加密仅重排顺序把硬件加速的 AES-GCM 提前（P2，见 preferHardwareCiphers）。
+    preferHardwareCiphers(session_);
     // 主机密钥校验（TOFU）在握手完成的瞬间进行，见 driveHandshake → verifyHostKey。
 
     transitionTo(SshSessionState::kHandshaking);

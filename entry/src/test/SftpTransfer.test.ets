@@ -53,6 +53,14 @@ class FakeGateway implements SftpGateway {
     return true;
   }
 
+  realpathResult: boolean = true;
+  lastRealpath: string = '';
+
+  realpath(_sftpHandle: number, path: string): boolean {
+    this.lastRealpath = path;
+    return this.realpathResult;
+  }
+
   download(_sftpHandle: number, _transferId: number, remotePath: string,
     _localPath: string): boolean {
     this.lastDownload = remotePath;
@@ -225,12 +233,44 @@ export default function sftpTransferTest(): void {
       expect(vm.nativeUnavailable).assertTrue();
     });
 
-    it('attachOpensAndLists', 0, () => {
+    it('attachOpensAndResolvesHome', 0, () => {
       const fixture1 = makeVm();
       const vm = fixture1.vm;
       const gw = fixture1.gw;
       expect(vm.attachSession('s1')).assertTrue();
       expect(vm.sftpHandle).assertEqual(42);
+      // 首列前先解析 home（"."）；未落定前不得预列根目录
+      expect(gw.lastRealpath).assertEqual('.');
+      expect(gw.lastListPath).assertEqual('');
+      vm.handleNativeEvent('sftpOpDone', { success: true, op: 'realpath', path: '/home/root' });
+      expect(vm.currentDir).assertEqual('/home/root');
+      expect(gw.lastListPath).assertEqual('/home/root');
+    });
+
+    it('eventsFilteredBySftpHandle_跨通道事件不串扰', 0, () => {
+      const fixtureCh = makeVm();
+      const vm = fixtureCh.vm;
+      vm.attachSession('s1');
+      expect(vm.sftpHandle).assertEqual(42);
+      const entries: string = JSON.stringify([
+        { name: 'other.txt', path: '/other.txt', type: 'file', size: 1, mtime: 0, mode: 0, permissions: '', linkTarget: '' }
+      ]);
+      // 别的消费者通道（句柄 999）的列表事件：不得污染本 VM
+      vm.handleNativeEvent('sftpList', { sftp: 999, success: true, path: '/other', entriesJson: entries });
+      expect(vm.rows.length).assertEqual(0);
+      expect(vm.currentDir).assertEqual('/');
+      // 自己通道（42）的事件正常生效
+      vm.handleNativeEvent('sftpList', { sftp: 42, success: true, path: '/mine', entriesJson: entries });
+      expect(vm.rows.length).assertEqual(1);
+      expect(vm.currentDir).assertEqual('/mine');
+    });
+
+    it('attachHomeResolveFailsFallsBackToRoot', 0, () => {
+      const fixture1b = makeVm();
+      const vm = fixture1b.vm;
+      const gw = fixture1b.gw;
+      gw.realpathResult = false;
+      expect(vm.attachSession('s1')).assertTrue();
       expect(gw.lastListPath).assertEqual('/');
     });
 

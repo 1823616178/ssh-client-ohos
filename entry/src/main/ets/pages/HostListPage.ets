@@ -7,7 +7,7 @@
  *   - 快速连接：空列表完整 CTA；有主机时默认收起，避免与列表争抢视线；
  *   - 分组列表：List + LazyForEach + IDataSource 懒加载，按 order 升序分组区 + 未分组区；
  *   - 主机行：状态点 + 名称 + user@host:port + authType 徽标；
- *   - 滑动菜单：编辑 / SFTP / 转发 / 删除（danger 底色，二次确认）；
+ *   - 滑动菜单 / 长按菜单：连接 / 新窗口 / 编辑 / SFTP / 转发 / 删除（danger 底色，二次确认）；
  *   - 空状态：无主机时引导「添加第一台主机」；搜索无结果时给提示文案。
  *
  * 本组件内嵌于 Index（@Entry 在其上），从 HostEditPage 返回时经父页 onPageShow
@@ -21,6 +21,8 @@ import { SshEvent } from '../napi/SshNative';
 import { CredentialStore } from '../repository/CredentialStore';
 import { SessionEventListener, SessionInfo, SessionManager } from '../service/SessionManager';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
+import { StatusDot } from '../view/StatusDot';
 import { SyncRuntime } from '../service/sync/SyncRuntime';
 import {
   focusWindowOfSession,
@@ -31,10 +33,10 @@ import {
 import { MAIN_WINDOW_KEY, windowKeyOfPaneId } from '../common/constants/WindowKeys';
 import { abilityContextOf, supportsMultiWindow } from '../common/utils/WindowContext';
 import { common } from '@kit.AbilityKit';
+import { curves } from '@kit.ArkUI';
 import {
   ActiveSessionItem,
   ActiveSessionLike,
-  HostConnStatus,
   HostListRow,
   HostListViewModel,
   QuickConnectTarget,
@@ -44,6 +46,11 @@ import {
 } from '../viewmodel/HostListViewModel';
 
 const LOG_TAG: string = 'HostListPage';
+
+/** bindPopup onStateChange 回调参数（ArkTS 禁止对象字面量类型注解，故具名声明） */
+interface PopupStateEvent {
+  isVisible: boolean;
+}
 
 /**
  * LazyForEach 数据源：扁平行数组 + 全量重载通知。
@@ -95,13 +102,27 @@ export struct HostListPage {
    * （右栏嵌入 TerminalPaneEmbed 或展示详情）。未提供时保持单栏 push TerminalPage。
    */
   onOpenHost: ((hostId: string) => void) | null = null;
+  /**
+   * 活动会话点按：Index md/lg 提供时把首页中栏切换到该会话（不 push 全页）；
+   * 未提供（sm 单栏无嵌入终端）时保持原行为，push TerminalPage。
+   */
+  onResumeSession: ((sessionId: string, hostId: string) => void) | null = null;
+  /** Index 双栏当前选中主机（高亮行；'' = 无选中 / 单栏） */
+  @Prop selectedHostId: string = '';
+  /** 首屏入场：false → true 时列表行按序淡入上移、空状态淡入 */
+  @State private listRevealed: boolean = false;
+  /** 正在按压的主机行（按压缩放反馈） */
+  @State private pressedRowId: string = '';
+  /** 长按菜单：目标行与可见性（LongPressGesture 驱动 bindPopup） */
+  @State private contextMenuRowId: string = '';
+  @State private contextMenuVisible: boolean = false;
   @State private syncChipSub: string = '云同步';
   @State private syncLinked: boolean = false;
   /** 搜索草稿：驱动输入框与清除按钮（vm.searchText 在 V1 中不可观察） */
   @State private searchText: string = '';
   /** 快速直连展开态：主机列表非空时默认收起，空态保留完整 CTA */
   @State private quickConnectExpanded: boolean = false;
-  /** 后台运行中的会话（终端页返回不断开；点按恢复） */
+  /** 活动会话：所有非终态会话（含正在终端页/分栏显示的），点按恢复或聚焦 */
   @State private activeSessions: ActiveSessionItem[] = [];
   /** 视图模型：搜索串 / 折叠集合 / 派生行（生产依赖惰性解析 AppDatabase / SettingsRepository） */
   private readonly viewModel: HostListViewModel = new HostListViewModel();
@@ -141,6 +162,18 @@ export struct HostListPage {
     SessionManager.get().addEventListener(this.sessionListener);
     SessionManager.get().addSessionCountListener(this.sessionCountListener);
     this.refreshActiveSessions();
+    this.revealList();
+  }
+
+  /** 首屏入场：下一帧把 listRevealed 置 true，行 / 空状态的隐式 .animation 接管过渡 */
+  private revealList(): void {
+    if (!Motion.enabled) {
+      this.listRevealed = true;
+      return;
+    }
+    setTimeout(() => {
+      this.listRevealed = true;
+    }, 16);
   }
 
   private async refreshSyncChipAfterHydrate(): Promise<void> {
@@ -153,7 +186,7 @@ export struct HostListPage {
     SessionManager.get().removeSessionCountListener(this.sessionCountListener);
   }
 
-  /** 活动会话：未绑定窗格（终端页已返回）且非终态的会话 */
+  /** 活动会话：所有非终态会话（连上即出现，含已绑窗格的） */
   private refreshActiveSessions(): void {
     const names: Map<string, string> = new Map();
     for (const host of this.viewModel.hosts) {
@@ -164,16 +197,19 @@ export struct HostListPage {
   }
 
   /**
-   * 恢复活动会话。多窗口：会话正显示在某个终端窗口里时，把那个窗口带到前台，
-   * 而不是在本窗口再开一页去抢窗格绑定；其余情况与改造前相同（push 终端页）。
+   * 点按活动会话（画面 / 回滚保留）：
+   *   - 会话正显示在其他窗口 → 把那个窗口带到前台；
+   *   - Index 双栏 → 通知父页把中栏切换到该会话，不打开全页
+   *     （全页只在嵌入终端顶栏的「全页终端」按钮触发）；
+   *   - 单栏（sm）→ 保持原行为 push TerminalPage。
    */
-  private resumeSession(sessionId: string): void {
-    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+  private resumeSession(item: ActiveSessionItem): void {
+    const info: SessionInfo | null = SessionManager.get().getSession(item.sessionId);
     const paneId: string | null = info === null ? null : info.paneId;
     if (paneId !== null && windowKeyOfPaneId(paneId) !== MAIN_WINDOW_KEY) {
       const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
       if (context !== null) {
-        focusWindowOfSession(context, windowKeyOfPaneId(paneId), sessionId).then((ok: boolean) => {
+        focusWindowOfSession(context, windowKeyOfPaneId(paneId), item.sessionId).then((ok: boolean) => {
           if (!ok) {
             this.toast('该会话已在其他窗口打开');
           }
@@ -181,7 +217,11 @@ export struct HostListPage {
         return;
       }
     }
-    pushTerminalForSession(this.getUIContext(), sessionId);
+    if (this.onResumeSession !== null) {
+      this.onResumeSession(item.sessionId, info === null ? item.hostId : info.hostId);
+      return;
+    }
+    pushTerminalForSession(this.getUIContext(), item.sessionId);
   }
 
   private confirmCloseSession(item: ActiveSessionItem): void {
@@ -227,11 +267,12 @@ export struct HostListPage {
 
   // ---------------------------------------------------------------- 交互
 
-  /** 父页 onPageShow 驱动：从 HostEditPage 返回后全量重载（含状态点与行重建） */
+  /** 父页 onPageShow 驱动：从 HostEditPage 返回后全量重载（含状态点、行重建与活动会话） */
   private onRefreshTick(): void {
     this.viewModel.reload();
     this.refreshConnStatus();
     this.reloadRows();
+    this.refreshActiveSessions();
     this.refreshSyncChip();
   }
 
@@ -387,21 +428,6 @@ export struct HostListPage {
     this.toast('已删除主机');
   }
 
-  private connStatusColor(status: HostConnStatus): Resource {
-    switch (status) {
-      case 'connecting':
-        return Tokens.Color.accent;
-      case 'established':
-        return Tokens.Color.success;
-      case 'disconnected':
-        return Tokens.Color.warn;
-      case 'error':
-        return Tokens.Color.danger;
-      default:
-        return Tokens.Color.textFaint;
-    }
-  }
-
   private authTypeLabel(host: HostProfile): string {
     switch (host.authType) {
       case 'password':
@@ -425,11 +451,7 @@ export struct HostListPage {
         .margin({ bottom: Tokens.space.xs2 })
       ForEach(this.activeSessions, (item: ActiveSessionItem) => {
         Row() {
-          Column()
-            .width(8)
-            .height(8)
-            .borderRadius(4)
-            .backgroundColor(this.connStatusColor(item.status))
+          StatusDot({ status: item.status, dotSize: 8 })
           Column() {
             Text(item.title)
               .fontSize(Tokens.fontSize.body)
@@ -461,7 +483,7 @@ export struct HostListPage {
         .accessibilityGroup(true)
         .accessibilityText(`恢复会话 ${item.title}，${item.statusLabel}`)
         .onClick(() => {
-          this.resumeSession(item.sessionId);
+          this.resumeSession(item);
         })
       }, (item: ActiveSessionItem) => `${item.sessionId}|${item.status}|${item.title}`)
     }
@@ -529,7 +551,7 @@ export struct HostListPage {
       .alignItems(VerticalAlign.Center)
       .margin({ top: Tokens.space.sm })
 
-      // 活动会话：终端页返回后仍在后台运行的连接，点按恢复（画面 / 回滚保留）
+      // 活动会话：所有非终态会话（含正在终端显示的），点按恢复 / 聚焦（画面 / 回滚保留）
       if (this.activeSessions.length > 0) {
         this.ActiveSessionsSection()
       }
@@ -553,11 +575,18 @@ export struct HostListPage {
         .justifyContent(FlexAlign.Center)
       } else {
         List() {
-          LazyForEach(this.dataSource, (row: HostListRow) => {
+          LazyForEach(this.dataSource, (row: HostListRow, index: number) => {
             if (row.kind === 'groupHeader') {
               ListItem() {
                 this.GroupHeaderItem(row)
               }
+              .opacity(this.listRevealed ? 1 : 0)
+              .translate({ y: this.listRevealed ? 0 : Motion.enterOffset() })
+              .animation({
+                duration: Motion.duration(Motion.BASE_MS),
+                curve: Curve.FastOutSlowIn,
+                delay: Motion.stagger(index)
+              })
             } else {
               ListItem() {
                 this.HostItem(row)
@@ -566,6 +595,14 @@ export struct HostListPage {
                 end: () => {
                   this.SwipeActions(row);
                 }
+              })
+              // 首屏交错入场（仅 listRevealed 翻转那一次有动画；滚动新建的行直接终态）
+              .opacity(this.listRevealed ? 1 : 0)
+              .translate({ y: this.listRevealed ? 0 : Motion.enterOffset() })
+              .animation({
+                duration: Motion.duration(Motion.BASE_MS),
+                curve: Curve.FastOutSlowIn,
+                delay: Motion.stagger(index)
               })
             }
           }, (row: HostListRow) => row.rowId)
@@ -825,11 +862,7 @@ export struct HostListPage {
     if (row.host !== null) {
       Row() {
         Row() {
-          Column()
-            .width(Tokens.space.xs)
-            .height(Tokens.space.xs)
-            .borderRadius(Tokens.space.xs2)
-            .backgroundColor(this.connStatusColor(row.connStatus))
+          StatusDot({ status: row.connStatus, dotSize: 8 }) // = space_xs（8vp）
         }
         .width(24)
         .height(24)
@@ -871,16 +904,133 @@ export struct HostListPage {
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
-      .backgroundColor(Tokens.Color.surface)
+      // 双栏选中高亮：底色 + 描边随切换服务器平滑过渡
+      .backgroundColor(this.isRowSelected(row) ? Tokens.Color.accentMuted : Tokens.Color.surface)
+      .border({
+        width: 1,
+        color: this.isRowSelected(row) ? Tokens.Color.accent : Tokens.Color.surface
+      })
       .borderRadius(Tokens.radius.sm)
+      .animation({ duration: Motion.duration(Motion.BASE_MS), curve: Curve.FastOutSlowIn })
       .padding(Tokens.space.md)
       .margin({ bottom: Tokens.space.xs })
+      // 按压缩放反馈（弹簧回弹）
+      .scale({
+        x: this.pressedRowId === row.rowId ? Motion.PRESS_SCALE : 1,
+        y: this.pressedRowId === row.rowId ? Motion.PRESS_SCALE : 1
+      })
+      .animation({ duration: Motion.duration(Motion.FAST_MS), curve: curves.springMotion(0.3, 0.8) })
+      .onTouch((event: TouchEvent) => {
+        if (!Motion.enabled) {
+          return;
+        }
+        if (event.type === TouchType.Down) {
+          this.pressedRowId = row.rowId;
+        } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+          if (this.pressedRowId === row.rowId) {
+            this.pressedRowId = '';
+          }
+        }
+      })
       .onClick(() => {
         if (row.host !== null) {
           this.openTerminal(row.host);
         }
       })
+      // bindContextMenu 的 LongPress 自动识别在本机实测不参与手势仲裁（长按被判成单击），
+      // 其 isShown 手动重载又缺 onStateChange 无法感知关闭；改为 LongPressGesture + bindPopup 自管可见性
+      .gesture(LongPressGesture({ repeat: false, duration: 500 })
+        .onAction(() => {
+          this.contextMenuRowId = row.rowId;
+          this.contextMenuVisible = true;
+        }))
+      .bindPopup(this.contextMenuVisible && this.contextMenuRowId === row.rowId, {
+        builder: (): void => {
+          this.HostContextMenu(row);
+        },
+        enableArrow: false,
+        onStateChange: (state: PopupStateEvent): void => {
+          if (!state.isVisible) {
+            this.contextMenuVisible = false;
+          }
+        }
+      })
     }
+  }
+
+  /** 长按菜单气泡内容：连接 / 新窗口 / 编辑 / SFTP / 转发 / 删除（danger），点按任一项后收起 */
+  @Builder
+  HostContextMenu(row: HostListRow) {
+    Column() {
+      if (row.host !== null) {
+        this.MenuEntry('连接', Tokens.Color.text, (): void => {
+          this.hideContextMenu();
+          if (row.host !== null) {
+            this.openTerminal(row.host);
+          }
+        })
+        if (this.multiWindow) {
+          this.MenuEntry('新窗口', Tokens.Color.text, (): void => {
+            this.hideContextMenu();
+            if (row.host !== null) {
+              this.openTerminalInNewWindow(row.host);
+            }
+          })
+        }
+        this.MenuEntry('编辑', Tokens.Color.text, (): void => {
+          this.hideContextMenu();
+          if (row.host !== null) {
+            this.onEditHost(row.host.id);
+          }
+        })
+        this.MenuEntry('SFTP', Tokens.Color.text, (): void => {
+          this.hideContextMenu();
+          if (row.host !== null) {
+            this.onOpenSftp(row.host);
+          }
+        })
+        this.MenuEntry('转发', Tokens.Color.text, (): void => {
+          this.hideContextMenu();
+          if (row.host !== null) {
+            this.onOpenPortForward(row.host);
+          }
+        })
+        this.MenuEntry('删除', Tokens.Color.danger, (): void => {
+          this.hideContextMenu();
+          if (row.host !== null) {
+            this.confirmDeleteHost(row.host);
+          }
+        })
+      }
+    }
+    .width(148)
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.md)
+    .border({ width: 1, color: Tokens.Color.border })
+    .padding({ top: Tokens.space.xs, bottom: Tokens.space.xs })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 收起长按菜单气泡（onStateChange 兜底之外，动作触发时主动收起） */
+  private hideContextMenu(): void {
+    this.contextMenuVisible = false;
+  }
+
+  /** 菜单项行：44vp 触控目标 */
+  @Builder
+  MenuEntry(label: string, color: Resource, onTap: () => void) {
+    Text(label)
+      .fontSize(Tokens.fontSize.body)
+      .fontColor(color)
+      .textAlign(TextAlign.Start)
+      .width('100%')
+      .constraintSize({ minHeight: 44 })
+      .maxLines(1)
+      .padding({ left: Tokens.space.md, right: Tokens.space.lg })
+      .borderRadius(Tokens.radius.sm)
+      .onClick(() => {
+        onTap();
+      })
   }
 
   /** 滑动菜单：[新窗口] + 编辑 + SFTP + 转发 + 删除（danger 底色，与次操作视觉隔离） */
@@ -954,6 +1104,10 @@ export struct HostListPage {
     }
   }
 
+  private isRowSelected(row: HostListRow): boolean {
+    return this.selectedHostId.length > 0 && row.host !== null && row.host.id === this.selectedHostId;
+  }
+
   /** 空状态：无主机时的引导位 +「添加第一台主机」 */
   @Builder
   EmptyState() {
@@ -999,5 +1153,8 @@ export struct HostListPage {
     .width('100%')
     .layoutWeight(1)
     .justifyContent(FlexAlign.Center)
+    .opacity(this.listRevealed ? 1 : 0)
+    .translate({ y: this.listRevealed ? 0 : Motion.enterOffset() })
+    .animation({ duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
   }
 }

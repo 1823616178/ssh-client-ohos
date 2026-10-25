@@ -132,6 +132,12 @@ private:
 
     // 把 damage 矩形内的 libvterm 单元格重读进网格
     void convertRect(int startRow, int startCol, int endRow, int endCol);
+    // P2 性能：feed 期间 damage 只记脏行（markDamageRows），feed 末尾按 libvterm 最终
+    // 缓冲一次性重读（applyPendingDamage）。滚动输出时 moverect 返回 0 会让库对整个滚动区
+    // 逐行发 damage——旧实现每滚一行全屏 get_cell+putCell（cat 大文件 1.5 MB/s 的根因）。
+    // 重读的是最终内容，与逐次重读结果逐格一致；未变化的格不写、不抬 revision/脏位。
+    void markDamageRows(int startRow, int endRow);
+    void applyPendingDamage();
     // VTermScreenCell → 本层 Cell（颜色解析 + 属性位映射）；convertRect 与
     // sb_pushline 共用同一转换，保证屏幕与回滚的内容表示一致
     Cell convertCell(const VTermScreenCell &vc) const;
@@ -171,6 +177,12 @@ private:
     int resizeNewCols_ = 0;
     size_t resizePushIndex_ = 0;
     std::vector<uint8_t> resizeWrapSnapshot_;
+
+    // feed 期间 damage 延迟重读（见 markDamageRows）：feeding_ 仅在 vterm_input_write +
+    // flush_damage 期间为 true；pendingDamageRows_[r] = 1 表示第 r 行待重读
+    bool feeding_ = false;
+    bool hasPendingDamage_ = false;
+    std::vector<uint8_t> pendingDamageRows_;
 
     // 输出改道（模式探测期间）
     bool probing_ = false;

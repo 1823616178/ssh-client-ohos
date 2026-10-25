@@ -8,10 +8,11 @@
  * 宽度经 onAreaChange 派生；面板宽度与可见性由 AdaptiveLayout 解析。
  *
  * lg/md 右栏（中栏）：
- *   - 点按主机 → selectedHostId；中栏展示主机信息 +「嵌入终端」（TerminalPaneEmbed）
- *     +「全页终端」（pushTerminalForHost，与单栏同参 hostId）。
+ *   - 点按主机 → selectedHostId；中栏展示「嵌入终端」（TerminalPaneEmbed）。
+ *   - 点按「活动会话」→ 中栏切换显示该会话（不 push 全页）；全页只由嵌入终端
+ *     顶栏的「全页终端」按钮触发（TerminalPaneEmbed.onOpenFullPage）。
  *   - 侧栏嵌入为单窗格终端；多标签/分屏仍走全页 TerminalPage。
- *   - 临时主机（快速连接）不进右栏，仍 sessionId 全页 push。
+ *   - 快速连接的临时主机不进库，会话点按后仅按 sessionId 接管中栏。
  */
 
 import { HostProfile } from '../common/model/models';
@@ -24,12 +25,17 @@ import {
   RightPanelTabId,
   appBreakpointOfWidth,
   resolveLayoutRegions,
+  rightPanelTabById,
   useHostListSidebar
 } from '../common/utils/AdaptiveLayout';
-import { pushTerminalForHost } from '../common/utils/TerminalNavigation';
+import { pushTerminalPage } from '../common/utils/TerminalNavigation';
 import { AppDatabase } from '../repository/AppDatabase';
 import { Tokens } from '../theme/Tokens';
-import { TerminalPaneEmbed } from '../view/TerminalPaneEmbed';
+import { Motion } from '../theme/Motion';
+import { TerminalPaneEmbed, embedHostTarget, embedSessionTarget } from '../view/TerminalPaneEmbed';
+import { SnippetSidePanel } from '../view/sidepanel/SnippetSidePanel';
+import { PortForwardSidePanel } from '../view/sidepanel/PortForwardSidePanel';
+import { SftpSidePanel } from '../view/sidepanel/SftpSidePanel';
 import { areaLengthToVp } from '../view/terminal/TerminalLayout';
 import { HostListPage } from './HostListPage';
 
@@ -43,11 +49,17 @@ struct Index {
   @State private breakpoint: AppBreakpoint = 'sm';
   @State private selectedHostId: string = '';
   @State private embedTerminal: boolean = false;
+  /** 活动会话点按：中栏要接管的会话（'' = 按主机连接） */
+  @State private embedSessionId: string = '';
+  /** 被接管会话的所属主机（快速连接为临时主机，不在库中，故与 selectedHostId 分开记） */
+  @State private embedSessionHostId: string = '';
   @State private selectedHostName: string = '';
   /** U5 lg：右侧可折叠面板是否展开 */
   @State private rightPanelOpen: boolean = true;
   /** U5 lg：右侧面板当前 tab */
   @State private rightPanelTab: RightPanelTabId = 'snippets';
+  /** 切换服务器时中栏 / 右侧面板内容的入场态（false → true 播放淡入 + 位移） */
+  @State private paneEntered: boolean = true;
 
   /** 页面重新显示（含从编辑页/配置管理页返回）：递增 tick 通知主机列表重载 */
   onPageShow(): void {
@@ -56,9 +68,86 @@ struct Index {
 
   /** HostList 双栏回调：选中主机并展示中栏（不 push） */
   private onHostSelected(hostId: string): void {
+    const switched: boolean = this.embedTerminal && this.selectedHostId.length > 0 &&
+      (this.selectedHostId !== hostId || this.embedSessionId.length > 0);
     this.selectedHostId = hostId;
+    // 点主机行 = 按主机连接，丢掉上一条活动会话的接管请求
+    this.embedSessionId = '';
+    this.embedSessionHostId = '';
     this.embedTerminal = true;
     this.refreshSelectedHostName();
+    if (switched) {
+      this.playPaneEnter();
+    }
+  }
+
+  /**
+   * HostList 双栏回调：点按「活动会话」→ 在首页中栏切换显示该会话，
+   * 不 push 全页（全页只由嵌入终端顶栏的「全页终端」按钮触发）。
+   */
+  private onSessionSelected(sessionId: string, hostId: string): void {
+    const switched: boolean = this.embedTerminal &&
+      (this.embedSessionId !== sessionId || this.embedSessionHostId !== hostId);
+    if (hostId.length > 0 && this.hostExists(hostId)) {
+      this.selectedHostId = hostId;
+      this.refreshSelectedHostName();
+    }
+    this.embedSessionId = sessionId;
+    this.embedSessionHostId = hostId;
+    this.embedTerminal = true;
+    if (switched) {
+      this.playPaneEnter();
+    }
+  }
+
+  /** 已保存主机才同步列表选中态；快速连接的临时主机不进库，只由会话接管 */
+  private hostExists(hostId: string): boolean {
+    try {
+      return AppDatabase.hosts().getById(hostId) !== null;
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  /** 中栏连接目标：活动会话优先，否则按当前选中主机 */
+  private embedTarget(): string {
+    if (!this.embedTerminal) {
+      return '';
+    }
+    if (this.embedSessionId.length > 0) {
+      return embedSessionTarget(this.embedSessionHostId, this.embedSessionId);
+    }
+    return embedHostTarget(this.selectedHostId);
+  }
+
+  /** 中栏是否无内容：需同时看选中主机与活动会话（快速连接无库内主机） */
+  private isEmptyEmbed(): boolean {
+    return !this.embedTerminal ||
+      (this.selectedHostId.length === 0 && this.embedSessionId.length === 0);
+  }
+
+  /**
+   * 切换服务器的内容过渡：先（无动画）退到起始态，animateTo 前框架会先刷新这一帧，
+   * 再以 FastOutSlowIn 回到终态。只动 opacity / translate，不触发终端画布重排。
+   */
+  private playPaneEnter(): void {
+    if (!Motion.enabled) {
+      return;
+    }
+    this.paneEntered = false;
+    this.getUIContext().animateTo({
+      duration: Motion.BASE_MS,
+      curve: Curve.FastOutSlowIn
+    }, () => {
+      this.paneEntered = true;
+    });
+  }
+
+  /** 中栏「占位 ↔ 终端」切换与右侧面板 tab 切换共用的组件内转场 */
+  private paneTransition(): TransitionEffect {
+    return TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ x: Motion.enterOffset() * 1.5 }))
+      .animation({ duration: Motion.duration(Motion.BASE_MS), curve: Curve.FastOutSlowIn });
   }
 
   private refreshSelectedHostName(): void {
@@ -106,6 +195,23 @@ struct Index {
     }
   }
 
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+  }
+
   build() {
     Column() {
       if (!useHostListSidebar(this.breakpoint)) {
@@ -118,14 +224,18 @@ struct Index {
         SideBarContainer(SideBarContainerType.Embed) {
           HostListPage({
             refreshTick: this.listRefreshTick,
+            selectedHostId: this.selectedHostId,
             onOpenHost: (hostId: string): void => {
               this.onHostSelected(hostId);
+            },
+            onResumeSession: (sessionId: string, hostId: string): void => {
+              this.onSessionSelected(sessionId, hostId);
             }
           })
             .width('100%')
             .height('100%')
-          Column() {
-            if (this.selectedHostId.length === 0 || !this.embedTerminal) {
+          Stack() {
+            if (this.isEmptyEmbed()) {
               this.RightPlaceholder()
             } else {
               this.RightContentPane()
@@ -144,8 +254,12 @@ struct Index {
         Row() {
           HostListPage({
             refreshTick: this.listRefreshTick,
+            selectedHostId: this.selectedHostId,
             onOpenHost: (hostId: string): void => {
               this.onHostSelected(hostId);
+            },
+            onResumeSession: (sessionId: string, hostId: string): void => {
+              this.onSessionSelected(sessionId, hostId);
             }
           })
             .width(280)
@@ -154,8 +268,8 @@ struct Index {
             .width(1)
             .height('100%')
             .backgroundColor(Tokens.Color.border)
-          Column() {
-            if (this.selectedHostId.length === 0 || !this.embedTerminal) {
+          Stack() {
+            if (this.isEmptyEmbed()) {
               this.RightPlaceholder()
             } else {
               this.RightContentPane()
@@ -201,23 +315,39 @@ struct Index {
     .justifyContent(FlexAlign.Center)
     .padding(Tokens.space.md)
     .backgroundColor(Tokens.Color.appBg)
+    .transition(TransitionEffect.OPACITY.animation({
+      duration: Motion.duration(Motion.BASE_MS),
+      curve: Curve.FastOutSlowIn
+    }))
   }
 
   @Builder
   RightContentPane() {
     TerminalPaneEmbed({
-      hostId: this.selectedHostId,
+      target: this.embedTarget(),
+      refreshTick: this.listRefreshTick,
       onClose: (): void => {
         this.embedTerminal = false;
         this.selectedHostId = '';
+        this.embedSessionId = '';
+        this.embedSessionHostId = '';
         this.selectedHostName = '';
       },
-      onOpenFullPage: (hostId: string): void => {
-        pushTerminalForHost(this.getUIContext(), hostId);
+      onOpenFullPage: (hostId: string, sessionId?: string): void => {
+        pushTerminalPage(
+          this.getUIContext(),
+          hostId,
+          (sessionId !== undefined && sessionId.length > 0) ? sessionId : ''
+        );
       }
     })
       .width('100%')
       .height('100%')
+      // 切换服务器：内容淡入 + 轻微右移归位
+      .opacity(this.paneEntered ? 1 : 0.4)
+      .translate({ x: this.paneEntered ? 0 : Motion.enterOffset() })
+      // 占位 → 终端：组件内转场
+      .transition(this.paneTransition())
   }
 
   /** lg 右侧侧面板（片段 / 转发 / 文件传输 → 全页路由） */
@@ -284,6 +414,7 @@ struct Index {
                 .backgroundColor(this.rightPanelTab === tab.id
                   ? Tokens.Color.accent : Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.xs)
+                .animation({ duration: Motion.duration(Motion.BASE_MS), curve: Curve.FastOutSlowIn })
                 .padding({
                   left: Tokens.space.sm,
                   right: Tokens.space.sm,
@@ -312,44 +443,53 @@ struct Index {
 
   @Builder
   RightPanelTabBody() {
-    Column() {
-      ForEach(RIGHT_PANEL_TABS, (tab: RightPanelTab) => {
-        if (this.rightPanelTab === tab.id) {
-          Column() {
-            Text(tab.title)
-              .fontSize(Tokens.fontSize.title)
-              .fontColor(Tokens.Color.text)
-              .fontWeight(FontWeight.Bold)
-            Text(tab.subtitle)
-              .fontSize(Tokens.fontSize.caption)
-              .fontColor(Tokens.Color.textDim)
-              .margin({ top: Tokens.space.xs2 })
-            Text('完整能力请打开对应页面')
-              .fontSize(Tokens.fontSize.caption)
-              .fontColor(Tokens.Color.textFaint)
-              .margin({ top: Tokens.space.sm })
-            Button(tab.needsHostId && this.selectedHostId.length === 0
-              ? '请先选择主机'
-              : '打开完整页面')
-              .fontSize(Tokens.fontSize.caption)
-              .fontColor(Tokens.Color.onAccent)
-              .backgroundColor(Tokens.Color.accent)
-              .borderRadius(Tokens.radius.sm)
-              .enabled(!(tab.needsHostId && this.selectedHostId.length === 0))
-              .opacity(tab.needsHostId && this.selectedHostId.length === 0 ? 0.45 : 1)
-              .margin({ top: Tokens.space.md })
-              .onClick(() => {
-                this.openRightPanelRoute(tab);
-              })
+    Stack({ alignContent: Alignment.Top }) {
+      if (this.rightPanelTab === 'snippets') {
+        SnippetSidePanel({
+          onOpenFullPage: (): void => {
+            const tab: RightPanelTab | null = rightPanelTabById('snippets');
+            if (tab !== null) {
+              this.openRightPanelRoute(tab);
+            }
           }
+        })
           .width('100%')
-          .alignItems(HorizontalAlign.Start)
-          .padding(Tokens.space.sm)
-        }
-      }, (tab: RightPanelTab) => `${this.rightPanelTab}-${tab.id}`)
+          .height('100%')
+          .transition(this.paneTransition())
+      } else if (this.rightPanelTab === 'forwards') {
+        PortForwardSidePanel({
+          hostId: this.selectedHostId,
+          hostName: this.selectedHostName,
+          onOpenFullPage: (): void => {
+            const tab: RightPanelTab | null = rightPanelTabById('forwards');
+            if (tab !== null) {
+              this.openRightPanelRoute(tab);
+            }
+          }
+        })
+          .width('100%')
+          .height('100%')
+          .transition(this.paneTransition())
+      } else if (this.rightPanelTab === 'sftp') {
+        SftpSidePanel({
+          hostId: this.selectedHostId,
+          hostName: this.selectedHostName,
+          onOpenFullPage: (): void => {
+            const tab: RightPanelTab | null = rightPanelTabById('sftp');
+            if (tab !== null) {
+              this.openRightPanelRoute(tab);
+            }
+          }
+        })
+          .width('100%')
+          .height('100%')
+          .transition(this.paneTransition())
+      }
     }
     .width('100%')
     .layoutWeight(1)
-    .alignItems(HorizontalAlign.Start)
+    // 切换服务器时右侧面板内容与中栏同步过渡
+    .opacity(this.paneEntered ? 1 : 0.4)
+    .translate({ x: this.paneEntered ? 0 : Motion.enterOffset() })
   }
 }

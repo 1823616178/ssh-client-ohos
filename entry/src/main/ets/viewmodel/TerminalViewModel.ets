@@ -36,7 +36,6 @@ import { buildAutoRunCommands, encodeAutoRunCommands } from '../common/utils/Aut
 import { encodeSnippetForTerminal, snippetVarsOf } from '../common/utils/SnippetVars';
 import { utf8Bytes } from '../view/terminal/KeyMap';
 import { SshError, SshErrorCode } from '../common/SshError';
-import { CredentialStore } from '../repository/CredentialStore';
 import { Logger } from '../common/utils/Logger';
 import { SshEvent, SshNativeSession } from '../napi/SshNative';
 import { SshTerminal } from '../napi/SshTerminal';
@@ -193,9 +192,11 @@ function connectingStageDetail(state: string): string {
  *   - established → none（无蒙层）；
  *   - disconnected 且倒计时中 → reconnecting（置灰 +「N 秒后自动重连（第 M 次）」+ 取消）；
  *   - disconnected 无倒计时（自动重连已取消）→ error 形态（「立即重连」+「关闭」）；
- *   - error → error（中文错误文案 +「立即重连」+「关闭」）；
+ *   - error 且倒计时中（拨号失败后退避重连已排程）→ reconnecting（失败原因 +「N 秒后第 M 次重试」+ 取消）；
+ *   - error 无倒计时 → error（中文错误文案 +「立即重连」+「关闭」）；
  *   - 其余（'' / idle / connecting / handshaking / authenticating）→ connecting；
- *     已有终端画面的 connecting（重连受理后的新一次拨号）置灰并显示「正在重新连接…」。
+ *     已有终端画面置灰并显示「正在重新连接…」；reconnectAttempt > 0（重连循环中的再拨号）
+ *     如实标注「第 M 次重试 · 上次失败：<原因>」，不伪装成首次连接。
  */
 export function deriveOverlay(input: OverlayInput): OverlayModel {
   if (input.startError.length > 0) {
@@ -218,13 +219,32 @@ export function deriveOverlay(input: OverlayInput): OverlayModel {
         input.errorMessage.length > 0 ? input.errorMessage : '自动重连已取消',
         false, true, true);
     case 'error':
+      // 拨号失败且退避重连已排程（countdown > 0）：以重连形态呈现失败原因，
+      // 不落 error 终态按钮（倒计时结束会自动再拨，无需「立即重连」）
+      if (input.reconnectCountdownSec > 0) {
+        return makeOverlay('reconnecting', input.hasTerminal, '连接失败',
+          `${input.errorMessage.length > 0 ? input.errorMessage : '连接失败'}` +
+          ` · ${input.reconnectCountdownSec} 秒后第 ${input.reconnectAttempt} 次重试`,
+          true, false, false);
+      }
       return makeOverlay('error', input.hasTerminal, '连接失败',
         input.errorMessage.length > 0 ? input.errorMessage : '连接失败，可尝试重新连接',
         false, true, true);
-    default:
+    default: {
+      // 重连循环中的再次拨号（attempt > 0）：如实标注重试次数与上次失败原因，
+      // 不伪装成首次连接的「正在连接…」（不可达主机会反复失败，用户须看到失败）
+      if (input.reconnectAttempt > 0) {
+        const lastFail: string =
+          input.errorMessage.length > 0 ? ` · 上次失败：${input.errorMessage}` : '';
+        return makeOverlay('connecting', input.hasTerminal,
+          input.hasTerminal ? '正在重新连接…' : '连接失败，正在重试',
+          `${connectingStageDetail(input.state)} · 第 ${input.reconnectAttempt} 次重试${lastFail}`,
+          false, false, false);
+      }
       return makeOverlay('connecting', input.hasTerminal,
         input.hasTerminal ? '正在重新连接…' : '正在连接…',
         connectingStageDetail(input.state), false, false, false);
+    }
   }
 }
 
@@ -363,15 +383,18 @@ class NoopFocusHost implements TerminalFocusHostLike {
 
 /** 会话管理窄接口：U4/U4b 用到的 SessionManager 最小方法集（生产适配器见 C4SessionHost） */
 export interface TerminalSessionHostLike {
-  connect(host: HostProfile): Promise<TerminalSessionLike>;
+  connect(host: HostProfile, password?: string): Promise<TerminalSessionLike>;
   close(sessionId: string): void;
   getSession(sessionId: string): TerminalSessionLike | null;
   listSessions(): TerminalSessionLike[];
   bindPane(sessionId: string, paneId: string): void;
   unbindPane(paneId: string, closeSession: boolean): void;
   nativeSessionOf(sessionId: string): NativeSessionHandleLike | null;
-  reconnectNow(sessionId: string): boolean;
+  reconnectNow(sessionId: string, password?: string): boolean;
   cancelAutoReconnect(sessionId: string): boolean;
+  /** 会话内补交密码：认证被拒但会话仍在 authenticating（native 等下一次尝试）时，
+   *  用新密码原地重试；其余状态返回 false（由调用方改走重连/新拨） */
+  resubmitPassword(sessionId: string, password: string): boolean;
   /** 会话主机快照（分屏/新标签复用；临时主机 DAO 没有时靠这条） */
   hostOf(sessionId: string): HostProfile | null;
   /** 会话当前绑定的窗格（null = 未绑定）。多窗口：据此判断会话是否正显示在别的窗口 */
@@ -390,22 +413,6 @@ export interface TerminalHostDaoLike {
 
 /** 连接选择面板的打开目标。replace=替换聚焦窗格但保留旧会话，row/column 对应左右/上下。 */
 export type ConnectionOpenMode = 'replace' | 'tab' | 'row' | 'column';
-
-/**
- * 凭据写入窄接口（生产 = CredentialStore.setSecret，落系统 ASSET 加密存储）。
- * 补录的密码必须持久化：§7.1 的自动重连会重新走 prepareAuth 取凭据，
- * 只在内存里存一份的话第一次断线重连就又没密码了。
- */
-export interface TerminalSecretWriterLike {
-  savePassword(hostId: string, password: string): Promise<void>;
-}
-
-/** 生产凭据写入：转发 CredentialStore（明文只进出 ASSET，不落沙箱、不进日志） */
-class CredentialStoreSecretWriter implements TerminalSecretWriterLike {
-  savePassword(hostId: string, password: string): Promise<void> {
-    return CredentialStore.setSecret(hostId, 'password', password);
-  }
-}
 
 /** 密码补录框的渲染模型（页面只读这一个对象） */
 export interface PasswordPromptModel {
@@ -432,13 +439,24 @@ export function isPasswordRetryError(event: SshEvent): boolean {
     return true;
   }
   const name: string = event.errorCodeName !== undefined ? event.errorCodeName : '';
-  return name === 'auth_password_failed' || name === 'auth_timeout';
+  if (name === 'auth_password_failed' || name === 'auth_timeout') {
+    return true;
+  }
+  // authResult 事件（认证被拒、会话仍停在 authenticating 等下一次尝试）：
+  // 字段形状与 stateChange 不同——失败码在 error 字符串（native toString 码名，
+  // 密码拒绝为 auth_failed_password；旧写法 auth_password_failed 一并兼容）
+  if (event.type === 'authResult') {
+    const err: string = event.error !== undefined ? event.error : '';
+    return err === 'auth_failed_password' || err === 'auth_password_failed' ||
+      err === 'auth_timeout';
+  }
+  return false;
 }
 
 /** 生产会话宿主：C4 SessionManager 的窄接口适配 */
 class C4SessionHost implements TerminalSessionHostLike {
-  connect(host: HostProfile): Promise<TerminalSessionLike> {
-    return SessionManager.get().connect(host);
+  connect(host: HostProfile, password?: string): Promise<TerminalSessionLike> {
+    return SessionManager.get().connect(host, password);
   }
 
   close(sessionId: string): void {
@@ -470,12 +488,16 @@ class C4SessionHost implements TerminalSessionHostLike {
     return SessionManager.get().nativeSessionOf(sessionId);
   }
 
-  reconnectNow(sessionId: string): boolean {
-    return SessionManager.get().reconnectNow(sessionId);
+  reconnectNow(sessionId: string, password?: string): boolean {
+    return SessionManager.get().reconnectNow(sessionId, password);
   }
 
   cancelAutoReconnect(sessionId: string): boolean {
     return SessionManager.get().cancelAutoReconnect(sessionId);
+  }
+
+  resubmitPassword(sessionId: string, password: string): boolean {
+    return SessionManager.get().resubmitPassword(sessionId, password);
   }
 
   hostOf(sessionId: string): HostProfile | null {
@@ -624,8 +646,6 @@ export interface TerminalViewModelDeps {
   onUiChange?: () => void;
   /** 焦点宿主（生产页注入 FocusManager 适配；缺省 no-op） */
   focusHost?: TerminalFocusHostLike;
-  /** 凭据写入（生产 = CredentialStore；单测注入内存 fake，不碰 ASSET） */
-  secretWriter?: TerminalSecretWriterLike;
   /** 终端寄存处（返回不断开；缺省 = 进程级 TerminalParkingLot.global()） */
   parking?: TerminalParkingLike;
   /** 视觉响铃出口：已节流的响铃投递到可见窗格（页面 → TerminalActionHub 'bell'） */
@@ -649,6 +669,21 @@ export interface TerminalViewModelDeps {
    */
   onSessionElsewhere?: (sessionId: string, paneId: string) => void;
 }
+
+/**
+ * 进程级「在途拨号」表（hostId → 拨号）：仅生产 SessionManager 路径使用（单测注入
+ * sessionHost 时不共享）。侧栏快速 A→B→A 切换时，第二次进入 A 的 VM 复用第一次
+ * 尚未受理完的拨号，而不是再拨一个新会话、再把前一个立刻关掉。
+ */
+interface PendingConnect {
+  promise: Promise<TerminalSessionLike>;
+  /** 仍在 await 本拨号的 VM 数（含已 detach 的） */
+  waiters: number;
+  /** 已有存活 VM 采用了结果：已退出的 VM 不得再关闭它 */
+  adopted: boolean;
+}
+
+const PENDING_CONNECTS: Map<string, PendingConnect> = new Map();
 
 /** 已 attach 终端的缓存条目：终端 + 绑定的 native 句柄（重连换柄检测依据） */
 interface AttachedTerminal {
@@ -713,7 +748,6 @@ export class TerminalViewModel {
   private readonly dirtyHook: () => void;
   private readonly uiHook: () => void;
   private readonly focusHost: TerminalFocusHostLike;
-  private readonly secretWriter: TerminalSecretWriterLike;
   private readonly injectedParking: TerminalParkingLike | null;
   private readonly bellHook: (paneId: string) => void;
   private readonly nowFn: () => number;
@@ -766,7 +800,6 @@ export class TerminalViewModel {
     this.dirtyHook = deps?.onContentDirty ?? ((): void => {});
     this.uiHook = deps?.onUiChange ?? ((): void => {});
     this.focusHost = deps?.focusHost ?? new NoopFocusHost();
-    this.secretWriter = deps?.secretWriter ?? new CredentialStoreSecretWriter();
     this.injectedParking = deps?.parking ?? null;
     this.bellHook = deps?.onBell ?? ((_paneId: string): void => {});
     this.nowFn = deps?.now ?? ((): number => Date.now());
@@ -839,18 +872,67 @@ export class TerminalViewModel {
     this.refreshOverlay();
     this.notifyUi();
     Logger.info(`发起连接 authType=${host.authType} port=${host.port}`, LOG_TAG);
+    const pending: PendingConnect = this.joinOrStartConnect(host);
+    let info: TerminalSessionLike;
     try {
-      const info: TerminalSessionLike = await this.sessionHost().connect(host);
-      if (this.disposed) {
-        // 等待受理期间页面已退出：会话未绑窗格，dispose 的 unbindPane 管不到，显式关闭
-        this.sessionHost().close(info.sessionId);
-        return;
-      }
-      Logger.info(`连接已受理 state=${info.state}`, LOG_TAG);
-      this.adoptSession(info, host);
+      info = await pending.promise;
     } catch (err) {
+      pending.waiters--;
       this.handleConnectFailure(err, host);
+      return;
     }
+    pending.waiters--;
+    if (this.disposed) {
+      // 等待受理期间页面已退出：会话未绑窗格，dispose 的 unbindPane 管不到，显式关闭——
+      // 但同一拨号若还有其他 VM 在等 / 已被采用（快速切回同一主机），交给它们
+      if (pending.waiters <= 0 && !pending.adopted) {
+        this.sessionHost().close(info.sessionId);
+      }
+      return;
+    }
+    pending.adopted = true;
+    Logger.info(`连接已受理 state=${info.state}`, LOG_TAG);
+    this.adoptSession(info, host);
+  }
+
+  /** 生产路径：同一主机有在途拨号则加入等待，否则发起新拨号并登记（受理落定即摘表） */
+  private joinOrStartConnect(host: HostProfile): PendingConnect {
+    const shareable: boolean = this.injectedHost === null && host.id.length > 0;
+    if (shareable) {
+      const existing: PendingConnect | undefined = PENDING_CONNECTS.get(host.id);
+      if (existing !== undefined) {
+        existing.waiters++;
+        Logger.info('复用同一主机的在途拨号', LOG_TAG);
+        return existing;
+      }
+    }
+    let promise: Promise<TerminalSessionLike>;
+    try {
+      promise = this.sessionHost().connect(host);
+    } catch (err) {
+      // 同步抛出（fake/未受理）也统一走 await 的 catch 分流
+      promise = Promise.reject<TerminalSessionLike>(err);
+    }
+    const created: PendingConnect = {
+      promise: promise,
+      waiters: 1,
+      adopted: false
+    };
+    if (shareable) {
+      const hostId: string = host.id;
+      PENDING_CONNECTS.set(hostId, created);
+      const forget = (): void => {
+        if (PENDING_CONNECTS.get(hostId) === created) {
+          PENDING_CONNECTS.delete(hostId);
+        }
+      };
+      created.promise.then((_info: TerminalSessionLike): void => {
+        forget();
+      }, (_err: Object): void => {
+        forget();
+      });
+    }
+    return created;
   }
 
   /** 从数据库刷新连接选择列表；页面从主机编辑页返回或打开面板时调用。 */
@@ -880,11 +962,7 @@ export class TerminalViewModel {
 
   // ---------------------------------------------------------------- 密码补录
 
-  /**
-   * 提交补录的密码：先落 ASSET 凭据库（重连要复用，见 TerminalSecretWriterLike 头注），
-   * 再按同一主机重新拨号。失败时留在框内并回显原因，用户可改了再试。
-   * 密码只在本方法调用栈内以局部量存在，不写字段、不进日志。
-   */
+  // 补录密码仅透传，由会话层在认证成功后保存，不受页面切换影响。
   async submitPassword(password: string): Promise<void> {
     const host: HostProfile | null = this.pendingPasswordHost;
     if (this.disposed || host === null || this.passwordPrompt.busy) {
@@ -901,31 +979,40 @@ export class TerminalViewModel {
       error: ''
     };
     this.refreshViews();
-    try {
-      await this.secretWriter.savePassword(host.id, password);
-    } catch (err) {
-      Logger.error(`密码写入凭据库失败: ${JSON.stringify(err)}`, LOG_TAG);
-      this.setPromptError('密码保存失败，请重试');
-      return;
-    }
     if (this.disposed) {
       return;
     }
     const existingSessionId: string = this.pendingPasswordSessionId;
     if (existingSessionId.length > 0) {
       const existing: TerminalSessionLike | null = this.sessionHost().getSession(existingSessionId);
-      if (existing !== null && (existing.state === 'error' || existing.state === 'disconnected')) {
+      if (existing !== null && existing.state === 'authenticating') {
+        // 认证被拒后 native 等下一次尝试：新密码原地补交，不另拨新会话
+        if (!this.sessionHost().resubmitPassword(existingSessionId, password)) {
+          this.setPromptError('重试未被受理，请稍后再试');
+          return;
+        }
         this.pendingPasswordHost = null;
         this.pendingPasswordSessionId = '';
         this.pendingPasswordInitial = false;
         this.passwordPrompt = HIDDEN_PASSWORD_PROMPT;
-        this.sessionHost().reconnectNow(existingSessionId);
+        this.refreshViews();
+        return;
+      }
+      if (existing !== null && (existing.state === 'error' || existing.state === 'disconnected')) {
+        if (!this.sessionHost().reconnectNow(existingSessionId, password)) {
+          this.setPromptError('重连未被受理，请重试');
+          return;
+        }
+        this.pendingPasswordHost = null;
+        this.pendingPasswordSessionId = '';
+        this.pendingPasswordInitial = false;
+        this.passwordPrompt = HIDDEN_PASSWORD_PROMPT;
         this.refreshViews();
         return;
       }
     }
     try {
-      const info: TerminalSessionLike = await this.sessionHost().connect(host);
+      const info: TerminalSessionLike = await this.sessionHost().connect(host, password);
       if (this.disposed) {
         this.sessionHost().close(info.sessionId);
         return;
@@ -2077,6 +2164,13 @@ export class TerminalViewModel {
         }
         if (wake) {
           this.dirtyHook();
+        }
+        break;
+      case 'authResult':
+        // 认证被拒但 native 不落终态（等待下一次尝试）：密码认证必须在这里
+        // 弹补录框，否则会话永远停在「正在进行身份认证」等一个不会来的重试
+        if (event.success !== true) {
+          this.maybePromptPasswordAfterAuthFailure(session, event);
         }
         break;
       case 'terminalOpen':

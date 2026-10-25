@@ -257,6 +257,9 @@ class TestEnv {
   readonly agent: FakeAgentAuth = new FakeAgentAuth();
   readonly manager: SessionManager;
   readonly dirtyLog: string[] = [];
+  readonly savedHosts: string[] = [];
+  saveGate: Promise<void> | null = null;
+  failSave: boolean = false;
   private idSeq: number = 0;
 
   constructor() {
@@ -265,6 +268,16 @@ class TestEnv {
       getSecret: (hostId: string, kind: CredentialKind): Promise<string | null> => {
         const value: string | undefined = this.secrets.get(`${hostId}:${kind}`);
         return Promise.resolve(value === undefined ? null : value);
+      },
+      savePassword: async (hostId: string, password: string): Promise<void> => {
+        this.savedHosts.push(hostId);
+        if (this.saveGate !== null) {
+          await this.saveGate;
+        }
+        if (this.failSave) {
+          throw new Error('storage unavailable');
+        }
+        this.setSecret(hostId, 'password', password);
       },
       scheduler: this.scheduler,
       newSessionId: (): string => {
@@ -380,6 +393,170 @@ export default function sessionManagerTest() {
       expect(env.manager.getNativeHandle(info.sessionId)).assertNull();
       env.manager.close(info.sessionId);
       expect(fake.closeCount).assertEqual(1);
+    });
+
+    it('补录密码_认证成功才保存且新会话自动读取_重复成功不重复保存', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      const host: HostProfile = sampleHost('h1', 'password');
+      const info: SessionInfo = await env.manager.connect(host, 'new-password');
+      const fake: FakeNativeSession = env.factory.latest();
+      expect(env.savedHosts.length).assertEqual(0);
+      expect(env.secrets.has('h1:password')).assertFalse();
+      fake.emit(stateChange('authenticating'));
+      expect(fake.passwordAuthCalls[0]).assertEqual('new-password');
+      expect(env.savedHosts.length).assertEqual(0);
+      expect(JSON.stringify(info).indexOf('new-password') < 0).assertTrue();
+      fake.emit(stateChange('established'));
+      fake.emit(stateChange('established'));
+      await flushAsync();
+      expect(env.savedHosts.length).assertEqual(1);
+      expect(env.secrets.get('h1:password')).assertEqual('new-password');
+      env.manager.close(info.sessionId);
+      await env.manager.connect(host);
+      env.factory.latest().emit(stateChange('authenticating'));
+      expect(env.factory.latest().passwordAuthCalls[0]).assertEqual('new-password');
+      env.factory.latest().emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(1);
+    });
+
+    it('补录错误密码或认证超时不覆盖旧凭据_更正重连成功后保存', 0, async () => {
+      const codes: number[] = [SshErrorCode.AUTH_PASSWORD_FAILED, SshErrorCode.AUTH_TIMEOUT];
+      for (const code of codes) {
+        const env: TestEnv = new TestEnv();
+        env.setSecret('h1', 'password', 'previous-password');
+        const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'), 'wrong-password');
+        const failed: FakeNativeSession = env.factory.latest();
+        failed.emit(stateChange('authenticating'));
+        expect(failed.passwordAuthCalls[0]).assertEqual('wrong-password');
+        failed.emit({ type: 'stateChange', to: 'error', errorCode: code });
+        expect(env.savedHosts.length).assertEqual(0);
+        expect(env.secrets.get('h1:password')).assertEqual('previous-password');
+        expect(env.manager.reconnectNow(info.sessionId, 'correct-password')).assertTrue();
+        await flushAsync();
+        const retried: FakeNativeSession = env.factory.latest();
+        failed.emit(stateChange('established'));
+        expect(env.savedHosts.length).assertEqual(0);
+        retried.emit(stateChange('authenticating'));
+        expect(retried.passwordAuthCalls[0]).assertEqual('correct-password');
+        expect(env.secrets.get('h1:password')).assertEqual('previous-password');
+        retried.emit(stateChange('established'));
+        await flushAsync();
+        expect(env.savedHosts.length).assertEqual(1);
+        expect(env.secrets.get('h1:password')).assertEqual('correct-password');
+      }
+    });
+
+    it('认证结束前断开或关闭_补录密码不保存也不留给下一次重连', 0, async () => {
+      const states: string[] = ['error', 'disconnected', 'closing', 'closed'];
+      for (const state of states) {
+        const env: TestEnv = new TestEnv();
+        await env.manager.connect(sampleHost('h1', 'password'), 'unverified-password');
+        const fake: FakeNativeSession = env.factory.latest();
+        fake.emit(stateChange('authenticating'));
+        fake.emit(stateChange(state));
+        fake.emit(stateChange('established'));
+        await flushAsync();
+        expect(env.savedHosts.length).assertEqual(0);
+        expect(env.secrets.size).assertEqual(0);
+      }
+      const env: TestEnv = new TestEnv();
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'), 'unverified-password');
+      const fake: FakeNativeSession = env.factory.latest();
+      fake.emit(stateChange('authenticating'));
+      env.manager.close(info.sessionId);
+      fake.emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(0);
+      expect(env.secrets.size).assertEqual(0);
+    });
+
+    it('认证请求被拒绝_不保存补录密码', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'), 'unverified-password');
+      const fake: FakeNativeSession = env.factory.latest();
+      fake.acceptAuth = false;
+      fake.emit(stateChange('authenticating'));
+      expect(info.state).assertEqual('error');
+      fake.emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(0);
+    });
+
+    it('成功后立即自动重连_等待凭据写入完成再读新密码', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      let finishSave: () => void = (): void => {};
+      env.saveGate = new Promise<void>((resolve) => { finishSave = resolve; });
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'), 'verified-password');
+      const fake: FakeNativeSession = env.factory.latest();
+      fake.emit(stateChange('authenticating'));
+      fake.emit(stateChange('established'));
+      fake.nextDelay = (_attempt: number): number => 0;
+      fake.emit(disconnectHint());
+      await flushAsync();
+      expect(env.factory.created.length).assertEqual(1);
+      expect(env.secrets.size).assertEqual(0);
+      finishSave();
+      await flushAsync();
+      expect(env.factory.created.length).assertEqual(2);
+      env.factory.latest().emit(stateChange('authenticating'));
+      expect(env.factory.latest().passwordAuthCalls[0]).assertEqual('verified-password');
+      expect(info.state).assertEqual('authenticating');
+    });
+
+    it('密码保存失败不破坏已建立会话或旧凭据_随后仍可再次保存', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'previous-password');
+      env.failSave = true;
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'), 'verified-password');
+      env.factory.latest().emit(stateChange('authenticating'));
+      env.factory.latest().emit(stateChange('established'));
+      await flushAsync();
+      expect(info.state).assertEqual('established');
+      expect(env.secrets.get('h1:password')).assertEqual('previous-password');
+      env.failSave = false;
+      env.factory.latest().emit(stateChange('disconnected'));
+      expect(env.manager.reconnectNow(info.sessionId, 'verified-password')).assertTrue();
+      await flushAsync();
+      env.factory.latest().emit(stateChange('authenticating'));
+      env.factory.latest().emit(stateChange('established'));
+      await flushAsync();
+      expect(env.secrets.get('h1:password')).assertEqual('verified-password');
+    });
+
+    it('同主机并行成功写入串行化_不同主机凭据互不影响', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      let finishSave: () => void = (): void => {};
+      env.saveGate = new Promise<void>((resolve) => { finishSave = resolve; });
+      await env.manager.connect(sampleHost('h1', 'password'), 'first-password');
+      env.factory.latest().emit(stateChange('authenticating'));
+      env.factory.latest().emit(stateChange('established'));
+      await env.manager.connect(sampleHost('h1', 'password'), 'second-password');
+      env.factory.latest().emit(stateChange('authenticating'));
+      env.factory.latest().emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(1);
+      await env.manager.connect(sampleHost('h2', 'password'), 'other-password');
+      env.factory.latest().emit(stateChange('authenticating'));
+      env.factory.latest().emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(2);
+      finishSave();
+      await flushAsync();
+      expect(env.savedHosts.length).assertEqual(3);
+      expect(env.secrets.get('h1:password')).assertEqual('second-password');
+      expect(env.secrets.get('h2:password')).assertEqual('other-password');
+    });
+
+    it('非密码认证及后台策略挂起不保存补录密码', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('hk', 'private_key', 'PEM-DATA');
+      await env.manager.connect(sampleHost('hk', 'key'), 'unused-password');
+      env.factory.latest().emit(stateChange('authenticating'));
+      env.factory.latest().emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(0);
+      await env.manager.connect(sampleHost('hp', 'password'), 'unverified-password');
+      const fake: FakeNativeSession = env.factory.latest();
+      fake.emit(stateChange('authenticating'));
+      env.manager.suspendAllForPolicy('test');
+      fake.emit(stateChange('established'));
+      expect(env.savedHosts.length).assertEqual(0);
+      expect(env.secrets.has('hp:password')).assertFalse();
     });
 
     it('公钥认证_私钥与短语取自凭据库且不落SessionInfo', 0, async () => {
@@ -595,6 +772,63 @@ export default function sessionManagerTest() {
       }
     });
 
+    it('authResult_密码被拒保持authenticating_密钥被拒落error终态', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      const fake: FakeNativeSession = env.factory.latest();
+      fake.emit(stateChange('authenticating'));
+      // 密码被拒：非终态事件，会话停在 authenticating 等 resubmitPassword
+      fake.emit({
+        type: 'authResult', method: 'password', success: false,
+        error: 'auth_password_failed', message: 'Authentication failed', attemptsLeft: 2
+      });
+      expect(info.state).assertEqual('authenticating');
+      // resubmitPassword：authenticating 受理新密码；其他状态不受理
+      expect(env.manager.resubmitPassword(info.sessionId, 'pw-2')).assertTrue();
+      expect(fake.passwordAuthCalls.length).assertEqual(2);
+      expect(fake.passwordAuthCalls[1]).assertEqual('pw-2');
+
+      // 密钥被拒：无补录交互，直接终态
+      env.setSecret('h2', 'private_key', 'PEM-DATA');
+      const keyHost: HostProfile = sampleHost('h2', 'key');
+      await env.manager.connect(keyHost);
+      const keyFake: FakeNativeSession = env.factory.latest();
+      keyFake.emit(stateChange('authenticating'));
+      keyFake.emit({
+        type: 'authResult', method: 'publickey', success: false,
+        error: 'auth_publickey_failed', message: 'Callback returned error', attemptsLeft: 1
+      });
+      const keyInfo: SessionInfo = env.manager.listSessions()
+        .filter((s: SessionInfo) => s.hostId === 'h2')[0];
+      expect(keyInfo.state).assertEqual('error');
+      expect(keyInfo.errorMessage).assertEqual('Callback returned error');
+      expect(keyInfo.errorCodeName).assertEqual('auth_publickey_failed');
+    });
+
+    it('首拨失败_从未established不自动重连_立即落终态', 0, async () => {      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      const fake: FakeNativeSession = env.factory.latest();
+      fake.nextDelay = (_attempt: number): number => 5;
+      // TCP 连接超时：native 会带 reconnectHint，但会话从未 established
+      fake.emit({
+        type: 'stateChange',
+        from: 'connecting',
+        to: 'error',
+        errorCode: SshErrorCode.CONNECT_TIMEOUT,
+        errorCodeName: 'connect_timeout',
+        reconnectHint: true
+      });
+      expect(info.state).assertEqual('error');
+      expect(info.errorMessage.length > 0).assertTrue();
+      // 不进退避：无定时器、无倒计时、不新建会话（点「重连」手动再试）
+      expect(env.scheduler.pendingCount).assertEqual(0);
+      expect(info.reconnectCountdownSec).assertEqual(0);
+      expect(info.reconnectAttempt).assertEqual(0);
+      expect(env.factory.created.length).assertEqual(1);
+    });
+
     it('断线hint_按建议秒数退避_倒计时递减_换句柄保sessionId_旧句柄迟到事件被丢弃', 0, async () => {
       const env: TestEnv = new TestEnv();
       env.setSecret('h1', 'password', 'pw');
@@ -715,6 +949,25 @@ export default function sessionManagerTest() {
       expect(env.dirtyLog.length).assertEqual(1);
       expect(env.dirtyLog[0]).assertEqual(info.sessionId);
       expect(info.state).assertEqual('connecting');
+    });
+
+    it('stateChange先落库再广播_监听器读到已应用的新状态', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.setSecret('h1', 'password', 'pw');
+      const info: SessionInfo = await env.manager.connect(sampleHost('h1', 'password'));
+      const seenInCallback: string[] = [];
+      env.manager.addEventListener((session: SessionInfo, event: SshEvent) => {
+        if (event.type === 'stateChange') {
+          seenInCallback.push(session.state);
+        }
+      });
+      env.factory.latest().emit({ type: 'stateChange', to: 'error', errorCode: SshErrorCode.CONNECT_TIMEOUT });
+      expect(info.state).assertEqual('error');
+      expect(seenInCallback.length).assertEqual(1);
+      // 回调里重读必须已是新状态 + 已映射的错误文案：
+      // 若先广播后落库，蒙层派生会永远读到上一个状态（「正在连接」卡死）
+      expect(seenInCallback[0]).assertEqual('error');
+      expect(info.errorMessage.length > 0).assertTrue();
     });
   });
 

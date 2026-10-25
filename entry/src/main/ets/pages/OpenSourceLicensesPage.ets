@@ -4,12 +4,46 @@
  */
 
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { OPEN_SOURCE_LICENSES, OpenSourceLicenseEntry } from '../common/constants/OpenSourceLicenses';
 import { PageHeader } from '../view/PageHeader';
 
 @Entry
 @ComponentV2
 struct OpenSourceLicensesPage {
+  /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
+  @Local private introDone: boolean = !Motion.enabled;
+  aboutToAppear(): void {
+    this.openIntroWindow();
+  }
+
+  /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
+  private openIntroWindow(): void {
+    if (this.introDone) {
+      return;
+    }
+    setTimeout(() => {
+      this.introDone = true;
+    }, Motion.INTRO_WINDOW_MS);
+  }
+
+  /**
+   * 页面转场（router 路由，pageTransition）：push 新页自右 PAGE_OFFSET_VP 淡入推入、旧页轻微左移；
+   * pop 反向。只动 opacity/translate（合成层属性，画布不重绘）；Motion 总开关关闭时时长 0。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+    PageTransitionEnter({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Push, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: -Motion.pageOffset() / 2 })
+    PageTransitionExit({ type: RouteType.Pop, duration: Motion.duration(Motion.SLOW_MS), curve: Curve.FastOutSlowIn })
+      .translate({ x: Motion.pageOffset() })
+      .opacity(0)
+  }
+
   build() {
     Column() {
       PageHeader({
@@ -23,7 +57,7 @@ struct OpenSourceLicensesPage {
             .fontSize(Tokens.fontSize.caption)
             .fontColor(Tokens.Color.textDim)
             .margin({ bottom: Tokens.space.sm })
-          ForEach(OPEN_SOURCE_LICENSES, (entry: OpenSourceLicenseEntry) => {
+          ForEach(OPEN_SOURCE_LICENSES, (entry: OpenSourceLicenseEntry, index: number) => {
             Column() {
               Text(`${entry.name} ${entry.version}`)
                 .fontSize(Tokens.fontSize.body)
@@ -44,6 +78,8 @@ struct OpenSourceLicensesPage {
             .backgroundColor(Tokens.Color.surface)
             .borderRadius(Tokens.radius.md)
             .margin({ bottom: Tokens.space.sm })
+            // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+            .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
           }, (entry: OpenSourceLicenseEntry) => entry.name)
         }
         .width('100%')
