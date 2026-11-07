@@ -13,6 +13,7 @@ import { Logger } from '../common/utils/Logger';
 import { KeyEntryMeta } from '../common/utils/KeyManagerLogic';
 import { KeyManagerViewModel } from '../viewmodel/KeyManagerViewModel';
 import { PageHeader } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 
 const LOG_TAG: string = 'KeyManagerPage';
 
@@ -21,6 +22,8 @@ const LOG_TAG: string = 'KeyManagerPage';
 struct KeyManagerPage {
   /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
   @Local private introDone: boolean = !Motion.enabled;
+  @Local private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   private readonly vm: KeyManagerViewModel = new KeyManagerViewModel();
   @Local private nameDraft: string = '';
   @Local private privateKeyDraft: string = '';
@@ -36,6 +39,31 @@ struct KeyManagerPage {
   aboutToAppear(): void {
     this.openIntroWindow();
     this.vm.reload();
+    this.pulseLoading();
+  }
+
+  aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+  }
+
+  private pulseLoading(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    this.loadingTimerId = setTimeout(() => {
+      this.loadingTimerId = -1;
+      this.listLoading = false;
+    }, ms);
   }
 
   private toast(message: string): void {
@@ -380,7 +408,9 @@ struct KeyManagerPage {
         .fontColor(Tokens.Color.text)
         .fontWeight(FontWeight.Bold)
         .margin({ bottom: Tokens.space.sm })
-      if (this.vm.entries.length === 0) {
+      if (this.listLoading) {
+        ListLoadingSkeleton({ variant: 'card', rows: 3, hint: '正在加载密钥列表…' })
+      } else if (this.vm.entries.length === 0) {
         Text('暂无私钥。导入或生成后可用于主机的密钥 / Agent 认证。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textFaint)

@@ -13,7 +13,9 @@
 import { SshTerminal } from '../napi/SshTerminal';
 import { Logger } from '../common/utils/Logger';
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 import { TerminalCanvas } from './TerminalCanvas';
+import { ServerConnect3DOverlay } from './ServerConnect3DOverlay';
 import { FrameScheduler } from './FrameScheduler';
 import { FocusManager } from './terminal/FocusManager';
 import { paneIdPrefixOf } from '../common/constants/WindowKeys';
@@ -107,6 +109,11 @@ export struct TerminalPaneEmbed {
     startError: ''
   });
   @State private canvasTerminal: SshTerminal | null = null;
+  /** 连接成功瞬间的 3D 空间穿越（Portal Dive）过渡态 */
+  @State private warpingOut: boolean = false;
+  @State private canvasScale: number = 1.0;
+  @State private canvasRotateXDeg: number = 0;
+  @State private canvasOpacity: number = 1.0;
   @State private passwordPrompt: PasswordPromptModel = {
     visible: false,
     hostName: '',
@@ -116,6 +123,7 @@ export struct TerminalPaneEmbed {
   @State private passwordDraft: string = '';
 
   private vm: TerminalViewModel | null = null;
+  private warpTimerId: number = -1;
 
   aboutToAppear(): void {
     this.startVm();
@@ -233,6 +241,14 @@ export struct TerminalPaneEmbed {
   }
 
   private detachVm(): void {
+    if (this.warpTimerId !== -1) {
+      clearTimeout(this.warpTimerId);
+      this.warpTimerId = -1;
+    }
+    this.warpingOut = false;
+    this.canvasScale = 1.0;
+    this.canvasRotateXDeg = 0;
+    this.canvasOpacity = 1.0;
     this.passwordDraft = '';
     this.passwordPrompt = {
       visible: false,
@@ -253,12 +269,40 @@ export struct TerminalPaneEmbed {
     if (vm === null) {
       return;
     }
+    const prevTerminal: SshTerminal | null = this.canvasTerminal;
     this.hostName = vm.hostName;
     this.sessionState = vm.sessionState;
     this.overlayModel = vm.overlay;
     this.passwordPrompt = vm.passwordPrompt;
     const term = vm.terminal;
-    this.canvasTerminal = term as SshTerminal | null;
+    const nextTerminal: SshTerminal | null = term as SshTerminal | null;
+    this.canvasTerminal = nextTerminal;
+    if (prevTerminal === null && nextTerminal !== null && Motion.enabled) {
+      this.triggerPortalDive();
+    }
+  }
+
+  /** 连接建立瞬间：触发 3D 空间穿越（Astro 星环前冲消散 + 画布自 3D 远端拉近展开） */
+  private triggerPortalDive(): void {
+    if (this.warpTimerId !== -1) {
+      clearTimeout(this.warpTimerId);
+    }
+    this.warpingOut = true;
+    this.canvasScale = 0.92;
+    this.canvasRotateXDeg = 8;
+    this.canvasOpacity = 0.25;
+    this.getUIContext().animateTo({
+      duration: Motion.warpDuration(),
+      curve: Curve.FastOutSlowIn
+    }, () => {
+      this.canvasScale = 1.0;
+      this.canvasRotateXDeg = 0;
+      this.canvasOpacity = 1.0;
+    });
+    this.warpTimerId = setTimeout(() => {
+      this.warpingOut = false;
+      this.warpTimerId = -1;
+    }, Motion.warpDuration());
   }
 
   private submitPassword(): void {
@@ -326,87 +370,65 @@ export struct TerminalPaneEmbed {
 
       Stack() {
         if (this.canvasTerminal !== null) {
-          TerminalCanvas({
-            terminal: this.canvasTerminal,
-            focusId: this.embedPaneId,
-            autoFocus: true,
-            visible: true
-          })
-            .width('100%')
-            .height('100%')
-        } else {
           Column() {
-            Text(this.overlayModel.kind === 'error'
-              ? (this.overlayModel.detail.length > 0 ? this.overlayModel.detail : this.overlayModel.title)
-              : (this.overlayModel.title.length > 0 ? this.overlayModel.title : '正在准备连接…'))
-              .fontSize(Tokens.fontSize.body)
-              .fontColor(this.overlayModel.kind === 'error' ? Tokens.Color.danger : Tokens.Color.text)
-              .textAlign(TextAlign.Center)
-            if (this.overlayModel.detail.length > 0) {
-              Text(this.overlayModel.detail)
-                .fontSize(Tokens.fontSize.caption)
-                .fontColor(Tokens.Color.textDim)
-                .textAlign(TextAlign.Center)
-                .margin({ top: Tokens.space.xs })
-            }
-            // 失败/倒计时/结束态的操作按钮（与全页终端 StatusOverlay 同语义）：
-            // 取消重连（退避倒计时）/ 重连（error 与 closed 可重连）/ 关闭（收起中栏终端）
-            if (this.overlayModel.showCancelReconnect || this.overlayModel.showReconnectNow ||
-              this.overlayModel.showClose) {
-              Row() {
-                if (this.overlayModel.showCancelReconnect) {
-                  Button('取消重连')
-                    .fontSize(Tokens.fontSize.body)
-                    .fontColor(Tokens.Color.text)
-                    .backgroundColor(Tokens.Color.surfaceHover)
-                    .borderRadius(Tokens.radius.sm)
-                    .height(36)
-                    .onClick(() => {
-                      const sid: string = this.vm !== null ? this.vm.currentSessionId : '';
-                      if (sid.length > 0 && this.vm !== null) {
-                        this.vm.cancelAutoReconnectAt(sid);
-                      }
-                    })
-                }
-                if (this.overlayModel.showReconnectNow) {
-                  Button('重连')
-                    .fontSize(Tokens.fontSize.body)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor(Tokens.Color.onAccent)
-                    .backgroundColor(Tokens.Color.accent)
-                    .borderRadius(Tokens.radius.sm)
-                    .height(36)
-                    .margin({ left: Tokens.space.sm })
-                    .onClick(() => {
-                      const sid: string = this.vm !== null ? this.vm.currentSessionId : '';
-                      if (sid.length > 0 && this.vm !== null) {
-                        this.vm.reconnectNowAt(sid);
-                      }
-                    })
-                }
-                if (this.overlayModel.showClose) {
-                  Button('关闭')
-                    .fontSize(Tokens.fontSize.body)
-                    .fontColor(Tokens.Color.textDim)
-                    .backgroundColor(Tokens.Color.surfaceHover)
-                    .borderRadius(Tokens.radius.sm)
-                    .height(36)
-                    .margin({ left: Tokens.space.sm })
-                    .onClick(() => {
-                      this.detachVm();
-                      this.canvasTerminal = null;
-                      this.onClose();
-                    })
-                }
-              }
-              .margin({ top: Tokens.space.md })
-            }
+            TerminalCanvas({
+              terminal: this.canvasTerminal,
+              focusId: this.embedPaneId,
+              autoFocus: true,
+              visible: true
+            })
+              .width('100%')
+              .height('100%')
           }
           .width('100%')
           .height('100%')
-          .justifyContent(FlexAlign.Center)
-          .padding({ left: Tokens.space.lg, right: Tokens.space.lg })
-          .backgroundColor(Tokens.Color.appBg)
+          .scale({ x: this.canvasScale, y: this.canvasScale })
+          .rotate({
+            x: 1,
+            y: 0,
+            z: 0,
+            angle: this.canvasRotateXDeg,
+            perspective: Motion.PERSPECTIVE_VP
+          })
+          .opacity(this.canvasOpacity)
+        }
+        if (this.canvasTerminal === null || this.warpingOut) {
+          ServerConnect3DOverlay({
+            overlayKind: this.overlayModel.kind,
+            sessionState: this.sessionState,
+            titleText: this.overlayModel.title.length > 0 ? this.overlayModel.title : '正在准备连接…',
+            detailText: this.overlayModel.detail,
+            warping: this.warpingOut,
+            compact: true,
+            showCancelReconnect: this.overlayModel.showCancelReconnect,
+            showReconnectNow: this.overlayModel.showReconnectNow,
+            showClose: this.overlayModel.showClose,
+            onCancelReconnect: (): void => {
+              const sid: string = this.vm !== null ? this.vm.currentSessionId : '';
+              if (sid.length > 0 && this.vm !== null) {
+                this.vm.cancelAutoReconnectAt(sid);
+              }
+            },
+            onReconnectNow: (): void => {
+              if (this.vm !== null) {
+                const sid: string = this.vm.currentSessionId;
+                if (sid.length > 0) {
+                  this.vm.reconnectNowAt(sid);
+                } else {
+                  this.vm.reconnectNow();
+                }
+              }
+            },
+            onClose: (): void => {
+              this.detachVm();
+              this.canvasTerminal = null;
+              this.onClose();
+            }
+          })
+            .width('100%')
+            .height('100%')
+            .backgroundColor(Tokens.Color.appBg)
+            .hitTestBehavior(this.warpingOut ? HitTestMode.None : HitTestMode.Default)
         }
         if (this.passwordPrompt.visible) {
           this.PasswordPrompt()
@@ -480,7 +502,6 @@ export struct TerminalPaneEmbed {
               .backgroundColor(Tokens.Color.surfaceHover)
               .borderRadius(Tokens.radius.sm)
               .layoutWeight(1)
-              .enabled(!this.passwordPrompt.busy)
               .onClick(() => {
                 this.passwordDraft = '';
                 this.vm?.cancelPasswordPrompt();

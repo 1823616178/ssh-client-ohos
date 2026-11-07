@@ -761,6 +761,10 @@ export class TerminalViewModel {
   private pendingPasswordInitial: boolean = false;
   /** 认证失败后补录对应的已有会话；空串 = 还没有会话，提交后走 connect。 */
   private pendingPasswordSessionId: string = '';
+  /** 密码补录请求序号：用于取消补密时作废在途 connect 请求 */
+  private passwordPromptSeq: number = 0;
+  /** 初次进入未建会话即取消补密：标记为已断开态而非一直连接中 */
+  private cancelledInitial: boolean = false;
   private readonly tabSet: PaneTabSet;
   private readonly elsewhereHook: (sessionId: string, paneId: string) => void;
   /** sessionId → 已 attach 终端（含切换走的会话：换回时复用，画面/回滚保留） */
@@ -769,6 +773,8 @@ export class TerminalViewModel {
   private readonly termTypes: Map<string, string> = new Map();
   /** sessionId → terminalClose 标记 */
   private readonly closedBySession: Map<string, boolean> = new Map();
+  /** sessionId → 用户主动取消密码输入导致断开的标记 */
+  private readonly cancelledBySession: Set<string> = new Set();
   /** sessionId → 最近 OSC 标题（聚焦切换时投影到 terminalTitle，标签副标题也读它） */
   private readonly titleBySession: Map<string, string> = new Map();
   /** sessionId → DECCKM（聚焦投影到 applicationCursorKeys，避免多会话串扰） */
@@ -992,6 +998,9 @@ export class TerminalViewModel {
           this.setPromptError('重试未被受理，请稍后再试');
           return;
         }
+        this.closedBySession.set(existingSessionId, false);
+        this.cancelledBySession.delete(existingSessionId);
+        this.cancelledInitial = false;
         this.pendingPasswordHost = null;
         this.pendingPasswordSessionId = '';
         this.pendingPasswordInitial = false;
@@ -1004,6 +1013,9 @@ export class TerminalViewModel {
           this.setPromptError('重连未被受理，请重试');
           return;
         }
+        this.closedBySession.set(existingSessionId, false);
+        this.cancelledBySession.delete(existingSessionId);
+        this.cancelledInitial = false;
         this.pendingPasswordHost = null;
         this.pendingPasswordSessionId = '';
         this.pendingPasswordInitial = false;
@@ -1012,13 +1024,15 @@ export class TerminalViewModel {
         return;
       }
     }
+    const seq: number = ++this.passwordPromptSeq;
     try {
       const info: TerminalSessionLike = await this.sessionHost().connect(host, password);
-      if (this.disposed) {
+      if (this.disposed || seq !== this.passwordPromptSeq) {
         this.sessionHost().close(info.sessionId);
         return;
       }
       const mode: ConnectionOpenMode = this.pendingPasswordMode;
+      this.cancelledInitial = false;
       this.pendingPasswordHost = null;
       this.pendingPasswordSessionId = '';
       this.pendingPasswordInitial = false;
@@ -1026,25 +1040,43 @@ export class TerminalViewModel {
       Logger.info(`补录密码后连接已受理 state=${info.state}`, LOG_TAG);
       this.placeSession(info, host, mode);
     } catch (err) {
-      this.setPromptError(err instanceof Error ? err.message : '连接发起失败');
+      if (!this.disposed && seq === this.passwordPromptSeq) {
+        this.setPromptError(err instanceof Error ? err.message : '连接发起失败');
+      }
     }
   }
 
-  /** 取消补录：没有可用凭据，落错误蒙层（用户可从蒙层「关闭」退回列表） */
+  /** 取消补录：立即断开在途或待认证连接，并切换到已断开终态 */
   cancelPasswordPrompt(): void {
     if (this.disposed) {
       return;
     }
+    this.passwordPromptSeq++;
     const initial: boolean = this.pendingPasswordInitial;
+    const pendingSessionId: string = this.pendingPasswordSessionId;
+    const targetSessionId: string = pendingSessionId.length > 0
+      ? pendingSessionId
+      : (this.terminal === null ? this.currentSessionId : '');
     this.pendingPasswordHost = null;
     this.pendingPasswordSessionId = '';
     this.pendingPasswordInitial = false;
     this.passwordPrompt = HIDDEN_PASSWORD_PROMPT;
-    if (initial) {
-      this.failStart('未提供登录密码，无法连接');
-    } else {
-      this.refreshViews();
+    if (targetSessionId.length > 0) {
+      // 取消补密 = 放弃这条连接：认证被拒后会话停在 authenticating 等
+      // 「下一次尝试」（native 不落终态），且生产 SessionManager.close 会把会话从表里摘除，
+      // 必须同步登记 closedBySession，否则 getSession 返回 null 会被误判为「正在准备连接」
+      this.closedBySession.set(targetSessionId, true);
+      this.cancelledBySession.add(targetSessionId);
+      this.sessionHost().close(targetSessionId);
+      this.refreshSessionList();
     }
+    if (initial || this.tabSet.tabs.length === 0) {
+      this.cancelledInitial = true;
+      this.refreshOverlay();
+      this.refreshViews();
+      return;
+    }
+    this.refreshViews();
   }
 
   private setPromptError(message: string): void {
@@ -1059,6 +1091,7 @@ export class TerminalViewModel {
 
   private showPasswordPrompt(host: HostProfile, mode: ConnectionOpenMode, initial: boolean,
     sessionId: string, error: string): void {
+    this.cancelledInitial = false;
     this.pendingPasswordHost = host;
     this.pendingPasswordMode = mode;
     this.pendingPasswordInitial = initial;
@@ -1537,6 +1570,12 @@ export class TerminalViewModel {
     if (focused === null || focused.sessionId.length === 0) {
       return 'replace';
     }
+    const info: TerminalSessionLike | null = this.sessionHost().getSession(focused.sessionId);
+    const closed: boolean = info === null || info.state === 'closed' || info.state === 'closing' ||
+      this.closedBySession.get(focused.sessionId) === true;
+    if (closed) {
+      return 'replace';
+    }
     return 'tab';
   }
 
@@ -1862,6 +1901,14 @@ export class TerminalViewModel {
 
   /** 「立即重连」（error 蒙层）：作用于聚焦会话 */
   reconnectNow(): void {
+    if (this.currentSessionId.length === 0 && this.lastHost !== null) {
+      this.cancelledInitial = false;
+      this.startError = '';
+      this.openHostProfile(this.lastHost, 'replace').catch((err: Object) => {
+        Logger.error(`重新连接失败: ${JSON.stringify(err)}`, LOG_TAG);
+      });
+      return;
+    }
     this.reconnectNowAt(this.currentSessionId);
   }
 
@@ -1875,6 +1922,7 @@ export class TerminalViewModel {
     if (this.disposed || sessionId.length === 0) {
       return;
     }
+    this.cancelledBySession.delete(sessionId);
     const info: TerminalSessionLike | null = this.sessionHost().getSession(sessionId);
     if (info !== null && (info.state === 'disconnected' || info.state === 'error')) {
       if (this.sessionHost().reconnectNow(sessionId)) {
@@ -1923,6 +1971,7 @@ export class TerminalViewModel {
       this.attachedTerminals.delete(sessionId);
     }
     this.closedBySession.set(sessionId, false);
+    this.cancelledBySession.delete(sessionId);
     this.titleBySession.delete(sessionId);
     this.appCursorBySession.delete(sessionId);
     this.ensureTerminalAttached(sessionId);
@@ -1975,6 +2024,7 @@ export class TerminalViewModel {
   /** 清掉某会话的全部会话级记账 */
   private forgetSession(sessionId: string): void {
     this.closedBySession.delete(sessionId);
+    this.cancelledBySession.delete(sessionId);
     this.titleBySession.delete(sessionId);
     this.appCursorBySession.delete(sessionId);
     this.bellLimiters.delete(sessionId);
@@ -2095,12 +2145,17 @@ export class TerminalViewModel {
       return;
     }
     this.disposed = true;
+    this.passwordPromptSeq++;
     this.unsubFocus();
     this.unregisterListeners();
     SnippetSendHub.get().unregister(this.snippetHubSender);
     const ended: string[] = [];
+    if (this.pendingPasswordSessionId.length > 0) {
+      ended.push(this.pendingPasswordSessionId);
+    }
     for (const leaf of this.tabSet.allLeaves()) {
-      if (leaf.sessionId.length > 0 && this.closedBySession.get(leaf.sessionId) === true) {
+      if (leaf.sessionId.length > 0 && this.closedBySession.get(leaf.sessionId) === true
+        && ended.indexOf(leaf.sessionId) < 0) {
         ended.push(leaf.sessionId);
       }
     }
@@ -2192,6 +2247,7 @@ export class TerminalViewModel {
       case 'stateChange':
         if (event.to === 'established') {
           this.closedBySession.set(session.sessionId, false);
+          this.cancelledBySession.delete(session.sessionId);
           this.ensureTerminalAttached(session.sessionId);
           if (focused) {
             this.vibrateHook();
@@ -2214,6 +2270,7 @@ export class TerminalViewModel {
         break;
       case 'terminalOpen':
         this.closedBySession.set(session.sessionId, false);
+        this.cancelledBySession.delete(session.sessionId);
         // shell 刚开出来：把该主机的自动执行（tmux 附着 + initCommands）打进去。
         // 每次 terminalOpen 都发一遍是有意的——重连后正是要重新 attach 回原来的 tmux 会话
         this.runAutoCommands(session.sessionId);
@@ -2655,6 +2712,7 @@ export class TerminalViewModel {
           (connectionPicker ? '新连接' : '终端'));
       const endpoint: string = host === null ? '' :
         `${host.username}@${host.host}${host.port === 22 ? '' : `:${host.port}`}`;
+      const closed: boolean = sessionId.length > 0 && this.closedBySession.get(sessionId) === true;
       const item: PaneRenderItem = {
         paneId: rect.paneId,
         sessionId: sessionId,
@@ -2662,7 +2720,7 @@ export class TerminalViewModel {
         hostId: paneHostId,
         hostName: paneHostName,
         endpoint: endpoint,
-        state: info === null ? '' : info.state,
+        state: info !== null ? info.state : (closed ? 'closed' : ''),
         terminal: term,
         overlay: connectionPicker ? NO_OVERLAY : this.overlayForSession(sessionId, term !== null),
         x: rect.x,
@@ -2695,11 +2753,14 @@ export class TerminalViewModel {
     const info: TerminalSessionLike | null =
       sessionId.length > 0 ? this.sessionHost().getSession(sessionId) : null;
     const closed: boolean = sessionId.length > 0 && this.closedBySession.get(sessionId) === true;
+    const cancelled: boolean = sessionId.length > 0 && this.cancelledBySession.has(sessionId);
     return deriveOverlay({
-      state: info === null ? '' : info.state,
+      state: info !== null ? info.state : (closed ? 'closed' : ''),
       reconnectCountdownSec: info === null ? 0 : info.reconnectCountdownSec,
       reconnectAttempt: info === null ? 0 : info.reconnectAttempt,
-      errorMessage: info === null ? '' : info.errorMessage,
+      errorMessage: info !== null && info.errorMessage.length > 0
+        ? info.errorMessage
+        : (cancelled ? '已取消输入密码，连接已断开' : ''),
       hasTerminal: hasTerminal,
       terminalClosed: closed,
       startError: '',
@@ -2710,18 +2771,27 @@ export class TerminalViewModel {
   private refreshOverlay(): void {
     const info: TerminalSessionLike | null =
       this.currentSessionId.length > 0 ? this.sessionHost().getSession(this.currentSessionId) : null;
-    this.sessionState = info === null ? '' : info.state;
-    const closed: boolean = this.currentSessionId.length > 0 &&
-      this.closedBySession.get(this.currentSessionId) === true;
+    const closed: boolean = (this.currentSessionId.length > 0 &&
+      this.closedBySession.get(this.currentSessionId) === true) ||
+      (this.currentSessionId.length === 0 && this.cancelledInitial);
+    const cancelled: boolean = (this.currentSessionId.length > 0 &&
+      this.cancelledBySession.has(this.currentSessionId)) ||
+      (this.currentSessionId.length === 0 && this.cancelledInitial);
+    this.sessionState = info !== null ? info.state : (closed ? 'closed' : '');
+    const canReconnect: boolean = this.currentSessionId.length > 0
+      ? this.canReconnectSession(this.currentSessionId)
+      : (this.cancelledInitial && this.lastHost !== null);
     this.overlay = deriveOverlay({
       state: this.sessionState,
       reconnectCountdownSec: info === null ? 0 : info.reconnectCountdownSec,
       reconnectAttempt: info === null ? 0 : info.reconnectAttempt,
-      errorMessage: info === null ? '' : info.errorMessage,
+      errorMessage: info !== null && info.errorMessage.length > 0
+        ? info.errorMessage
+        : (cancelled ? '已取消输入密码，连接已断开' : ''),
       hasTerminal: this.terminal !== null,
       terminalClosed: closed,
       startError: this.startError,
-      canReconnect: this.canReconnectSession(this.currentSessionId)
+      canReconnect: canReconnect
     });
   }
 

@@ -29,9 +29,41 @@ export class Motion {
   static readonly INTRO_WINDOW_MS: number = 600;
   /** 底部弹层入场位移（vp） */
   static readonly SHEET_OFFSET_VP: number = 24;
+  /** 列表骨架屏呼吸脉冲单程周期（ms） */
+  static readonly SKELETON_PULSE_MS: number = 650;
+  /** 本地列表首屏 / 刷新 / 切 Tab 轻量骨架过渡窗口（ms） */
+  static readonly LOCAL_LOADING_MS: number = 180;
+  /** 服务器连接成功时 3D 空间穿越（Portal Dive）过渡时长（ms） */
+  static readonly WARP_TRANSITION_MS: number = 280;
+  /** 开屏 3D 吉祥物「Astro 星航员」主秀展示时长（ms） */
+  static readonly SPLASH_HOLD_MS: number = 1150;
+  /** 开屏结束 3D 星门冲刺揭幕过渡时长（ms） */
+  static readonly SPLASH_WARP_MS: number = 320;
+  /** ArkUI 3D 旋转透视距离（vp） */
+  static readonly PERSPECTIVE_VP: number = 900;
 
   static duration(ms: number): number {
     return Motion.enabled ? ms : 0;
+  }
+
+  /** 本地列表骨架引导窗时长：总开关关闭时为 0 */
+  static localLoadingDuration(): number {
+    return Motion.enabled ? Motion.LOCAL_LOADING_MS : 0;
+  }
+
+  /** 3D 空间穿越时长：总开关关闭时为 0 */
+  static warpDuration(): number {
+    return Motion.enabled ? Motion.WARP_TRANSITION_MS : 0;
+  }
+
+  /** 开屏主秀时长：总开关关闭时为 0 */
+  static splashHoldDuration(): number {
+    return Motion.enabled ? Motion.SPLASH_HOLD_MS : 0;
+  }
+
+  /** 开屏 3D 跃迁退场时长：总开关关闭时为 0 */
+  static splashWarpDuration(): number {
+    return Motion.enabled ? Motion.SPLASH_WARP_MS : 0;
   }
 
   static stagger(index: number): number {

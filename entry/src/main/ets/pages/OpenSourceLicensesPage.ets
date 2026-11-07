@@ -7,14 +7,43 @@ import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { OPEN_SOURCE_LICENSES, OpenSourceLicenseEntry } from '../common/constants/OpenSourceLicenses';
 import { PageHeader } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 
 @Entry
 @ComponentV2
 struct OpenSourceLicensesPage {
   /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
   @Local private introDone: boolean = !Motion.enabled;
+  @Local private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
+
   aboutToAppear(): void {
     this.openIntroWindow();
+    this.pulseLoading();
+  }
+
+  aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+  }
+
+  private pulseLoading(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    this.loadingTimerId = setTimeout(() => {
+      this.loadingTimerId = -1;
+      this.listLoading = false;
+    }, ms);
   }
 
   /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
@@ -57,30 +86,34 @@ struct OpenSourceLicensesPage {
             .fontSize(Tokens.fontSize.caption)
             .fontColor(Tokens.Color.textDim)
             .margin({ bottom: Tokens.space.sm })
-          ForEach(OPEN_SOURCE_LICENSES, (entry: OpenSourceLicenseEntry, index: number) => {
-            Column() {
-              Text(`${entry.name} ${entry.version}`)
-                .fontSize(Tokens.fontSize.body)
-                .fontWeight(FontWeight.Bold)
-                .fontColor(Tokens.Color.text)
-              Text(entry.license)
-                .fontSize(Tokens.fontSize.caption)
-                .fontColor(Tokens.Color.accent)
-                .margin({ top: Tokens.space.xs2 })
-              Text(entry.usage)
-                .fontSize(Tokens.fontSize.caption)
-                .fontColor(Tokens.Color.textDim)
-                .margin({ top: Tokens.space.xs2 })
-            }
-            .width('100%')
-            .alignItems(HorizontalAlign.Start)
-            .padding(Tokens.space.md)
-            .backgroundColor(Tokens.Color.surface)
-            .borderRadius(Tokens.radius.md)
-            .margin({ bottom: Tokens.space.sm })
-            // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
-            .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
-          }, (entry: OpenSourceLicenseEntry) => entry.name)
+          if (this.listLoading) {
+            ListLoadingSkeleton({ variant: 'card', rows: 5, hint: '正在加载开源许可列表…' })
+          } else {
+            ForEach(OPEN_SOURCE_LICENSES, (entry: OpenSourceLicenseEntry, index: number) => {
+              Column() {
+                Text(`${entry.name} ${entry.version}`)
+                  .fontSize(Tokens.fontSize.body)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(Tokens.Color.text)
+                Text(entry.license)
+                  .fontSize(Tokens.fontSize.caption)
+                  .fontColor(Tokens.Color.accent)
+                  .margin({ top: Tokens.space.xs2 })
+                Text(entry.usage)
+                  .fontSize(Tokens.fontSize.caption)
+                  .fontColor(Tokens.Color.textDim)
+                  .margin({ top: Tokens.space.xs2 })
+              }
+              .width('100%')
+              .alignItems(HorizontalAlign.Start)
+              .padding(Tokens.space.md)
+              .backgroundColor(Tokens.Color.surface)
+              .borderRadius(Tokens.radius.md)
+              .margin({ bottom: Tokens.space.sm })
+              // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+              .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
+            }, (entry: OpenSourceLicenseEntry) => entry.name)
+          }
         }
         .width('100%')
         .padding({ left: Tokens.space.md, right: Tokens.space.md, bottom: Tokens.space.xl })

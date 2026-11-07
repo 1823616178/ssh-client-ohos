@@ -32,6 +32,7 @@ import { pushTerminalPage } from '../common/utils/TerminalNavigation';
 import { AppDatabase } from '../repository/AppDatabase';
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
+import { AstroSplashOverlay } from '../view/AstroSplashOverlay';
 import { TerminalPaneEmbed, embedHostTarget, embedSessionTarget } from '../view/TerminalPaneEmbed';
 import { SnippetSidePanel } from '../view/sidepanel/SnippetSidePanel';
 import { PortForwardSidePanel } from '../view/sidepanel/PortForwardSidePanel';
@@ -40,6 +41,9 @@ import { areaLengthToVp } from '../view/terminal/TerminalLayout';
 import { HostListPage } from './HostListPage';
 
 const LOG_TAG: string = 'Index';
+
+/** 进程级标记：确保 3D 吉祥物开屏动画仅在应用冷启动首次进入首页时播放一次 */
+let splashPlayedInProcess: boolean = false;
 
 @Entry
 @Component
@@ -56,10 +60,21 @@ struct Index {
   @State private selectedHostName: string = '';
   /** U5 lg：右侧可折叠面板是否展开 */
   @State private rightPanelOpen: boolean = true;
-  /** U5 lg：右侧面板当前 tab */
-  @State private rightPanelTab: RightPanelTabId = 'snippets';
+  /** U5 lg：右侧面板当前 tab（默认第一项：文件传输） */
+  @State private rightPanelTab: RightPanelTabId = 'sftp';
   /** 切换服务器时中栏 / 右侧面板内容的入场态（false → true 播放淡入 + 位移） */
   @State private paneEntered: boolean = true;
+  /** 冷启动 3D 吉祥物开屏动画显隐与工作台揭幕缩放 */
+  @State private showSplash: boolean = false;
+  @State private mainWorkspaceScale: number = 1.0;
+
+  aboutToAppear(): void {
+    if (!splashPlayedInProcess && Motion.enabled) {
+      splashPlayedInProcess = true;
+      this.showSplash = true;
+      this.mainWorkspaceScale = 0.95;
+    }
+  }
 
   /** 页面重新显示（含从编辑页/配置管理页返回）：递增 tick 通知主机列表重载 */
   onPageShow(): void {
@@ -213,79 +228,104 @@ struct Index {
   }
 
   build() {
-    Column() {
-      if (!useHostListSidebar(this.breakpoint)) {
-        // sm：单栏，行为与 U5 前一致
-        HostListPage({ refreshTick: this.listRefreshTick })
-          .width('100%')
-          .layoutWeight(1)
-      } else if (!this.regions().rightPanel) {
-        // md：双栏 SideBar（主机树 + 中栏）
-        SideBarContainer(SideBarContainerType.Embed) {
-          HostListPage({
-            refreshTick: this.listRefreshTick,
-            selectedHostId: this.selectedHostId,
-            onOpenHost: (hostId: string): void => {
-              this.onHostSelected(hostId);
-            },
-            onResumeSession: (sessionId: string, hostId: string): void => {
-              this.onSessionSelected(sessionId, hostId);
+    Stack() {
+      Column() {
+        if (!useHostListSidebar(this.breakpoint)) {
+          // sm：单栏，行为与 U5 前一致
+          HostListPage({ refreshTick: this.listRefreshTick })
+            .width('100%')
+            .layoutWeight(1)
+        } else if (!this.regions().rightPanel) {
+          // md：双栏 SideBar（主机树 + 中栏）
+          SideBarContainer(SideBarContainerType.Embed) {
+            HostListPage({
+              refreshTick: this.listRefreshTick,
+              selectedHostId: this.selectedHostId,
+              onOpenHost: (hostId: string): void => {
+                this.onHostSelected(hostId);
+              },
+              onResumeSession: (sessionId: string, hostId: string): void => {
+                this.onSessionSelected(sessionId, hostId);
+              }
+            })
+              .width('100%')
+              .height('100%')
+            Stack() {
+              if (this.isEmptyEmbed()) {
+                this.RightPlaceholder()
+              } else {
+                this.RightContentPane()
+              }
             }
-          })
             .width('100%')
             .height('100%')
-          Stack() {
-            if (this.isEmptyEmbed()) {
-              this.RightPlaceholder()
-            } else {
-              this.RightContentPane()
+            .backgroundColor(Tokens.Color.appBg)
+          }
+          .sideBarWidth(280)
+          .minSideBarWidth(240)
+          .maxSideBarWidth(360)
+          .divider({ strokeWidth: 1, color: Tokens.Color.border })
+        } else {
+          // lg：三栏 —— 主机列表 | 终端嵌入 | 右侧侧面板
+          Row() {
+            HostListPage({
+              refreshTick: this.listRefreshTick,
+              selectedHostId: this.selectedHostId,
+              onOpenHost: (hostId: string): void => {
+                this.onHostSelected(hostId);
+              },
+              onResumeSession: (sessionId: string, hostId: string): void => {
+                this.onSessionSelected(sessionId, hostId);
+              }
+            })
+              .width(280)
+              .height('100%')
+            Column()
+              .width(1)
+              .height('100%')
+              .backgroundColor(Tokens.Color.border)
+            Stack() {
+              if (this.isEmptyEmbed()) {
+                this.RightPlaceholder()
+              } else {
+                this.RightContentPane()
+              }
             }
+            .layoutWeight(1)
+            .height('100%')
+            .backgroundColor(Tokens.Color.appBg)
+            Column()
+              .width(1)
+              .height('100%')
+              .backgroundColor(Tokens.Color.border)
+            this.RightPanelStub()
           }
           .width('100%')
           .height('100%')
-          .backgroundColor(Tokens.Color.appBg)
         }
-        .sideBarWidth(280)
-        .minSideBarWidth(240)
-        .maxSideBarWidth(360)
-        .divider({ strokeWidth: 1, color: Tokens.Color.border })
-      } else {
-        // lg：三栏 —— 主机列表 | 终端嵌入 | 右侧侧面板
-        Row() {
-          HostListPage({
-            refreshTick: this.listRefreshTick,
-            selectedHostId: this.selectedHostId,
-            onOpenHost: (hostId: string): void => {
-              this.onHostSelected(hostId);
-            },
-            onResumeSession: (sessionId: string, hostId: string): void => {
-              this.onSessionSelected(sessionId, hostId);
-            }
-          })
-            .width(280)
-            .height('100%')
-          Column()
-            .width(1)
-            .height('100%')
-            .backgroundColor(Tokens.Color.border)
-          Stack() {
-            if (this.isEmptyEmbed()) {
-              this.RightPlaceholder()
-            } else {
-              this.RightContentPane()
-            }
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(Tokens.Color.appBg)
+      .scale({ x: this.mainWorkspaceScale, y: this.mainWorkspaceScale })
+
+      if (this.showSplash) {
+        AstroSplashOverlay({
+          onWarpStart: (): void => {
+            this.getUIContext().animateTo({
+              duration: Motion.splashWarpDuration(),
+              curve: Curve.FastOutSlowIn
+            }, () => {
+              this.mainWorkspaceScale = 1.0;
+            });
+          },
+          onFinished: (): void => {
+            this.mainWorkspaceScale = 1.0;
+            this.showSplash = false;
           }
-          .layoutWeight(1)
+        })
+          .width('100%')
           .height('100%')
-          .backgroundColor(Tokens.Color.appBg)
-          Column()
-            .width(1)
-            .height('100%')
-            .backgroundColor(Tokens.Color.border)
-          this.RightPanelStub()
-        }
-        .width('100%')
-        .height('100%')
       }
     }
     .width('100%')

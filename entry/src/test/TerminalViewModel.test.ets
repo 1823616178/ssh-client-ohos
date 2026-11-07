@@ -134,6 +134,7 @@ class FakeSessionHost implements TerminalSessionHostLike {
   reconnectPasswords: (string | undefined)[] = [];
   reconnectAccepted: boolean = true;
   credentialMissing: boolean = false;
+  deleteOnClose: boolean = false;
   cancelLog: string[] = [];
   connectError: Error | null = null;
   private idSeq: number = 0;
@@ -183,6 +184,9 @@ class FakeSessionHost implements TerminalSessionHostLike {
     const info: FakeSessionInfo | undefined = this.byId.get(sessionId);
     if (info !== undefined) {
       info.state = 'closed';
+    }
+    if (this.deleteOnClose) {
+      this.byId.delete(sessionId);
     }
   }
 
@@ -1292,6 +1296,51 @@ export default function terminalViewModelTest() {
       await env.vm.submitPassword('duplicate');
       expect(env.host.reconnectNowLog.length).assertEqual(1);
       expect(env.host.connectCalls.length).assertEqual(1);
+    });
+
+    it('取消补密_已有会话直接断开不再僵尸挂起', 0, async () => {
+      const env: TestEnv = new TestEnv();
+      env.dao.put(sampleHost('h1'));
+      env.host.deleteOnClose = true; // 模拟生产 SessionManager.close 摘表（getSession 返回 null）
+      await env.vm.start({ hostId: 'h1', sessionId: '' });
+      const sid: string = env.vm.currentSessionId;
+      env.host.emit(sid, {
+        type: 'authResult',
+        method: 'password',
+        success: false,
+        error: 'auth_failed_password'
+      });
+      expect(env.vm.passwordPrompt.visible).assertTrue();
+      const closeCountBefore: number = env.host.ops.filter((op: string) => op.startsWith('close:')).length;
+      env.vm.cancelPasswordPrompt();
+      expect(env.vm.passwordPrompt.visible).assertFalse();
+      // 取消 = 放弃连接：会话被关闭且立即进入 closed 终态，不会停在 connecting/authenticating
+      expect(env.host.ops.filter((op: string) => op.startsWith('close:')).length)
+        .assertEqual(closeCountBefore + 1);
+      expect(env.host.getSession(sid)).assertNull();
+      expect(env.vm.sessionState).assertEqual('closed');
+      expect(env.vm.overlay.kind).assertEqual('closed');
+      expect(env.vm.overlay.detail).assertEqual('已取消输入密码，连接已断开');
+      expect(env.vm.visiblePanes.length).assertEqual(1);
+      expect(env.vm.visiblePanes[0].state).assertEqual('closed');
+      expect(env.vm.visiblePanes[0].overlay.kind).assertEqual('closed');
+
+      // 初次进入缺凭据（尚无会话）取消补密，且在途提交返回后立即断开
+      const env2: TestEnv = new TestEnv();
+      env2.dao.put(sampleHost('h2'));
+      env2.host.credentialMissing = true;
+      await env2.vm.start({ hostId: 'h2', sessionId: '' });
+      expect(env2.vm.passwordPrompt.visible).assertTrue();
+      const pendingSubmit: Promise<void> = env2.vm.submitPassword('late-pass');
+      env2.vm.cancelPasswordPrompt();
+      expect(env2.vm.passwordPrompt.visible).assertFalse();
+      expect(env2.vm.sessionState).assertEqual('closed');
+      expect(env2.vm.overlay.kind).assertEqual('closed');
+      expect(env2.vm.overlay.detail).assertEqual('已取消输入密码，连接已断开');
+      expect(env2.vm.overlay.showReconnectNow).assertTrue();
+      await pendingSubmit;
+      expect(env2.host.ops.indexOf('close:s-new-1') >= 0).assertTrue();
+      expect(env2.vm.currentSessionId).assertEqual('');
     });
 
     it('缺凭据补录_原样透传密码发起新连接_空密码与重复提交不拨号', 0, async () => {

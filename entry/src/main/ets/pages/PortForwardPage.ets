@@ -11,6 +11,7 @@
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { Logger } from '../common/utils/Logger';
 import { PortForwardRule } from '../common/model/models';
 import { AppDatabase } from '../repository/AppDatabase';
@@ -103,6 +104,8 @@ interface ForwardRouteParams {
 struct PortForwardPage {
   /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
   @State private introDone: boolean = !Motion.enabled;
+  @State private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   @State rows: PortForwardRow[] = [];
   @State logs: ForwardRuntimeLog[] = [];
   @State error: string = '';
@@ -130,9 +133,31 @@ struct PortForwardPage {
     SessionManager.get().addEventListener(this.onSessionEvent);
     this.listenerBound = true;
     this.sync();
+    this.pulseLoading();
+  }
+
+  private pulseLoading(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    this.loadingTimerId = setTimeout(() => {
+      this.loadingTimerId = -1;
+      this.listLoading = false;
+    }, ms);
   }
 
   aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
     if (this.listenerBound) {
       SessionManager.get().removeEventListener(this.onSessionEvent);
       this.listenerBound = false;
@@ -289,7 +314,11 @@ struct PortForwardPage {
           .width('100%')
       }
 
-      if (this.rows.length === 0) {
+      if (this.listLoading) {
+        ListLoadingSkeleton({ variant: 'card', rows: 3, hint: '正在加载转发规则…' })
+          .layoutWeight(1)
+          .margin({ top: Tokens.space.sm })
+      } else if (this.rows.length === 0) {
         Text('暂无转发规则。请先在主机编辑页添加。')
           .fontSize(Tokens.fontSize.body)
           .fontColor(Tokens.Color.textFaint)

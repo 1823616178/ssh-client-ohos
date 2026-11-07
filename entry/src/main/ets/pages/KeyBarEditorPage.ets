@@ -13,6 +13,7 @@ import { SettingsRepository } from '../repository/SettingsRepository';
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { PageHeader } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { accessibilityNameOf } from '../view/KeyBar';
 import {
   DEFAULT_KEY_BAR_LAYOUT,
@@ -48,6 +49,8 @@ struct KeyBarEditorPage {
   @State private dirty: boolean = false;
   @State private customChar: string = '';
   @State private message: string = '';
+  @State private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
 
   aboutToAppear(): void {
     let json: string = '';
@@ -57,6 +60,31 @@ struct KeyBarEditorPage {
       Logger.warn(`键条布局读取失败，使用默认：${JSON.stringify(err)}`, LOG_TAG);
     }
     this.keys = parseKeyBarLayout(json).slice();
+    this.pulseLoading();
+  }
+
+  aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+  }
+
+  private pulseLoading(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    this.loadingTimerId = setTimeout(() => {
+      this.loadingTimerId = -1;
+      this.listLoading = false;
+    }, ms);
   }
 
   onBackPress(): boolean {
@@ -251,14 +279,18 @@ struct KeyBarEditorPage {
   @Builder
   CurrentKeys() {
     this.SectionTitle(`当前按键（${this.keys.length}）`, '自左向右的顺序；至少保留一个键')
-    Column() {
-      ForEach(this.keys, (spec: KeyBarKeySpec, index: number) => {
-        this.EditorRow({ spec: spec, index: index })
-      }, (spec: KeyBarKeySpec, index: number) => `${spec.id}|${index}|${this.keys.length}`)
+    if (this.listLoading) {
+      ListLoadingSkeleton({ variant: 'compact', rows: 5, hint: '正在加载按键布局…' })
+    } else {
+      Column() {
+        ForEach(this.keys, (spec: KeyBarKeySpec, index: number) => {
+          this.EditorRow({ spec: spec, index: index })
+        }, (spec: KeyBarKeySpec, index: number) => `${spec.id}|${index}|${this.keys.length}`)
+      }
+      .width('100%')
+      .backgroundColor(Tokens.Color.surface)
+      .borderRadius(Tokens.radius.md)
     }
-    .width('100%')
-    .backgroundColor(Tokens.Color.surface)
-    .borderRadius(Tokens.radius.md)
   }
 
   @Builder

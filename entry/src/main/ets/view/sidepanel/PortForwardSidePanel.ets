@@ -1,6 +1,7 @@
 import { util } from '@kit.ArkTS';
 import { Tokens } from '../../theme/Tokens';
 import { Motion } from '../../theme/Motion';
+import { ListLoadingSkeleton } from '../ListLoadingSkeleton';
 import { PortForwardRule, PortForwardType } from '../../common/model/models';
 import { AppDatabase } from '../../repository/AppDatabase';
 import { SessionInfo, SessionManager } from '../../service/SessionManager';
@@ -100,6 +101,8 @@ export struct PortForwardSidePanel {
   onOpenFullPage: () => void = () => {};
 
   @State private rows: PortForwardRow[] = [];
+  @State private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   @State private sessionId: string = '';
   @State private sessionActive: boolean = false;
   @State private showAddForm: boolean = false;
@@ -122,6 +125,10 @@ export struct PortForwardSidePanel {
   }
 
   aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
     if (this.listenerBound) {
       SessionManager.get().removeEventListener(this.onSessionEvent);
       this.listenerBound = false;
@@ -140,6 +147,23 @@ export struct PortForwardSidePanel {
     }
     this.bindNativeSession();
     this.sync();
+    this.pulseLoading();
+  }
+
+  private pulseLoading(): void {
+    const dur: number = Motion.localLoadingDuration();
+    if (dur <= 0 || this.rows.length === 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+    }
+    this.loadingTimerId = setTimeout(() => {
+      this.listLoading = false;
+      this.loadingTimerId = -1;
+    }, dur);
   }
 
   private bindNativeSession(): void {
@@ -406,7 +430,14 @@ export struct PortForwardSidePanel {
       }
 
       // 规则列表
-      if (this.rows.length === 0) {
+      if (this.listLoading && this.rows.length > 0) {
+        Column() {
+          ListLoadingSkeleton({ variant: 'compact', rows: 3, hint: '正在加载转发规则…' })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: Tokens.space.sm, right: Tokens.space.sm, top: Tokens.space.xs })
+      } else if (this.rows.length === 0) {
         Column() {
           Text('暂无端口转发规则')
             .fontSize(Tokens.fontSize.caption)

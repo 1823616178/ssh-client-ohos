@@ -62,6 +62,8 @@ import { ColorPickerSheet } from '../view/ColorPickerSheet';
 import { KeyBar, keyFaceOverlayForBackground } from '../view/KeyBar';
 import { TerminalActionHub, TerminalClipboardAction } from '../view/terminal/TerminalActionHub';
 import { TerminalCanvas } from '../view/TerminalCanvas';
+import { ServerConnect3DOverlay } from '../view/ServerConnect3DOverlay';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { SftpSidePanel } from '../view/sidepanel/SftpSidePanel';
 import { FrameScheduler } from '../view/FrameScheduler';
 import { FocusManager } from '../view/terminal/FocusManager';
@@ -316,6 +318,9 @@ interface StatusOverlayParams {
   model: OverlayModel;
   sessionId: string;
   paneId: string;
+  state?: string;
+  warping?: boolean;
+  compact?: boolean;
 }
 
 interface SessionRowParams {
@@ -411,6 +416,15 @@ struct TerminalPage {
   @State private paneMenuVisible: boolean = false;
   @State private sessions: TerminalSessionLike[] = [];
   @State private savedHosts: HostProfile[] = [];
+  /** 连接选择列表（内嵌选择器 / 侧栏）骨架屏加载引导态 */
+  @State private connectionsLoading: boolean = false;
+  /** 正在执行 3D 空间穿越（Portal Dive）入场的窗格 id */
+  @State private warpingPaneId: string = '';
+  @State private warpCanvasScale: number = 1.0;
+  @State private warpCanvasRotateXDeg: number = 0;
+  @State private warpCanvasOpacity: number = 1.0;
+  private warpTimerId: number = -1;
+  private connLoadTimerId: number = -1;
   /** 右侧「选择连接」抽屉的搜索草稿；只过滤本面板列表。 */
   @State private connectionSearchText: string = '';
   @State private hostName: string = '';
@@ -663,6 +677,11 @@ struct TerminalPage {
    * 主机列表可恢复。返回 true 表示已自行处理（不再走默认 router.back）。
    */
   onBackPress(): boolean {
+    if (this.passwordPrompt.visible) {
+      this.passwordDraft = '';
+      this.vm.cancelPasswordPrompt();
+      return true;
+    }
     if (this.colorPickerVisible) {
       this.onColorPickerCancel();
       return true;
@@ -812,6 +831,16 @@ struct TerminalPage {
   }
 
   aboutToDisappear(): void {
+    if (this.warpTimerId !== -1) {
+      clearTimeout(this.warpTimerId);
+      this.warpTimerId = -1;
+    }
+    if (this.connLoadTimerId !== -1) {
+      clearTimeout(this.connLoadTimerId);
+      this.connLoadTimerId = -1;
+    }
+    this.warpingPaneId = '';
+    this.connectionsLoading = false;
     this.terminalPageVisible = false;
     ScreenAwake.forWindow(this.windowKey).setTerminalVisible(false);
     this.colorPickerVisible = false;
@@ -837,8 +866,26 @@ struct TerminalPage {
    * 故直接赋值即可让 @State 判定变更并驱动对应元素重绘。
    */
   private syncFromVm(): void {
+    const prevPanes: PaneRenderItem[] = this.panes;
+    const nextPanes: PaneRenderItem[] = this.vm.visiblePanes;
+    if (Motion.enabled) {
+      for (let i = 0; i < nextPanes.length; i++) {
+        const nextItem: PaneRenderItem = nextPanes[i];
+        if (nextItem.terminal !== null && nextItem.overlay.kind === 'none') {
+          for (let j = 0; j < prevPanes.length; j++) {
+            const prevItem: PaneRenderItem = prevPanes[j];
+            if (prevItem.paneId === nextItem.paneId &&
+              prevItem.terminal === null &&
+              prevItem.overlay.kind !== 'none') {
+              this.triggerPanePortalDive(nextItem.paneId);
+              break;
+            }
+          }
+        }
+      }
+    }
     this.overlayModel = this.vm.overlay;
-    this.panes = this.vm.visiblePanes;
+    this.panes = nextPanes;
     this.dividerRects = this.vm.dividers;
     this.tabItems = this.vm.tabs;
     this.sessions = this.vm.sessionList;
@@ -850,6 +897,46 @@ struct TerminalPage {
     this.breakpoint = this.vm.breakpoint;
     this.passwordPrompt = this.vm.passwordPrompt;
     this.syncTerminalChromeColor();
+  }
+
+  /** 连接成功瞬间：触发 3D 空间穿越（Astro 星环前冲消散 + 终端画布自 3D 远端拉近展开） */
+  private triggerPanePortalDive(paneId: string): void {
+    if (this.warpTimerId !== -1) {
+      clearTimeout(this.warpTimerId);
+    }
+    this.warpingPaneId = paneId;
+    this.warpCanvasScale = 0.92;
+    this.warpCanvasRotateXDeg = 8;
+    this.warpCanvasOpacity = 0.25;
+    this.getUIContext().animateTo({
+      duration: Motion.warpDuration(),
+      curve: Curve.FastOutSlowIn
+    }, () => {
+      this.warpCanvasScale = 1.0;
+      this.warpCanvasRotateXDeg = 0;
+      this.warpCanvasOpacity = 1.0;
+    });
+    this.warpTimerId = setTimeout(() => {
+      this.warpingPaneId = '';
+      this.warpTimerId = -1;
+    }, Motion.warpDuration());
+  }
+
+  /** 打开连接选择器 / 抽屉时触发轻量脉冲骨架屏引导 */
+  private pulseConnectionsLoading(): void {
+    const dur: number = Motion.localLoadingDuration();
+    if (dur <= 0) {
+      this.connectionsLoading = false;
+      return;
+    }
+    if (this.connLoadTimerId !== -1) {
+      clearTimeout(this.connLoadTimerId);
+    }
+    this.connectionsLoading = true;
+    this.connLoadTimerId = setTimeout(() => {
+      this.connectionsLoading = false;
+      this.connLoadTimerId = -1;
+    }, dur);
   }
 
   /** 提交补录密码：提交后立刻清掉草稿，明文不在页面状态里多留一刻 */
@@ -981,6 +1068,7 @@ struct TerminalPage {
     this.connectionOpenMode = mode;
     this.connectionSearchText = '';
     this.vm.reloadConnections();
+    this.pulseConnectionsLoading();
     this.showSideBar = true;
   }
 
@@ -2201,6 +2289,7 @@ struct TerminalPage {
         .clickEffect(Motion.pressEffect())
         .onClick(() => {
           this.closeSidePanel();
+          this.pulseConnectionsLoading();
           this.vm.openConnectionTab();
         })
       Row() {
@@ -2465,7 +2554,9 @@ struct TerminalPage {
             .width('100%')
             .margin({ bottom: Tokens.space.xs })
 
-          if (this.savedHosts.length === 0) {
+          if (this.connectionsLoading) {
+            ListLoadingSkeleton({ variant: 'compact', rows: 4, hint: '正在加载已保存连接…' })
+          } else if (this.savedHosts.length === 0) {
             Column() {
               Text('还没有保存的服务器')
                 .fontSize(Tokens.fontSize.body)
@@ -2690,27 +2781,43 @@ struct TerminalPage {
   @Builder
   PaneCanvasBody($$: PaneSlotParams) {
     Stack() {
-      TerminalCanvas({
-        terminal: this.canvasTerminalOf($$.item),
-        appearance: this.appearanceForHost($$.item.hostId),
-        stickyModifiers: this.stickyModifiers,
-        hapticEnabled: this.hapticEnabled,
-        focusId: $$.item.paneId,
-        autoFocus: $$.item.focused,
-        visible: this.pageVisible,
-        autoResizeTerminal: !this.dividerDragging,
-        shortcutBindingsJson: this.shortcutBindingsJson,
-        // T10 DECCKM：会话级应用光标键标志（native 未暴露前恒 false）
-        applicationCursorKeys: this.vm.applicationCursorKeys,
-        onFontSizeCommit: (fontSize: number): void => {
-          this.onPaneFontSizeCommit($$.item.hostId, fontSize);
-        },
-        onAppShortcut: (action: ShortcutAction): boolean => {
-          const handled: boolean = this.vm.handleShortcut(action);
-          this.exitIfEmpty();
-          return handled;
-        }
+      Column() {
+        TerminalCanvas({
+          terminal: this.canvasTerminalOf($$.item),
+          appearance: this.appearanceForHost($$.item.hostId),
+          stickyModifiers: this.stickyModifiers,
+          hapticEnabled: this.hapticEnabled,
+          focusId: $$.item.paneId,
+          autoFocus: $$.item.focused,
+          visible: this.pageVisible,
+          autoResizeTerminal: !this.dividerDragging,
+          shortcutBindingsJson: this.shortcutBindingsJson,
+          // T10 DECCKM：会话级应用光标键标志（native 未暴露前恒 false）
+          applicationCursorKeys: this.vm.applicationCursorKeys,
+          onFontSizeCommit: (fontSize: number): void => {
+            this.onPaneFontSizeCommit($$.item.hostId, fontSize);
+          },
+          onAppShortcut: (action: ShortcutAction): boolean => {
+            const handled: boolean = this.vm.handleShortcut(action);
+            this.exitIfEmpty();
+            return handled;
+          }
+        })
+      }
+      .width('100%')
+      .height('100%')
+      .scale({
+        x: this.warpingPaneId === $$.item.paneId ? this.warpCanvasScale : 1.0,
+        y: this.warpingPaneId === $$.item.paneId ? this.warpCanvasScale : 1.0
       })
+      .rotate({
+        x: 1,
+        y: 0,
+        z: 0,
+        angle: this.warpingPaneId === $$.item.paneId ? this.warpCanvasRotateXDeg : 0,
+        perspective: Motion.PERSPECTIVE_VP
+      })
+      .opacity(this.warpingPaneId === $$.item.paneId ? this.warpCanvasOpacity : 1.0)
 
       if ($$.item.overlay.dimmed) {
         // 置灰层不参与命中：横幅模式下画面仍可滚动 / 选择 / 复制
@@ -2729,11 +2836,14 @@ struct TerminalPage {
           sessionId: $$.item.sessionId,
           paneId: $$.item.paneId
         })
-      } else if ($$.item.overlay.kind !== 'none') {
+      } else if ($$.item.overlay.kind !== 'none' || this.warpingPaneId === $$.item.paneId) {
         this.StatusOverlay({
           model: $$.item.overlay,
           sessionId: $$.item.sessionId,
-          paneId: $$.item.paneId
+          paneId: $$.item.paneId,
+          state: $$.item.state,
+          warping: this.warpingPaneId === $$.item.paneId,
+          compact: this.panes.length > 1 || ($$.item.w > 0 && $$.item.w < 380)
         })
       }
     }
@@ -2854,7 +2964,6 @@ struct TerminalPage {
             .backgroundColor(Tokens.Color.surfaceHover)
             .borderRadius(Tokens.radius.sm)
             .layoutWeight(1)
-            .enabled(!this.passwordPrompt.busy)
             .onClick(() => {
               this.passwordDraft = '';
               this.vm.cancelPasswordPrompt();
@@ -2994,76 +3103,46 @@ struct TerminalPage {
   @Builder
   StatusOverlay($$: StatusOverlayParams) {
     Column() {
-      if ($$.model.kind === 'connecting' || $$.model.kind === 'reconnecting') {
-        LoadingProgress()
-          .width(LOADING_SIZE_VP)
-          .height(LOADING_SIZE_VP)
-          .color(Tokens.Color.accent)
-      }
-      Text($$.model.title)
-        .fontSize(Tokens.fontSize.title)
-        .fontColor(this.chromeText())
-        .margin({ top: Tokens.space.md })
-      if ($$.model.detail.length > 0) {
-        Text($$.model.detail)
-          .fontSize(Tokens.fontSize.body)
-          .fontColor(this.chromeTextDim())
-          .textAlign(TextAlign.Center)
-          .margin({ top: Tokens.space.xs })
-      }
-      Row() {
-        if ($$.model.showCancelReconnect) {
-          Button('取消重连')
-            .fontSize(Tokens.fontSize.body)
-            .fontColor(Tokens.Color.text)
-            .backgroundColor(Tokens.Color.surfaceHover)
-            .borderRadius(Tokens.radius.sm)
-            .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
-            .onClick(() => {
-              if ($$.sessionId.length > 0) {
-                this.vm.cancelAutoReconnectAt($$.sessionId);
-              } else {
-                this.vm.cancelAutoReconnect();
-              }
-            })
+      ServerConnect3DOverlay({
+        overlayKind: $$.model.kind,
+        sessionState: $$.state ?? this.sessionState,
+        titleText: $$.model.title.length > 0 ? $$.model.title : '正在连接…',
+        detailText: $$.model.detail,
+        warping: $$.warping === true,
+        compact: $$.compact === true,
+        showCancelReconnect: $$.model.showCancelReconnect,
+        showReconnectNow: $$.model.showReconnectNow,
+        showClose: $$.model.showClose,
+        onCancelReconnect: (): void => {
+          if ($$.sessionId.length > 0) {
+            this.vm.cancelAutoReconnectAt($$.sessionId);
+          } else {
+            this.vm.cancelAutoReconnect();
+          }
+        },
+        onReconnectNow: (): void => {
+          if ($$.sessionId.length > 0) {
+            this.vm.reconnectNowAt($$.sessionId);
+          } else {
+            this.vm.reconnectNow();
+          }
+        },
+        onClose: (): void => {
+          if ($$.paneId.length > 0) {
+            this.onPaneClose($$.paneId);
+          } else {
+            this.onBack();
+          }
         }
-        if ($$.model.showReconnectNow) {
-          Button($$.model.kind === 'closed' ? '重新连接' : '立即重连')
-            .fontSize(Tokens.fontSize.body)
-            .fontColor(Tokens.Color.onAccent)
-            .backgroundColor(Tokens.Color.accent)
-            .borderRadius(Tokens.radius.sm)
-            .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
-            .onClick(() => {
-              if ($$.sessionId.length > 0) {
-                this.vm.reconnectNowAt($$.sessionId);
-              } else {
-                this.vm.reconnectNow();
-              }
-            })
-        }
-        if ($$.model.showClose) {
-          Button('关闭')
-            .fontSize(Tokens.fontSize.body)
-            .fontColor(Tokens.Color.text)
-            .backgroundColor(Tokens.Color.surfaceHover)
-            .borderRadius(Tokens.radius.sm)
-            .margin({ left: Tokens.space.xs, right: Tokens.space.xs })
-            .onClick(() => {
-              if ($$.paneId.length > 0) {
-                this.onPaneClose($$.paneId);
-              } else {
-                this.onBack();
-              }
-            })
-        }
-      }
-      .margin({ top: Tokens.space.lg })
+      })
+        .width('100%')
+        .height('100%')
     }
     .width('100%')
     .height('100%')
     .justifyContent(FlexAlign.Center)
-    .padding(Tokens.space.lg)
+    .alignItems(HorizontalAlign.Center)
+    .hitTestBehavior($$.warping === true ? HitTestMode.None : HitTestMode.Default)
     .transition(Motion.fadeTransition())
   }
 
@@ -3224,7 +3303,9 @@ struct TerminalPage {
           .width('100%')
           .margin({ top: Tokens.space.md, bottom: Tokens.space.xs })
 
-          if (this.filteredSavedHosts().length === 0) {
+          if (this.connectionsLoading) {
+            ListLoadingSkeleton({ variant: 'compact', rows: 4, hint: '正在加载连接列表…' })
+          } else if (this.filteredSavedHosts().length === 0) {
             Text(this.connectionSearchText.trim().length > 0 ? '没有匹配的已保存连接' : '暂无已保存连接')
               .fontSize(Tokens.fontSize.body)
               .fontColor(Tokens.Color.textFaint)

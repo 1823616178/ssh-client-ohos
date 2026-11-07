@@ -23,6 +23,7 @@ import { SessionEventListener, SessionInfo, SessionManager } from '../service/Se
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { StatusDot } from '../view/StatusDot';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { SyncRuntime } from '../service/sync/SyncRuntime';
 import {
   focusWindowOfSession,
@@ -111,6 +112,9 @@ export struct HostListPage {
   @Prop selectedHostId: string = '';
   /** 首屏入场：false → true 时列表行按序淡入上移、空状态淡入 */
   @State private listRevealed: boolean = false;
+  /** 列表加载脉冲骨架态（首屏 / 重载） */
+  @State private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   /** 正在按压的主机行（按压缩放反馈） */
   @State private pressedRowId: string = '';
   /** 长按菜单：目标行与可见性（LongPressGesture 驱动 bindPopup） */
@@ -143,8 +147,10 @@ export struct HostListPage {
       }
     };
 
-  /** 会话增删（连接受理 / 关闭）→ 刷新活动会话 */
+  /** 会话增删（连接受理 / 关闭）→ 同步刷新主机状态点、行与活动会话 */
   private readonly sessionCountListener = (): void => {
+    this.refreshConnStatus();
+    this.reloadRows();
     this.refreshActiveSessions();
   };
 
@@ -165,15 +171,26 @@ export struct HostListPage {
     this.revealList();
   }
 
-  /** 首屏入场：下一帧把 listRevealed 置 true，行 / 空状态的隐式 .animation 接管过渡 */
+  /** 首屏入场：先展示轻量脉冲骨架引导，随后把 listRevealed 置 true 触发列表交错入场 */
   private revealList(): void {
-    if (!Motion.enabled) {
+    const dur: number = Motion.localLoadingDuration();
+    if (dur <= 0 || this.viewModel.hosts.length === 0) {
+      this.listLoading = false;
       this.listRevealed = true;
       return;
     }
-    setTimeout(() => {
-      this.listRevealed = true;
-    }, 16);
+    this.listLoading = true;
+    this.listRevealed = false;
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+    }
+    this.loadingTimerId = setTimeout(() => {
+      this.listLoading = false;
+      this.loadingTimerId = -1;
+      setTimeout(() => {
+        this.listRevealed = true;
+      }, 16);
+    }, dur);
   }
 
   private async refreshSyncChipAfterHydrate(): Promise<void> {
@@ -182,6 +199,10 @@ export struct HostListPage {
   }
 
   aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
     SessionManager.get().removeEventListener(this.sessionListener);
     SessionManager.get().removeSessionCountListener(this.sessionCountListener);
   }
@@ -559,8 +580,15 @@ export struct HostListPage {
       // 快速直连：空列表完整展示；有主机时默认收起为轻量入口
       this.QuickConnectSection()
 
-      // 列表区：空状态 / 搜索无结果 / 分组懒加载列表
-      if (this.viewModel.hosts.length === 0) {
+      // 列表区：加载脉冲骨架 / 空状态 / 搜索无结果 / 分组懒加载列表
+      if (this.listLoading && this.viewModel.hosts.length > 0) {
+        Column() {
+          ListLoadingSkeleton({ variant: 'card', rows: 4, hint: '正在加载主机列表…' })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .margin({ top: Tokens.space.xs })
+      } else if (this.viewModel.hosts.length === 0) {
         this.EmptyState()
       } else if (this.dataSource.totalCount() === 0) {
         Column() {

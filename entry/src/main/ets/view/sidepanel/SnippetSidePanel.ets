@@ -2,6 +2,7 @@ import { util } from '@kit.ArkTS';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { Tokens } from '../../theme/Tokens';
 import { Motion } from '../../theme/Motion';
+import { ListLoadingSkeleton } from '../ListLoadingSkeleton';
 import { Snippet } from '../../common/model/models';
 import { AppDatabase } from '../../repository/AppDatabase';
 import { SnippetSendHub } from '../terminal/SnippetSendHub';
@@ -16,6 +17,8 @@ export struct SnippetSidePanel {
   onOpenFullPage: () => void = () => {};
 
   @State private snippets: Snippet[] = [];
+  @State private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   @State private searchText: string = '';
   @State private showAddForm: boolean = false;
   @State private newName: string = '';
@@ -24,6 +27,30 @@ export struct SnippetSidePanel {
   aboutToAppear(): void {
     this.openIntroWindow();
     this.reloadSnippets();
+    this.pulseLoading();
+  }
+
+  aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+  }
+
+  private pulseLoading(): void {
+    const dur: number = Motion.localLoadingDuration();
+    if (dur <= 0 || this.snippets.length === 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+    }
+    this.loadingTimerId = setTimeout(() => {
+      this.listLoading = false;
+      this.loadingTimerId = -1;
+    }, dur);
   }
 
   private reloadSnippets(): void {
@@ -200,7 +227,14 @@ export struct SnippetSidePanel {
       }
 
       // 片段列表
-      if (this.filteredSnippets().length === 0) {
+      if (this.listLoading && this.snippets.length > 0) {
+        Column() {
+          ListLoadingSkeleton({ variant: 'compact', rows: 4, hint: '正在加载命令片段…' })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: Tokens.space.sm, right: Tokens.space.sm, top: Tokens.space.xs })
+      } else if (this.filteredSnippets().length === 0) {
         Column() {
           Text(this.searchText.trim().length > 0 ? '没有匹配的命令片段' : '暂无命令片段，点上方添加')
             .fontSize(Tokens.fontSize.caption)

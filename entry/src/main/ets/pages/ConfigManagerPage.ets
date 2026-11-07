@@ -23,6 +23,7 @@ import {
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { ConfigManagerViewModel, ConfigTabType } from '../viewmodel/ConfigManagerViewModel';
 import { Logger } from '../common/utils/Logger';
 import { previewSnippet, snippetVarsOf } from '../common/utils/SnippetVars';
@@ -42,6 +43,8 @@ const ACTION_BTN_HEIGHT_VP: number = 32;
 struct ConfigManagerPage {
   /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
   @Local private introDone: boolean = !Motion.enabled;
+  @Local private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   private readonly vm: ConfigManagerViewModel = new ConfigManagerViewModel();
   @Local private newGroupName: string = '';
   @Local private showAddGroupDialog: boolean = false;
@@ -56,6 +59,35 @@ struct ConfigManagerPage {
   aboutToAppear(): void {
     this.openIntroWindow();
     this.vm.reload();
+    this.pulseLoading();
+  }
+
+  aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+  }
+
+  private pulseLoading(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    this.introDone = false;
+    this.loadingTimerId = setTimeout(() => {
+      this.loadingTimerId = -1;
+      this.listLoading = false;
+      setTimeout(() => {
+        this.introDone = true;
+      }, Motion.INTRO_WINDOW_MS);
+    }, ms);
   }
 
   private toast(message: string): void {
@@ -94,6 +126,7 @@ struct ConfigManagerPage {
         label: '刷新',
         onClick: (): void => {
           this.vm.reload();
+          this.pulseLoading();
           this.toast('配置数据已刷新');
         }
       }
@@ -189,7 +222,9 @@ struct ConfigManagerPage {
       // 内容列表区
       Scroll() {
         Column() {
-          if (this.vm.currentTab === 'hosts') {
+          if (this.listLoading) {
+            ListLoadingSkeleton({ variant: 'card', rows: 4, hint: '正在加载配置列表…' })
+          } else if (this.vm.currentTab === 'hosts') {
             this.HostsSection()
           } else if (this.vm.currentTab === 'groups') {
             this.GroupsSection()
@@ -237,7 +272,10 @@ struct ConfigManagerPage {
     .animation(Motion.colorAnim()) // 选中态颜色过渡
     .clickEffect(Motion.pressEffect())
     .onClick(() => {
-      this.vm.setTab(tab);
+      if (this.vm.currentTab !== tab) {
+        this.vm.setTab(tab);
+        this.pulseLoading();
+      }
     })
   }
 

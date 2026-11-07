@@ -8,6 +8,7 @@
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { PageHeader } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { DeviceItem } from '../service/sync/ApiTypes';
 import { RevisionItem } from '../service/sync/ApiTypes';
 import { SyncConflict } from '../service/sync/SyncMerge';
@@ -26,6 +27,8 @@ struct AccountSyncPage {
   /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
   @Local private introDone: boolean = !Motion.enabled;
   @Local private isSyncing: boolean = false;
+  @Local private hydrating: boolean = Motion.enabled;
+  private hydrateTimerId: number = -1;
   private readonly vm: AccountSyncViewModel = SyncRuntime.get().createViewModel();
 
   /** VM 的 async 方法内部已把异常收敛为 errorText，这里只兜底防止未处理拒绝 */
@@ -50,9 +53,25 @@ struct AccountSyncPage {
     void this.refreshAfterHydrate();
   }
 
+  aboutToDisappear(): void {
+    if (this.hydrateTimerId !== -1) {
+      clearTimeout(this.hydrateTimerId);
+      this.hydrateTimerId = -1;
+    }
+  }
+
   private async refreshAfterHydrate(): Promise<void> {
     await SyncRuntime.get().ensureHydrated();
     this.vm.refreshFromAuth();
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.hydrating = false;
+      return;
+    }
+    this.hydrateTimerId = setTimeout(() => {
+      this.hydrateTimerId = -1;
+      this.hydrating = false;
+    }, ms);
   }
 
   /** 首屏入场窗口：INTRO_WINDOW_MS 内插入的列表行交错入场，之后直接终态 */
@@ -965,7 +984,10 @@ struct AccountSyncPage {
       .alignItems(HorizontalAlign.Start)
       .width('100%')
 
-      if (this.vm.devices.length === 0) {
+      if (this.hydrating || this.isSyncing) {
+        ListLoadingSkeleton({ variant: 'card', rows: 2, hint: '正在同步设备列表…' })
+          .margin({ top: Tokens.space.xs })
+      } else if (this.vm.devices.length === 0) {
         Row() {
           Text('尚无设备列表（同步后刷新）')
             .fontSize(Tokens.fontSize.caption)
@@ -1102,7 +1124,10 @@ struct AccountSyncPage {
       .alignItems(HorizontalAlign.Start)
       .width('100%')
 
-      if (this.vm.revisions.length === 0) {
+      if (this.hydrating || this.isSyncing) {
+        ListLoadingSkeleton({ variant: 'card', rows: 2, hint: '正在加载历史快照…' })
+          .margin({ top: Tokens.space.xs })
+      } else if (this.vm.revisions.length === 0) {
         Row() {
           Text('暂无历史版本（同步后生成快照）')
             .fontSize(Tokens.fontSize.caption)

@@ -2,6 +2,7 @@ import { SessionManager, SessionInfo } from '../../service/SessionManager';
 import { Tokens } from '../../theme/Tokens';
 import { Motion } from '../../theme/Motion';
 import { SmoothProgressBar } from '../SmoothProgressBar';
+import { ListLoadingSkeleton } from '../ListLoadingSkeleton';
 import { SftpNativeGateway } from '../../napi/SftpNativeGateway';
 import {
   SftpRow,
@@ -271,13 +272,12 @@ export struct SftpSidePanel {
         .backgroundColor(Tokens.Color.surface)
 
         // 状态消息
-        if (this.vmLoading) {
-          Text('加载目录中…')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.accent)
-            .width('100%')
-            .padding({ left: Tokens.space.sm, top: Tokens.space.xs2 })
-          .transition(Motion.fadeTransition())
+        if (this.vmLoading && this.vmRows.length > 0) {
+          Column() {
+            ListLoadingSkeleton({ variant: 'compact', rows: 1, hint: '正在刷新目录…' })
+          }
+          .width('100%')
+          .padding({ left: Tokens.space.sm, right: Tokens.space.sm, top: Tokens.space.xs2 })
         }
         if (this.vmError.length > 0) {
           Text(this.vmError)
@@ -288,7 +288,14 @@ export struct SftpSidePanel {
         }
 
         // 文件列表（List 保证从顶部向下排；Scroll 内容不足一屏时会垂直居中）
-        if (this.vmRows.length === 0 && !this.vmLoading) {
+        if (this.vmLoading && this.vmRows.length === 0) {
+          Column() {
+            ListLoadingSkeleton({ variant: 'compact', rows: 5, hint: '正在加载远端目录…' })
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .padding({ left: Tokens.space.sm, right: Tokens.space.sm, top: Tokens.space.xs })
+        } else if (this.vmRows.length === 0 && !this.vmLoading) {
           Column() {
             Text('空目录')
               .fontSize(Tokens.fontSize.caption)

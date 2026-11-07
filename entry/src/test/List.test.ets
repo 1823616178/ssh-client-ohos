@@ -37,6 +37,7 @@ import benchMetricsTest from './BenchMetrics.test';
 import keyManagerLogicTest from './KeyManagerLogic.test';
 import cursorBlinkTest from './CursorBlink.test';
 import multiWindowTest from './MultiWindow.test';
+import astro3DSceneModelTest from './Astro3DSceneModel.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -79,4 +80,5 @@ export default function testsuite() {
   keyManagerLogicTest();
   cursorBlinkTest();
   multiWindowTest();
+  astro3DSceneModelTest();
 }

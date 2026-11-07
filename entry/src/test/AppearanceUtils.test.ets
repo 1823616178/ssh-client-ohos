@@ -230,11 +230,14 @@ export default function appearanceAndUtilsTest() {
       const lgDisabled = resolveLayoutRegions('lg', true, true, false);
       expect(lgDisabled.rightPanel).assertFalse();
       expect(lgDisabled.rightPanelWidthVp).assertEqual(0);
-      // tab 清单：片段/转发/SFTP 路由
+      // tab 清单：文件传输排第一，命令片段/转发/SFTP 路由
       expect(RIGHT_PANEL_TABS.length).assertEqual(3);
+      expect(RIGHT_PANEL_TABS[0].id).assertEqual('sftp');
+      expect(RIGHT_PANEL_TABS[0].title).assertEqual('文件传输');
       const snippets = rightPanelTabById('snippets');
       expect(snippets !== null).assertTrue();
       if (snippets !== null) {
+        expect(snippets.title).assertEqual('命令片段');
         expect(snippets.route).assertEqual('pages/ConfigManagerPage');
         expect(snippets.needsHostId).assertFalse();
       }

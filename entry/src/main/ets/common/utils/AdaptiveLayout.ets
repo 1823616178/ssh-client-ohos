@@ -110,11 +110,18 @@ export interface RightPanelTab {
   readonly needsHostId: boolean;
 }
 
-/** 面板 tab 清单：片段 → ConfigManager，转发 → PortForwardPage，文件传输 → SftpPage */
+/** 面板 tab 清单：文件传输 → SftpPage，命令片段 → ConfigManager，转发 → PortForwardPage */
 export const RIGHT_PANEL_TABS: RightPanelTab[] = [
   {
+    id: 'sftp',
+    title: '文件传输',
+    subtitle: '远端文件浏览与传输',
+    route: 'pages/SftpPage',
+    needsHostId: true
+  },
+  {
     id: 'snippets',
-    title: '片段',
+    title: '命令片段',
     subtitle: '配置中心 · 命令片段',
     route: 'pages/ConfigManagerPage',
     needsHostId: false
@@ -124,13 +131,6 @@ export const RIGHT_PANEL_TABS: RightPanelTab[] = [
     title: '转发',
     subtitle: '端口转发规则',
     route: 'pages/PortForwardPage',
-    needsHostId: true
-  },
-  {
-    id: 'sftp',
-    title: '文件传输',
-    subtitle: '远端文件浏览与传输',
-    route: 'pages/SftpPage',
     needsHostId: true
   }
 ];

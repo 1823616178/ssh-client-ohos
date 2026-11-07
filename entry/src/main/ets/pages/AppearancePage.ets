@@ -23,6 +23,7 @@ import {
 import { COLOR_SLOT_LABELS, AppearanceViewModel } from '../viewmodel/AppearanceViewModel';
 import { ColorPickerSheet } from '../view/ColorPickerSheet';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { TerminalAppearance } from '../view/terminal/TerminalAppearance';
 import { TerminalPreviewCard } from '../view/TerminalPreviewCard';
 
@@ -49,6 +50,8 @@ export function applyThemeColorMode(colorModeName: ColorModeName, context: commo
 struct AppearancePage {
   /** 首屏入场窗口已过：列表行改用 IDENTITY 过渡（Motion.listItemTransition 注释） */
   @Local private introDone: boolean = !Motion.enabled;
+  @Local private listLoading: boolean = Motion.enabled;
+  private loadingTimerId: number = -1;
   private readonly vm: AppearanceViewModel = new AppearanceViewModel();
   @Local private pickerVisible: boolean = false;
   @Local private pickerSlot: number = 0;
@@ -61,6 +64,31 @@ struct AppearancePage {
     this.openIntroWindow();
     this.vm.reload();
     this.vm.reloadThemeMode();
+    this.pulseLoading();
+  }
+
+  aboutToDisappear(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+  }
+
+  private pulseLoading(): void {
+    if (this.loadingTimerId !== -1) {
+      clearTimeout(this.loadingTimerId);
+      this.loadingTimerId = -1;
+    }
+    const ms: number = Motion.localLoadingDuration();
+    if (ms <= 0) {
+      this.listLoading = false;
+      return;
+    }
+    this.listLoading = true;
+    this.loadingTimerId = setTimeout(() => {
+      this.loadingTimerId = -1;
+      this.listLoading = false;
+    }, ms);
   }
 
   private toast(message: string): void {
@@ -238,28 +266,32 @@ struct AppearancePage {
         .fontSize(Tokens.fontSize.caption)
         .fontColor(Tokens.Color.textDim)
         .margin({ top: Tokens.space.xs2, bottom: Tokens.space.sm })
-      Flex({ wrap: FlexWrap.Wrap }) {
-        ForEach(this.vm.presets, (preset: ThemePreset, index: number) => {
-          Button(preset.name)
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(preset.dark ? Tokens.Color.text : Tokens.Color.appBg)
-            .backgroundColor(preset.colors.background)
-            .borderRadius(Tokens.radius.sm)
-            .margin({ right: Tokens.space.xs, bottom: Tokens.space.xs })
-            .onClick(() => {
-              if (this.vm.draft !== null) {
-                this.vm.applyPresetToDraft(preset.id);
-                this.toast(`已套用 ${preset.name} 配色到当前草稿`);
-              } else {
-                this.vm.createFromPreset(preset.id);
-                this.toast(`已创建 ${preset.name}`);
-              }
-            })
-          // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
-          .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
-        }, (preset: ThemePreset) => preset.id)
+      if (this.listLoading) {
+        ListLoadingSkeleton({ variant: 'grid', rows: 6 })
+      } else {
+        Flex({ wrap: FlexWrap.Wrap }) {
+          ForEach(this.vm.presets, (preset: ThemePreset, index: number) => {
+            Button(preset.name)
+              .fontSize(Tokens.fontSize.caption)
+              .fontColor(preset.dark ? Tokens.Color.text : Tokens.Color.appBg)
+              .backgroundColor(preset.colors.background)
+              .borderRadius(Tokens.radius.sm)
+              .margin({ right: Tokens.space.xs, bottom: Tokens.space.xs })
+              .onClick(() => {
+                if (this.vm.draft !== null) {
+                  this.vm.applyPresetToDraft(preset.id);
+                  this.toast(`已套用 ${preset.name} 配色到当前草稿`);
+                } else {
+                  this.vm.createFromPreset(preset.id);
+                  this.toast(`已创建 ${preset.name}`);
+                }
+              })
+            // 首屏交错入场（INTRO_WINDOW_MS 后 IDENTITY：滚动复用/数据刷新不重播）
+            .transition(this.introDone ? TransitionEffect.IDENTITY : Motion.listItemTransition(index))
+          }, (preset: ThemePreset) => preset.id)
+        }
+        .width('100%')
       }
-      .width('100%')
     }
     .width('100%')
     .padding(Tokens.space.md)
@@ -276,7 +308,9 @@ struct AppearancePage {
         .fontColor(Tokens.Color.text)
         .fontWeight(FontWeight.Bold)
         .margin({ bottom: Tokens.space.sm })
-      if (this.vm.profiles.length === 0) {
+      if (this.listLoading) {
+        ListLoadingSkeleton({ variant: 'card', rows: 2, hint: '正在加载已保存主题…' })
+      } else if (this.vm.profiles.length === 0) {
         Text('暂无自定义主题，点上方预设创建。')
           .fontSize(Tokens.fontSize.caption)
           .fontColor(Tokens.Color.textFaint)

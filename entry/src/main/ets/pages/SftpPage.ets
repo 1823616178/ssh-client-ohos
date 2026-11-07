@@ -13,6 +13,7 @@ import { SessionManager, SessionInfo } from '../service/SessionManager';
 import { Tokens } from '../theme/Tokens';
 import { Motion } from '../theme/Motion';
 import { SmoothProgressBar } from '../view/SmoothProgressBar';
+import { ListLoadingSkeleton } from '../view/ListLoadingSkeleton';
 import { PageHeader, PageHeaderAction } from '../view/PageHeader';
 import { Logger } from '../common/utils/Logger';
 import { SftpSaver } from '../common/utils/SftpSaver';
@@ -247,12 +248,9 @@ struct SftpPage {
         this.UnavailableBanner()
       }
       this.PathBar()
-      if (this.vmLoading) {
-        Text('加载中…')
-          .fontSize(Tokens.fontSize.caption)
-          .fontColor(Tokens.Color.textDim)
-          .margin({ top: Tokens.space.sm })
-        .transition(Motion.fadeTransition())
+      if (this.vmLoading && this.vmRows.length > 0) {
+        ListLoadingSkeleton({ variant: 'compact', rows: 1, hint: '正在刷新远端目录…' })
+          .margin({ top: Tokens.space.xs })
       }
       if (this.vmError.length > 0 && !this.nativeUnavailable) {
         Text(this.vmError)
@@ -330,7 +328,14 @@ struct SftpPage {
 
   @Builder
   FileList() {
-    if (this.vmRows.length === 0) {
+    if (this.vmLoading && this.vmRows.length === 0) {
+      Column() {
+        ListLoadingSkeleton({ variant: 'compact', rows: 6, hint: '正在读取远端文件列表…' })
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .margin({ top: Tokens.space.sm })
+    } else if (this.vmRows.length === 0) {
       Text(this.nativeUnavailable ? '暂无文件列表' : '空目录')
         .fontSize(Tokens.fontSize.body)
         .fontColor(Tokens.Color.textFaint)
