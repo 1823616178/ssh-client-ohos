@@ -7,7 +7,7 @@
  *   - 快速连接：空列表完整 CTA；有主机时默认收起，避免与列表争抢视线；
  *   - 分组列表：List + LazyForEach + IDataSource 懒加载，按 order 升序分组区 + 未分组区；
  *   - 主机行：状态点 + 名称 + user@host:port + authType 徽标；
- *   - 滑动菜单 / 长按菜单：连接 / 新窗口 / 编辑 / SFTP / 转发 / 删除（danger 底色，二次确认）；
+ *   - 滑动菜单：编辑 / SFTP / 转发 / 删除（danger 底色，二次确认）；
  *   - 空状态：无主机时引导「添加第一台主机」；搜索无结果时给提示文案。
  *
  * 本组件内嵌于 Index（@Entry 在其上），从 HostEditPage 返回时经父页 onPageShow
@@ -31,22 +31,35 @@ import {
   pushTerminalForHost,
   pushTerminalForSession
 } from '../common/utils/TerminalNavigation';
-import { MAIN_WINDOW_KEY, windowKeyOfPaneId } from '../common/constants/WindowKeys';
-import { abilityContextOf, supportsMultiWindow } from '../common/utils/WindowContext';
+import { paneIdPrefixOf } from '../common/constants/WindowKeys';
+import { abilityContextOf, supportsMultiWindow, windowKeyOf } from '../common/utils/WindowContext';
 import { common } from '@kit.AbilityKit';
 import { curves } from '@kit.ArkUI';
 import {
-  ActiveSessionItem,
   ActiveSessionLike,
+  HostConnStatus,
   HostListRow,
   HostListViewModel,
   QuickConnectTarget,
-  buildActiveSessionItems,
   parseQuickConnectAddress,
   recordHostLastUsed
 } from '../viewmodel/HostListViewModel';
+import {
+  ActiveSessionRow,
+  MINI_TERMINAL_PANE_ID,
+  SessionActivityTracker,
+  SessionLocation,
+  activeSessionsHeader,
+  buildActiveSessionRows,
+  decideSessionTap,
+  locateSession
+} from '../viewmodel/MiniTerminalModel';
+import { TerminalParkingLot } from '../viewmodel/TerminalViewModel';
 
 const LOG_TAG: string = 'HostListPage';
+/** 活动会话区最大高度：超出后区内滚动，不把主机列表挤没 */
+const ACTIVE_SESSIONS_MAX_HEIGHT_VP: number = 232;
+const ROW_ACTION_VP: number = 40;
 
 /** bindPopup onStateChange 回调参数（ArkTS 禁止对象字面量类型注解，故具名声明） */
 interface PopupStateEvent {
@@ -104,10 +117,16 @@ export struct HostListPage {
    */
   onOpenHost: ((hostId: string) => void) | null = null;
   /**
-   * 活动会话点按：Index md/lg 提供时把首页中栏切换到该会话（不 push 全页）；
-   * 未提供（sm 单栏无嵌入终端）时保持原行为，push TerminalPage。
+   * 活动会话行点按：父页（Index）把迷你终端窗口就地切到该会话（不跳页）。
+   * 未提供时退化为 push 全页终端（独立使用本组件时）。
    */
-  onResumeSession: ((sessionId: string, hostId: string) => void) | null = null;
+  onOpenSession: ((sessionId: string) => void) | null = null;
+  /** 行内「⤢ 全页」：父页先让迷你窗口让出会话再 push TerminalPage */
+  onOpenSessionFullPage: ((sessionId: string) => void) | null = null;
+  /** 会话被用户断开（父页据此清空迷你窗口） */
+  onSessionClosed: ((sessionId: string) => void) | null = null;
+  /** 迷你窗口当前显示的会话（行高亮「迷你窗口中」） */
+  @Prop @Watch('onMiniSessionChanged') miniSessionId: string = '';
   /** Index 双栏当前选中主机（高亮行；'' = 无选中 / 单栏） */
   @Prop selectedHostId: string = '';
   /** 首屏入场：false → true 时列表行按序淡入上移、空状态淡入 */
@@ -126,8 +145,10 @@ export struct HostListPage {
   @State private searchText: string = '';
   /** 快速直连展开态：主机列表非空时默认收起，空态保留完整 CTA */
   @State private quickConnectExpanded: boolean = false;
-  /** 活动会话：所有非终态会话（含正在终端页/分栏显示的），点按恢复或聚焦 */
-  @State private activeSessions: ActiveSessionItem[] = [];
+  /** 后台运行中的会话（终端页返回不断开；点按恢复） */
+  @State private activeSessions: ActiveSessionRow[] = [];
+  /** 后台活动（新输出 / 响铃 / 标题）翻转 → 刷新活动会话 */
+  private unsubActivity: () => void = (): void => {};
   /** 视图模型：搜索串 / 折叠集合 / 派生行（生产依赖惰性解析 AppDatabase / SettingsRepository） */
   private readonly viewModel: HostListViewModel = new HostListViewModel();
   private readonly dataSource: HostRowDataSource = new HostRowDataSource();
@@ -167,6 +188,9 @@ export struct HostListPage {
     void this.refreshSyncChipAfterHydrate();
     SessionManager.get().addEventListener(this.sessionListener);
     SessionManager.get().addSessionCountListener(this.sessionCountListener);
+    this.unsubActivity = SessionActivityTracker.global().addListener((): void => {
+      this.refreshActiveSessions();
+    });
     this.refreshActiveSessions();
     this.revealList();
   }
@@ -205,47 +229,83 @@ export struct HostListPage {
     }
     SessionManager.get().removeEventListener(this.sessionListener);
     SessionManager.get().removeSessionCountListener(this.sessionCountListener);
+    this.unsubActivity();
+    this.unsubActivity = (): void => {};
   }
 
-  /** 活动会话：所有非终态会话（连上即出现，含已绑窗格的） */
+  private onMiniSessionChanged(): void {
+    this.refreshActiveSessions();
+  }
+
+  /** 活动会话：全部存活连接（含迷你窗口中的、返回键转入后台的、全页各标签/分屏的） */
   private refreshActiveSessions(): void {
     const names: Map<string, string> = new Map();
     for (const host of this.viewModel.hosts) {
       names.set(host.id, host.name.length > 0 ? host.name : host.host);
     }
     const sessions: ActiveSessionLike[] = SessionManager.get().listSessions();
-    this.activeSessions = buildActiveSessionItems(sessions, names);
+    this.activeSessions = buildActiveSessionRows(sessions, names, this.miniSessionId,
+      SessionActivityTracker.global(), this.miniPaneId());
+  }
+
+  /** 本窗口迷你终端的窗格 id（主窗口无前缀；与 TerminalPaneEmbed.embedPaneId 同口径） */
+  private miniPaneId(): string {
+    return `${paneIdPrefixOf(windowKeyOf(this.getUIContext()))}${MINI_TERMINAL_PANE_ID}`;
   }
 
   /**
-   * 点按活动会话（画面 / 回滚保留）：
-   *   - 会话正显示在其他窗口 → 把那个窗口带到前台；
-   *   - Index 双栏 → 通知父页把中栏切换到该会话，不打开全页
-   *     （全页只在嵌入终端顶栏的「全页终端」按钮触发）；
-   *   - 单栏（sm）→ 保持原行为 push TerminalPage。
+   * 多窗口：会话正显示在别的系统窗口时，把那个窗口带到前台并返回 true——
+   * 不在本窗口再开（迷你窗口 / 全页都不去抢它的窗格绑定）。
    */
-  private resumeSession(item: ActiveSessionItem): void {
-    const info: SessionInfo | null = SessionManager.get().getSession(item.sessionId);
-    const paneId: string | null = info === null ? null : info.paneId;
-    if (paneId !== null && windowKeyOfPaneId(paneId) !== MAIN_WINDOW_KEY) {
-      const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
-      if (context !== null) {
-        focusWindowOfSession(context, windowKeyOfPaneId(paneId), item.sessionId).then((ok: boolean) => {
-          if (!ok) {
-            this.toast('该会话已在其他窗口打开');
-          }
-        });
-        return;
+  private focusIfInOtherWindow(sessionId: string): boolean {
+    const info: SessionInfo | null = SessionManager.get().getSession(sessionId);
+    const location: SessionLocation = locateSession(info === null ? null : info.paneId, this.miniPaneId());
+    if (decideSessionTap(location) !== 'focus-window') {
+      return false;
+    }
+    const context: common.UIAbilityContext | null = abilityContextOf(this.getUIContext());
+    if (context === null) {
+      this.toast('该会话已在其他窗口打开');
+      return true;
+    }
+    focusWindowOfSession(context, location.windowKey, sessionId).then((ok: boolean) => {
+      if (!ok) {
+        this.toast('该会话已在其他窗口打开');
       }
-    }
-    if (this.onResumeSession !== null) {
-      this.onResumeSession(item.sessionId, info === null ? item.hostId : info.hostId);
-      return;
-    }
-    pushTerminalForSession(this.getUIContext(), item.sessionId);
+    });
+    return true;
   }
 
-  private confirmCloseSession(item: ActiveSessionItem): void {
+  /**
+   * 点按行：会话在别的系统窗口 → 切到那个窗口；否则迷你窗口就地切换（父页提供时），
+   * 再否则退化为本窗口全页。
+   */
+  private resumeSession(sessionId: string): void {
+    SessionActivityTracker.global().markSeen(sessionId);
+    if (this.focusIfInOtherWindow(sessionId)) {
+      return;
+    }
+    if (this.onOpenSession !== null) {
+      this.onOpenSession(sessionId);
+      return;
+    }
+    pushTerminalForSession(this.getUIContext(), sessionId);
+  }
+
+  /** 行内「⤢」：显式进入全页终端（会话已在别的系统窗口则切过去，不在本窗口重复打开） */
+  private openSessionFullPage(sessionId: string): void {
+    SessionActivityTracker.global().markSeen(sessionId);
+    if (this.focusIfInOtherWindow(sessionId)) {
+      return;
+    }
+    if (this.onOpenSessionFullPage !== null) {
+      this.onOpenSessionFullPage(sessionId);
+      return;
+    }
+    pushTerminalForSession(this.getUIContext(), sessionId);
+  }
+
+  private confirmCloseSession(item: ActiveSessionRow): void {
     AlertDialog.show({
       title: '断开会话？',
       message: `将断开「${item.title}」，未保存的远端工作（非 tmux/screen）会丢失。`,
@@ -260,6 +320,11 @@ export struct HostListPage {
         fontColor: Tokens.Color.danger,
         action: () => {
           SessionManager.get().close(item.sessionId);
+          // 寄存的终端（全页返回 / 迷你窗口切走 / 迁窗时留下）随会话一起释放
+          TerminalParkingLot.global().discard(item.sessionId);
+          if (this.onSessionClosed !== null) {
+            this.onSessionClosed(item.sessionId);
+          }
           this.refreshConnStatus();
           this.reloadRows();
           this.refreshActiveSessions();
@@ -288,13 +353,14 @@ export struct HostListPage {
 
   // ---------------------------------------------------------------- 交互
 
-  /** 父页 onPageShow 驱动：从 HostEditPage 返回后全量重载（含状态点、行重建与活动会话） */
+  /** 父页 onPageShow 驱动：从 HostEditPage 返回后全量重载（含状态点与行重建） */
   private onRefreshTick(): void {
     this.viewModel.reload();
     this.refreshConnStatus();
     this.reloadRows();
-    this.refreshActiveSessions();
     this.refreshSyncChip();
+    // 全页终端返回：会话已解绑（不再「全页终端中」），重派生活动会话
+    this.refreshActiveSessions();
   }
 
   /** 顶栏芯片：登录/锁定/已连接，从同步运行时快照（页面重建时刷新） */
@@ -449,6 +515,21 @@ export struct HostListPage {
     this.toast('已删除主机');
   }
 
+  private connStatusColor(status: HostConnStatus): Resource {
+    switch (status) {
+      case 'connecting':
+        return Tokens.Color.accent;
+      case 'established':
+        return Tokens.Color.success;
+      case 'disconnected':
+        return Tokens.Color.warn;
+      case 'error':
+        return Tokens.Color.danger;
+      default:
+        return Tokens.Color.textFaint;
+    }
+  }
+
   private authTypeLabel(host: HostProfile): string {
     switch (host.authType) {
       case 'password':
@@ -465,48 +546,24 @@ export struct HostListPage {
   @Builder
   ActiveSessionsSection() {
     Column() {
-      Text(`活动会话（${this.activeSessions.length}）`)
+      Text(activeSessionsHeader(this.activeSessions))
         .fontSize(Tokens.fontSize.body)
         .fontWeight(FontWeight.Bold)
         .fontColor(Tokens.Color.text)
         .margin({ bottom: Tokens.space.xs2 })
-      ForEach(this.activeSessions, (item: ActiveSessionItem) => {
-        Row() {
-          StatusDot({ status: item.status, dotSize: 8 })
-          Column() {
-            Text(item.title)
-              .fontSize(Tokens.fontSize.body)
-              .fontColor(Tokens.Color.text)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(`${item.statusLabel} · 点按恢复`)
-              .fontSize(Tokens.fontSize.caption)
-              .fontColor(Tokens.Color.textDim)
-              .maxLines(1)
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-          .margin({ left: Tokens.space.sm })
-          Text('断开')
-            .fontSize(Tokens.fontSize.caption)
-            .fontColor(Tokens.Color.danger)
-            .height(40)
-            .constraintSize({ minWidth: 48 })
-            .textAlign(TextAlign.Center)
-            .accessibilityText(`断开会话 ${item.title}`)
-            .onClick(() => {
-              this.confirmCloseSession(item);
-            })
+        .accessibilityText(activeSessionsHeader(this.activeSessions))
+      Scroll() {
+        Column() {
+          ForEach(this.activeSessions, (item: ActiveSessionRow) => {
+            this.ActiveSessionRowView(item)
+          }, (item: ActiveSessionRow) => item.renderKey)
         }
         .width('100%')
-        .constraintSize({ minHeight: 48 })
-        .alignItems(VerticalAlign.Center)
-        .accessibilityGroup(true)
-        .accessibilityText(`恢复会话 ${item.title}，${item.statusLabel}`)
-        .onClick(() => {
-          this.resumeSession(item);
-        })
-      }, (item: ActiveSessionItem) => `${item.sessionId}|${item.status}|${item.title}`)
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: ACTIVE_SESSIONS_MAX_HEIGHT_VP })
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.None)
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')
@@ -514,6 +571,82 @@ export struct HostListPage {
     .backgroundColor(Tokens.Color.surface)
     .borderRadius(Tokens.radius.md)
     .margin({ top: Tokens.space.sm })
+  }
+
+  @Builder
+  ActiveSessionRowView(item: ActiveSessionRow) {
+    Row() {
+      StatusDot({ status: item.status, dotSize: 8 })
+      Column() {
+        Row() {
+          Text(item.title)
+            .fontSize(Tokens.fontSize.body)
+            .fontWeight(item.unread || item.bell ? FontWeight.Bold : FontWeight.Medium)
+            .fontColor(Tokens.Color.text)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .flexShrink(1)
+          if (item.bell) {
+            Text('🔔')
+              .fontSize(Tokens.fontSize.caption)
+              .margin({ left: Tokens.space.xs2 })
+          }
+          if (item.unread) {
+            Column()
+              .width(8)
+              .height(8)
+              .borderRadius(4)
+              .backgroundColor(Tokens.Color.accent)
+              .margin({ left: Tokens.space.xs2 })
+          }
+        }
+        .alignItems(VerticalAlign.Center)
+        Text(item.subtitle)
+          .fontSize(Tokens.fontSize.caption)
+          .fontColor(item.inMini ? Tokens.Color.accent : Tokens.Color.textDim)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .margin({ left: Tokens.space.sm })
+      Button() {
+        Text('⤢')
+          .fontSize(Tokens.fontSize.body)
+          .fontColor(Tokens.Color.accent)
+      }
+      .backgroundColor(Color.Transparent)
+      .width(ROW_ACTION_VP)
+      .height(ROW_ACTION_VP)
+      .accessibilityText(item.inOtherWindow ? `切换到 ${item.title} 所在窗口` : `在完整终端页打开 ${item.title}`)
+      .onClick(() => {
+        this.openSessionFullPage(item.sessionId);
+      })
+      Button() {
+        Text('✕')
+          .fontSize(Tokens.fontSize.body)
+          .fontColor(Tokens.Color.danger)
+      }
+      .backgroundColor(Color.Transparent)
+      .width(ROW_ACTION_VP)
+      .height(ROW_ACTION_VP)
+      .accessibilityText(`断开会话 ${item.title}`)
+      .onClick(() => {
+        this.confirmCloseSession(item);
+      })
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 48 })
+    .padding({ left: Tokens.space.xs, right: 0 })
+    .alignItems(VerticalAlign.Center)
+    .borderRadius(Tokens.radius.sm)
+    .backgroundColor(item.inMini ? Tokens.Color.surfaceHover : Color.Transparent)
+    .accessibilityText(item.inMini ? `${item.accessibilityText}，正在迷你窗口显示` :
+      (item.inOtherWindow ? `${item.accessibilityText}，点按切换到该窗口` :
+        `${item.accessibilityText}，点按在迷你窗口查看`))
+    .onClick(() => {
+      this.resumeSession(item.sessionId);
+    })
   }
 
   build() {
@@ -572,7 +705,7 @@ export struct HostListPage {
       .alignItems(VerticalAlign.Center)
       .margin({ top: Tokens.space.sm })
 
-      // 活动会话：所有非终态会话（含正在终端显示的），点按恢复 / 聚焦（画面 / 回滚保留）
+      // 活动会话：全部存活连接；点按在迷你窗口就地查看，⤢ 才进全页（画面 / 回滚保留）
       if (this.activeSessions.length > 0) {
         this.ActiveSessionsSection()
       }
@@ -890,7 +1023,7 @@ export struct HostListPage {
     if (row.host !== null) {
       Row() {
         Row() {
-          StatusDot({ status: row.connStatus, dotSize: 8 }) // = space_xs（8vp）
+          StatusDot({ status: row.connStatus, dotSize: 8 })
         }
         .width(24)
         .height(24)

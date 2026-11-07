@@ -613,6 +613,20 @@ export class TerminalParkingLot implements TerminalParkingLike {
     return this.entries.size;
   }
 
+  /**
+   * 用户显式断开会话时同步丢弃其寄存（detach 终端、释放 native 句柄引用）。
+   * 会话数监听里的 prune 也会兜底，但通知在重入时会被丢弃，这里不依赖它。返回是否有寄存被丢弃。
+   */
+  discard(sessionId: string): boolean {
+    const entry: ParkedTerminal | undefined = this.entries.get(sessionId);
+    if (entry === undefined) {
+      return false;
+    }
+    this.entries.delete(sessionId);
+    entry.terminal.detach();
+    return true;
+  }
+
   /** 失主寄存一律 detach 并移除 */
   prune(): void {
     const dead: string[] = [];
@@ -794,6 +808,8 @@ export class TerminalViewModel {
   private startError: string = '';
   private started: boolean = false;
   private disposed: boolean = false;
+  /** detach（转后台）而非 dispose（关闭）：等待中的连接受理后不关闭 */
+  private detachedKeepAlive: boolean = false;
   private listenersOn: boolean = false;
   private areaWidthVp: number = 0;
   private areaHeightVp: number = 0;
@@ -890,9 +906,9 @@ export class TerminalViewModel {
     }
     pending.waiters--;
     if (this.disposed) {
-      // 等待受理期间页面已退出：会话未绑窗格，dispose 的 unbindPane 管不到，显式关闭——
-      // 但同一拨号若还有其他 VM 在等 / 已被采用（快速切回同一主机），交给它们
-      if (pending.waiters <= 0 && !pending.adopted) {
+      // 等待受理期间页面已退出：会话未绑窗格，dispose 的 unbindPane 管不到。
+      // dispose（关闭语义）且没有其他等待者/采用者时显式关闭；detach（转后台）则保留。
+      if (!this.detachedKeepAlive && pending.waiters <= 0 && !pending.adopted) {
         this.sessionHost().close(info.sessionId);
       }
       return;
@@ -2146,6 +2162,7 @@ export class TerminalViewModel {
     }
     this.disposed = true;
     this.passwordPromptSeq++;
+    this.detachedKeepAlive = true;
     this.unsubFocus();
     this.unregisterListeners();
     SnippetSendHub.get().unregister(this.snippetHubSender);

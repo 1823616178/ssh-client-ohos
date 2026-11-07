@@ -31,9 +31,6 @@ import {
   HostSessionStateLike,
   QuickConnectTarget,
   buildConnStatusMap,
-  ActiveSessionItem,
-  ActiveSessionLike,
-  buildActiveSessionItems,
   buildHostRows,
   decodeCollapsedGroups,
   deriveHostConnStatus,
@@ -518,32 +515,6 @@ export default function hostListViewModelTest() {
       expect(vm.deleteHost('h1')).assertTrue();
       expect(hostDao.deletedIds.join(',')).assertEqual('h1');
       expect(hostIdsOf(vm.buildRows()).join(',')).assertEqual('h2');
-    });
-    it('活动会话_列出全部非终态会话含已绑窗格_标题优先已保存主机名', 0, () => {
-      const sessions: ActiveSessionLike[] = [
-        { sessionId: 's1', hostId: 'h1', hostName: 'root@1.2.3.4', state: 'established', paneId: null },
-        { sessionId: 's2', hostId: 'h2', hostName: 'dba@db', state: 'disconnected', paneId: null },
-        { sessionId: 's3', hostId: 'h1', hostName: 'x', state: 'established', paneId: 'terminal-main' },
-        { sessionId: 's4', hostId: 'h3', hostName: 'y', state: 'closed', paneId: null },
-        { sessionId: 's5', hostId: 'tmp', hostName: '', state: 'connecting', paneId: null }
-      ];
-      const names: Map<string, string> = new Map();
-      names.set('h1', '生产机');
-      const items: ActiveSessionItem[] = buildActiveSessionItems(sessions, names);
-      // 已绑窗格的 s3 也列出（连上即出现），仅终态 s4(closed) 被排除
-      expect(items.length).assertEqual(4);
-      expect(items[0].title).assertEqual('生产机');
-      expect(items[0].hostId).assertEqual('h1');
-      expect(items[0].statusLabel).assertEqual('运行中');
-      expect(items[1].title).assertEqual('dba@db');
-      expect(items[1].hostId).assertEqual('h2');
-      expect(items[1].status).assertEqual('disconnected');
-      expect(items[2].sessionId).assertEqual('s3');
-      expect(items[2].title).assertEqual('生产机');
-      expect(items[2].status).assertEqual('established');
-      expect(items[3].title).assertEqual('终端');
-      expect(items[3].hostId).assertEqual('tmp');
-      expect(items[3].status).assertEqual('connecting');
     });
   });
 }

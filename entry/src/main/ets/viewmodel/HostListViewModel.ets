@@ -102,16 +102,6 @@ export interface ActiveSessionLike {
   readonly paneId: string | null;
 }
 
-/** 主机列表「活动会话」一行 */
-export interface ActiveSessionItem {
-  readonly sessionId: string;
-  /** 所属主机（双栏点按时用于把首页切到该服务器） */
-  readonly hostId: string;
-  readonly title: string;
-  readonly status: HostConnStatus;
-  readonly statusLabel: string;
-}
-
 export function hostConnStatusLabel(status: HostConnStatus): string {
   switch (status) {
     case 'connecting':
@@ -125,34 +115,6 @@ export function hostConnStatusLabel(status: HostConnStatus): string {
     default:
       return '';
   }
-}
-
-/**
- * 活动会话列表：所有非终态会话，连上即出现——含已绑窗格、正在终端页/分栏里
- * 显示的会话（点按后的去向由页面侧重定向：别的窗口就切窗口；主窗口双栏则把中栏
- * 切换到该会话，单栏仍推终端页；已被其他窗格占用时终端 VM 经 elsewhereHook
- * 提示而不抢绑定）。标题优先用已保存主机名。
- */
-export function buildActiveSessionItems(sessions: ActiveSessionLike[],
-  hostNames: Map<string, string>): ActiveSessionItem[] {
-  const items: ActiveSessionItem[] = [];
-  for (const session of sessions) {
-    const status: HostConnStatus = sessionStateToStatus(session.state);
-    if (status === 'none') {
-      continue;
-    }
-    const saved: string | undefined = hostNames.get(session.hostId);
-    const title: string = saved !== undefined && saved.length > 0 ? saved :
-      (session.hostName.length > 0 ? session.hostName : '终端');
-    items.push({
-      sessionId: session.sessionId,
-      hostId: session.hostId,
-      title: title,
-      status: status,
-      statusLabel: hostConnStatusLabel(status)
-    });
-  }
-  return items;
 }
 
 /** 单主机状态点派生：其全部会话中取最严重状态；无会话 → none */
