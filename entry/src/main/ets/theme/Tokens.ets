@@ -66,10 +66,18 @@ class FontSizeTokens {
   readonly display: Resource = $r('app.float.font_display');
 }
 
+/** 控件尺寸与描边 Token（vp） */
+class SizeTokens {
+  readonly controlSm: Resource = $r('app.float.control_sm');
+  readonly control: Resource = $r('app.float.control_regular');
+  readonly strokeThin: Resource = $r('app.float.stroke_thin');
+}
+
 /** Design Token 统一入口 */
 export class Tokens {
   static readonly Color: ColorTokens = new ColorTokens();
   static readonly radius: RadiusTokens = new RadiusTokens();
   static readonly space: SpaceTokens = new SpaceTokens();
   static readonly fontSize: FontSizeTokens = new FontSizeTokens();
+  static readonly size: SizeTokens = new SizeTokens();
 }

@@ -62,6 +62,7 @@ const KEY_KEEP_ALIVE_IN_BACKGROUND: string = 'keepAliveInBackground';
 const KEY_SCREEN_OFF_DISCONNECT_MINUTES: string = 'screenOffDisconnectMinutes';
 const KEY_KEEP_SCREEN_ON_MODE: string = 'keepScreenOnMode';
 const KEY_HAPTIC_ENABLED: string = 'hapticEnabled';
+const KEY_SAFE_AREA_ENABLED: string = 'safeAreaEnabled';
 const KEY_KEY_BAR_LAYOUT: string = 'keyBarLayout';
 const KEY_LAST_SESSION_ID: string = 'lastSessionId';
 const KEY_SYNC_POLL_INTERVAL_MINUTES: string = 'syncPollIntervalMinutes';
@@ -91,6 +92,7 @@ export const SETTING_DEFS: SettingDef[] = [
   { key: KEY_SCREEN_OFF_DISCONNECT_MINUTES, type: 'number', defaultValue: 0, comment: '息屏 N 分钟后断开，0 = 关（§7.5 默认关）' },
   { key: KEY_KEEP_SCREEN_ON_MODE, type: 'string', defaultValue: 'session', comment: '终端页屏幕常亮：never / session / always（默认 session）' },
   { key: KEY_HAPTIC_ENABLED, type: 'boolean', defaultValue: true, comment: '触感反馈开关（§4.4）' },
+  { key: KEY_SAFE_AREA_ENABLED, type: 'boolean', defaultValue: true, comment: '底部安全距离总开关（无实体键盘时自动关闭）' },
   { key: KEY_KEY_BAR_LAYOUT, type: 'string', defaultValue: '', comment: '功能键条布局（JSON 串，空串 = 内置默认布局）' },
   { key: KEY_LAST_SESSION_ID, type: 'string', defaultValue: '', comment: '上次会话 id（§5.1），空串 = 无' },
   { key: KEY_SYNC_POLL_INTERVAL_MINUTES, type: 'number', defaultValue: 15, comment: '同步轮询间隔（分钟，§6.4 默认 15）' },
@@ -203,6 +205,14 @@ export class SettingsRepository {
 
   static setHapticEnabled(value: boolean): void {
     SettingsRepository.writeValue(KEY_HAPTIC_ENABLED, value);
+  }
+
+  static isSafeAreaEnabled(): boolean {
+    return SettingsRepository.readBoolean(KEY_SAFE_AREA_ENABLED);
+  }
+
+  static setSafeAreaEnabled(value: boolean): void {
+    SettingsRepository.writeValue(KEY_SAFE_AREA_ENABLED, value);
   }
 
   /** 功能键条布局（JSON 串）；空串表示使用内置默认布局 */

@@ -131,3 +131,8 @@ export function shouldSuppressSoftKeyboardOnKeyEvent(physicalKeyEventArrived: bo
 export function shouldShowSoftKeyboardOnTouch(externalKeyboardActive: boolean): boolean {
   return !externalKeyboardActive;
 }
+
+/** 底部安全距离：用户总开关开启且当前存在实体键盘时才保留。 */
+export function shouldReserveBottomSafeArea(enabled: boolean, physicalKeyboardPresent: boolean): boolean {
+  return enabled && physicalKeyboardPresent;
+}

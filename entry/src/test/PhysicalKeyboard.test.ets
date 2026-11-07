@@ -9,6 +9,7 @@ import { describe, it, expect } from '@ohos/hypium';
 import {
   isPhysicalKeyboardTypeName,
   keyboardTypeToString,
+  shouldReserveBottomSafeArea,
   shouldShowSoftKeyboardOnTouch,
   shouldSuppressSoftKeyboard,
   shouldSuppressSoftKeyboardOnKeyEvent
@@ -65,6 +66,13 @@ export default function physicalKeyboardTest() {
     it('触摸路径_外接键盘活跃时不拉软键盘', 0, () => {
       expect(shouldShowSoftKeyboardOnTouch(false)).assertTrue();
       expect(shouldShowSoftKeyboardOnTouch(true)).assertFalse();
+    });
+
+    it('底部安全距离_仅用户开启且存在实体键盘时保留', 0, () => {
+      expect(shouldReserveBottomSafeArea(true, true)).assertTrue();
+      expect(shouldReserveBottomSafeArea(true, false)).assertFalse();
+      expect(shouldReserveBottomSafeArea(false, true)).assertFalse();
+      expect(shouldReserveBottomSafeArea(false, false)).assertFalse();
     });
   });
 }

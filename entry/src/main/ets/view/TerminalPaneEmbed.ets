@@ -574,6 +574,7 @@ export struct TerminalPaneEmbed {
       bottom: Tokens.space.xs2
     })
     .backgroundColor(Tokens.Color.surface)
+    .border({ width: { bottom: Tokens.size.strokeThin }, color: Tokens.Color.border })
   }
 
   /** 有画面时的非阻塞状态条（断线 / 重连倒计时 / 已结束），画面可继续滚动查看 */

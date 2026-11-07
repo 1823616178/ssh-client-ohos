@@ -69,6 +69,8 @@ import { FrameScheduler } from '../view/FrameScheduler';
 import { FocusManager } from '../view/terminal/FocusManager';
 import { areaLengthToVp } from '../view/terminal/TerminalLayout';
 import { StickyModifiers } from '../view/terminal/StickyModifiers';
+import { ExternalKeyboardMonitor } from '../view/terminal/ExternalKeyboardMonitor';
+import { shouldReserveBottomSafeArea } from '../view/terminal/PhysicalKeyboard';
 import {
   TerminalAppearance,
   createDefaultTerminalAppearance,
@@ -468,6 +470,9 @@ struct TerminalPage {
   private appliedChromeBackground: string = '';
   /** 全屏布局只沉浸到底部；顶部仍避开系统状态栏。 */
   @State private terminalTopInsetVp: number = 0;
+  @State private safeAreaEnabled: boolean = true;
+  @State private physicalKeyboardPresent: boolean = false;
+  private unsubscribeKeyboardPresence: () => void = () => {};
   /** 页面是否在前台（onPageHide → false：画布停绘、光标不闪） */
   @State private pageVisible: boolean = true;
   /** 全屏模式：隐藏顶栏 / 标签栏 / 状态栏 */
@@ -573,9 +578,14 @@ struct TerminalPage {
       this.hapticEnabled = SettingsRepository.isHapticEnabled();
       this.shortcutBindingsJson = SettingsRepository.getKeyboardShortcuts();
       this.keyBarLayoutJson = SettingsRepository.getKeyBarLayout();
+      this.safeAreaEnabled = SettingsRepository.isSafeAreaEnabled();
     } catch (err) {
       Logger.warn(`设置读取失败，使用默认值：${JSON.stringify(err)}`, LOG_TAG);
     }
+    this.physicalKeyboardPresent = ExternalKeyboardMonitor.get().hasPhysicalKeyboard();
+    this.unsubscribeKeyboardPresence = ExternalKeyboardMonitor.get().subscribePresence((present: boolean): void => {
+      this.physicalKeyboardPresent = present;
+    });
     // 终端窗口：启动参数在窗口级 LocalStorage（根页面拿不到 router 参数）；主窗口回退路由参数
     const launch: TerminalWindowLaunch | null = takeWindowLaunch(this.getUIContext());
     let extraSessionIds: string[] = [];
@@ -635,15 +645,20 @@ struct TerminalPage {
     this.applyTerminalWindowLayout();
     this.syncTerminalChromeColor();
     this.vm.reloadConnections();
-    // 从键位编辑页返回：重新读布局
+    // 从设置页 / 键位编辑页返回：重读本机显示与键位偏好
     try {
       this.keyBarLayoutJson = SettingsRepository.getKeyBarLayout();
+      this.safeAreaEnabled = SettingsRepository.isSafeAreaEnabled();
     } catch (err) {
-      Logger.warn(`键条布局读取失败：${JSON.stringify(err)}`, LOG_TAG);
+      Logger.warn(`页面设置读取失败：${JSON.stringify(err)}`, LOG_TAG);
     }
     // 常亮只在真正看着终端时生效：跳去主机编辑页那段时间不该压着系统不息屏
     ScreenAwake.forWindow(this.windowKey).setTerminalVisible(true);
     FrameScheduler.get().wakeup();
+  }
+
+  private bottomSafeAreaEnabled(): boolean {
+    return shouldReserveBottomSafeArea(this.safeAreaEnabled, this.physicalKeyboardPresent);
   }
 
   onPageHide(): void {
@@ -856,6 +871,8 @@ struct TerminalPage {
       Logger.warn(`恢复键盘避让模式失败：${JSON.stringify(err)}`, LOG_TAG);
     }
     this.fullscreen = false;
+    this.unsubscribeKeyboardPresence();
+    this.unsubscribeKeyboardPresence = () => {};
     this.unsubscribeOpenRequest();
     // 系统手势返回 / 关闭终端窗口等未经 onBack 的离开路径：同样只转后台不断开（detach 幂等）
     this.vm.detach();
@@ -1924,11 +1941,12 @@ struct TerminalPage {
         .width('100%')
         .layoutWeight(1)
         .backgroundColor(this.focusedAppearance().background)
-        // 必须由 PTY 工作区自身扩进导航手势安全区；只给外层 SideBarContainer
-        // 设置 expandSafeArea 只会延伸页面底色，Canvas 仍会停在安全区上沿。
+        // 左右始终扩展；底部只在用户开启且存在实体键盘时扩展。
         .expandSafeArea(
           [SafeAreaType.SYSTEM],
-          [SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END])
+          this.bottomSafeAreaEnabled()
+            ? [SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END]
+            : [SafeAreaEdge.START, SafeAreaEdge.END])
         .onAreaChange((_oldArea: Area, newArea: Area) => {
           this.paneAreaW = areaLengthToVp(newArea.width);
           this.paneAreaH = areaLengthToVp(newArea.height);
@@ -2021,11 +2039,13 @@ struct TerminalPage {
     // 只保留系统状态栏安全区，不再叠加页面外部空隙。
     .padding({ top: this.terminalTopInsetVp })
     .backgroundColor(this.focusedAppearance().background)
-    // 展开 BOTTOM/START/END：左右与底部手势条不再露出窗口默认底（#03060A）。
-    // 不展开 TOP 是因为顶栏只有 space.sm 的上内边距，钻到状态栏下会跟时钟打架
+    // 左右始终扩展；底部安全距离由用户设置与实体键盘状态共同决定。
+    // 不展开 TOP，避免终端顶栏与系统状态栏重叠。
     .expandSafeArea(
       [SafeAreaType.SYSTEM],
-      [SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END])
+      this.bottomSafeAreaEnabled()
+        ? [SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END]
+        : [SafeAreaEdge.START, SafeAreaEdge.END])
   }
 
   /** 连接列表小图标：三行「点 + 横线」，比汉堡符更像会话清单。 */
@@ -2055,7 +2075,7 @@ struct TerminalPage {
    */
   @Builder
   KeyBarSlot() {
-    // 扩进底部安全区：PTY 区 expandSafeArea 后，键条自身也要占到手势条上方
+    // 键条与 PTY 使用同一底部策略；无实体键盘或用户关闭时不再预留。
     Column() {
       KeyBar({
         stickyModifiers: this.stickyModifiers,
@@ -2076,7 +2096,7 @@ struct TerminalPage {
         .width('100%')
     }
     .width('100%')
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
+    .expandSafeArea([SafeAreaType.SYSTEM], this.bottomSafeAreaEnabled() ? [SafeAreaEdge.BOTTOM] : [])
   }
 
   /** 沉浸式顶栏：返回 + 终端标题/主机名 + 状态点/文案 + 抽屉开关 */
@@ -2100,6 +2120,7 @@ struct TerminalPage {
       Column() {
         Text(this.topBarTitle())
           .fontSize(Tokens.fontSize.title)
+          .fontWeight(FontWeight.Medium)
           .fontColor(this.chromeText())
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2140,6 +2161,7 @@ struct TerminalPage {
       })
       .backgroundColor(this.chromeOverlay())
       .borderRadius(Tokens.radius.sm)
+      .constraintSize({ minHeight: Tokens.size.controlSm })
       .margin({ left: Tokens.space.xs })
 
       if (this.currentSessionId.length > 0) {
@@ -2254,6 +2276,7 @@ struct TerminalPage {
       right: Tokens.space.xs
     })
     .backgroundColor(this.focusedAppearance().background)
+    .border({ width: { bottom: Tokens.size.strokeThin }, color: this.chromeOverlay() })
     .clip(true)
   }
 

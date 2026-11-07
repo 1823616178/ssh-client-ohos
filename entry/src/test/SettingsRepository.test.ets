@@ -23,6 +23,7 @@ const EXPECTED_DEFS: ExpectedDef[] = [
   { key: 'screenOffDisconnectMinutes', type: 'number', defaultValue: 0 },
   { key: 'keepScreenOnMode', type: 'string', defaultValue: 'session' },
   { key: 'hapticEnabled', type: 'boolean', defaultValue: true },
+  { key: 'safeAreaEnabled', type: 'boolean', defaultValue: true },
   { key: 'keyBarLayout', type: 'string', defaultValue: '' },
   { key: 'lastSessionId', type: 'string', defaultValue: '' },
   { key: 'syncPollIntervalMinutes', type: 'number', defaultValue: 15 },

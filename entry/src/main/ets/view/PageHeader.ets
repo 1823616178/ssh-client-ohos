@@ -1,13 +1,15 @@
 /**
  * PageHeader —— 二级页统一顶栏（UI 收敛 P0）。
  *
- * 版式：36×36 返回钮（Tokens.fontSize.display 的「‹」）+ 中文标题/可选副标题 + 右侧动作。
+ * 版式：40×40 返回钮（Tokens.fontSize.display 的「‹」）+ 中文标题/可选副标题 + 右侧动作。
  * 标题只用产品中文：设置 / 密钥管理 / 外观 / 开源许可 / 配置中心 / 文件传输 /
  * 端口转发 / 账号与同步 等；禁止全大写英文眉题。颜色尺寸一律 Design Token。
+ * 次级按钮使用细描边，页头底部以同色分隔线收束内容区。
  * 右侧动作建议 ≤2 个；主操作 primary=true（accent 底 + onAccent 字）。
  */
 
 import { Tokens } from '../theme/Tokens';
+import { Motion } from '../theme/Motion';
 
 /** 顶栏右侧动作（最多建议 2 个） */
 export interface PageHeaderAction {
@@ -44,10 +46,12 @@ export struct PageHeader {
               .fontWeight(FontWeight.Regular)
           }
           .backgroundColor(Tokens.Color.surface)
+          .border({ width: Tokens.size.strokeThin, color: Tokens.Color.border })
           .borderRadius(Tokens.radius.sm)
-          .width(36)
-          .height(36)
+          .width(Tokens.size.control)
+          .height(Tokens.size.control)
           .accessibilityText(this.backLabel)
+          .clickEffect(Motion.pressEffect())
           .onClick(() => {
             this.getUIContext().getRouter().back();
           })
@@ -77,13 +81,18 @@ export struct PageHeader {
           Button(action.label)
             .fontSize(Tokens.fontSize.caption)
             .fontColor(action.primary === true ? Tokens.Color.onAccent : Tokens.Color.text)
-            .backgroundColor(action.primary === true ? Tokens.Color.accent : Tokens.Color.surfaceHover)
+            .backgroundColor(action.primary === true ? Tokens.Color.accent : Tokens.Color.surface)
+            .border({
+              width: Tokens.size.strokeThin,
+              color: action.primary === true ? Tokens.Color.accent : Tokens.Color.border
+            })
             .borderRadius(Tokens.radius.sm)
-            .height(36)
+            .height(Tokens.size.control)
             .padding({ left: Tokens.space.sm, right: Tokens.space.sm })
             .enabled(!(action.disabled === true))
             .opacity(action.disabled === true ? 0.45 : 1)
             .accessibilityText(action.accessibilityText === undefined ? action.label : action.accessibilityText)
+            .clickEffect(Motion.pressEffect())
             .margin({ left: Tokens.space.xs })
             .onClick(() => {
               if (action.disabled !== true) {
@@ -94,8 +103,15 @@ export struct PageHeader {
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
-      .padding(Tokens.space.md)
+      .padding({
+        left: Tokens.space.md,
+        right: Tokens.space.md,
+        top: Tokens.space.sm,
+        bottom: Tokens.space.sm
+      })
     }
     .width('100%')
+    .backgroundColor(Tokens.Color.appBg)
+    .border({ width: { bottom: Tokens.size.strokeThin }, color: Tokens.Color.border })
   }
 }

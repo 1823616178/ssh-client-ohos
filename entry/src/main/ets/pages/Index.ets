@@ -273,6 +273,14 @@ struct Index {
 
   build() {
     Stack() {
+      // 常驻背景覆盖导航区，不随开屏和工作台缩放、淡出，避免退场时露出白底。
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Tokens.Color.appBg)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .hitTestBehavior(HitTestMode.None)
+
       Column() {
         if (!useHostListSidebar(this.breakpoint)) {
           // sm：单栏，活动会话在底部迷你面板打开
@@ -399,9 +407,11 @@ struct Index {
       }
     }
     .width('100%')
-    .height('100%')
+    .height(LayoutPolicy.matchParent)
     .backgroundColor(Tokens.Color.appBg)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    // 底部参与实际布局，避免只扩展背景、内容仍停在导航区上沿。
+    .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.BOTTOM])
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
     .onAreaChange((_old: Area, area: Area) => {
       const width: number = areaLengthToVp(area.width);
       const next: AppBreakpoint = appBreakpointOfWidth(width);
@@ -598,6 +608,10 @@ struct Index {
                   ? Tokens.Color.accent : Tokens.Color.surfaceHover)
                 .borderRadius(Tokens.radius.xs)
                 .animation({ duration: Motion.duration(Motion.BASE_MS), curve: Curve.FastOutSlowIn })
+                .layoutWeight(1)
+                .textAlign(TextAlign.Center)
+                .maxLines(1)
+                .constraintSize({ minHeight: Tokens.size.controlSm })
                 .padding({
                   left: Tokens.space.sm,
                   right: Tokens.space.sm,

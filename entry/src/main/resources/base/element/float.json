@@ -41,6 +41,18 @@
       "value": "32vp"
     },
     {
+      "name": "control_sm",
+      "value": "36vp"
+    },
+    {
+      "name": "control_regular",
+      "value": "40vp"
+    },
+    {
+      "name": "stroke_thin",
+      "value": "1vp"
+    },
+    {
       "name": "font_caption",
       "value": "12fp"
     },

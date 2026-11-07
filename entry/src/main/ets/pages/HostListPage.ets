@@ -569,6 +569,7 @@ export struct HostListPage {
     .width('100%')
     .padding({ left: Tokens.space.md, right: Tokens.space.xs, top: Tokens.space.sm, bottom: Tokens.space.xs })
     .backgroundColor(Tokens.Color.surface)
+    .border({ width: Tokens.size.strokeThin, color: Tokens.Color.border })
     .borderRadius(Tokens.radius.md)
     .margin({ top: Tokens.space.sm })
   }
@@ -677,7 +678,7 @@ export struct HostListPage {
           .placeholderColor(Tokens.Color.textFaint)
           .backgroundColor(Tokens.Color.surface)
           .borderRadius(Tokens.radius.sm)
-          .height(42)
+          .height(Tokens.size.control)
           .layoutWeight(1)
           .onChange((value: string) => {
             this.searchText = value;
@@ -690,8 +691,8 @@ export struct HostListPage {
             .fontColor(Tokens.Color.textDim)
             .backgroundColor(Tokens.Color.surface)
             .borderRadius(Tokens.radius.sm)
-            .width(42)
-            .height(42)
+            .width(Tokens.size.control)
+            .height(Tokens.size.control)
             .margin({ left: Tokens.space.xs })
             .accessibilityText('清除搜索')
             .onClick(() => {
@@ -772,7 +773,6 @@ export struct HostListPage {
         .layoutWeight(1)
         .margin({ top: Tokens.space.xs })
         .scrollBar(BarState.Off)
-        .contentEndOffset(Tokens.space.md)
       }
     }
     .width('100%')
@@ -809,6 +809,7 @@ export struct HostListPage {
       bottom: Tokens.space.xs
     })
     .backgroundColor(Tokens.Color.surface)
+    .border({ width: Tokens.size.strokeThin, color: Tokens.Color.border })
     .borderRadius(Tokens.radius.sm)
     .margin({ right: Tokens.space.xs })
     .accessibilityText(`云同步：${this.syncChipSub}`)
@@ -824,11 +825,12 @@ export struct HostListPage {
         .fontSize(Tokens.fontSize.title)
         .fontColor(Tokens.Color.textDim)
     }
-    .width(36)
-    .height(36)
+    .width(Tokens.size.control)
+    .height(Tokens.size.control)
     .justifyContent(FlexAlign.Center)
     .alignItems(VerticalAlign.Center)
     .backgroundColor(Tokens.Color.surface)
+    .border({ width: Tokens.size.strokeThin, color: Tokens.Color.border })
     .borderRadius(Tokens.radius.sm)
     .margin({ right: Tokens.space.xs })
     .accessibilityText('设置')
@@ -845,11 +847,12 @@ export struct HostListPage {
         .fontSize(Tokens.fontSize.title)
         .fontColor(Tokens.Color.textDim)
     }
-    .width(36)
-    .height(36)
+    .width(Tokens.size.control)
+    .height(Tokens.size.control)
     .justifyContent(FlexAlign.Center)
     .alignItems(VerticalAlign.Center)
     .backgroundColor(Tokens.Color.surface)
+    .border({ width: Tokens.size.strokeThin, color: Tokens.Color.border })
     .borderRadius(Tokens.radius.sm)
     .margin({ right: Tokens.space.xs })
     .accessibilityText('配置中心')
@@ -868,8 +871,8 @@ export struct HostListPage {
         .fontWeight(FontWeight.Regular)
         .textAlign(TextAlign.Center)
     }
-    .width(36)
-    .height(36)
+    .width(Tokens.size.control)
+    .height(Tokens.size.control)
     .justifyContent(FlexAlign.Center)
     .alignItems(VerticalAlign.Center)
     .backgroundColor(Tokens.Color.accent)
@@ -918,7 +921,7 @@ export struct HostListPage {
             .placeholderColor(Tokens.Color.textFaint)
             .backgroundColor(Tokens.Color.surfaceHover)
             .borderRadius(Tokens.radius.sm)
-            .height(42)
+            .height(Tokens.size.control)
             .layoutWeight(2)
             .onChange((value: string) => {
               this.quickAddress = value;
@@ -929,7 +932,7 @@ export struct HostListPage {
             .placeholderColor(Tokens.Color.textFaint)
             .backgroundColor(Tokens.Color.surfaceHover)
             .borderRadius(Tokens.radius.sm)
-            .height(42)
+            .height(Tokens.size.control)
             .layoutWeight(1)
             .margin({ left: Tokens.space.xs })
             .onChange((value: string) => {
@@ -946,7 +949,7 @@ export struct HostListPage {
           .backgroundColor(this.viewModel.hosts.length === 0
             ? Tokens.Color.accent : Tokens.Color.surfaceHover)
           .borderRadius(Tokens.radius.sm)
-          .height(this.viewModel.hosts.length === 0 ? 42 : 36)
+          .height(this.viewModel.hosts.length === 0 ? Tokens.size.control : Tokens.size.controlSm)
           .width('100%')
           .margin({ top: Tokens.space.sm })
           .onClick(() => {
@@ -955,6 +958,7 @@ export struct HostListPage {
       }
       .alignItems(HorizontalAlign.Start)
       .backgroundColor(Tokens.Color.surface)
+      .border({ width: Tokens.size.strokeThin, color: Tokens.Color.border })
       .borderRadius(Tokens.radius.md)
       .padding(Tokens.space.md)
       .width('100%')
@@ -1068,8 +1072,8 @@ export struct HostListPage {
       // 双栏选中高亮：底色 + 描边随切换服务器平滑过渡
       .backgroundColor(this.isRowSelected(row) ? Tokens.Color.accentMuted : Tokens.Color.surface)
       .border({
-        width: 1,
-        color: this.isRowSelected(row) ? Tokens.Color.accent : Tokens.Color.surface
+        width: Tokens.size.strokeThin,
+        color: this.isRowSelected(row) ? Tokens.Color.accent : Tokens.Color.border
       })
       .borderRadius(Tokens.radius.sm)
       .animation({ duration: Motion.duration(Motion.BASE_MS), curve: Curve.FastOutSlowIn })
@@ -1304,7 +1308,7 @@ export struct HostListPage {
         .fontColor(Tokens.Color.onAccent)
         .backgroundColor(Tokens.Color.accent)
         .borderRadius(Tokens.radius.sm)
-        .height(42)
+        .height(Tokens.size.control)
         .padding({ left: Tokens.space.lg, right: Tokens.space.lg })
         .margin({ top: Tokens.space.lg })
         .onClick(() => {

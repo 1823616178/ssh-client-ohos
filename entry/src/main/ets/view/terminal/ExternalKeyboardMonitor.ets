@@ -5,9 +5,10 @@
  * 与上一次的「物理字母键盘设备集合」比较（纯策略见 PhysicalKeyboard.diffPhysicalKeyboards）：
  *   - 有物理键盘被拔掉 → 广播 'removed'：画布清除「外接键盘活跃」，点按重新弹软键盘；
  *   - 新插入物理键盘 → 广播 'added'：直接进入外接键盘模式，不必等第一次按键。
- * 启动时的基线枚举**不**广播：个别机型会把机身按键报告成字母键盘，若据此置位，
- * 手机上点按终端将永远不弹软键盘——基线只用于后续比较。
- * 单例，首个订阅者到来时 on、最后一个离开时 off；任何系统调用失败只记日志。
+ * 输入模式的 change 订阅在启动基线枚举时不广播：个别机型会把机身按键报告成字母键盘，
+ * 若据此置位，手机上点按终端将永远不弹软键盘——基线只用于后续比较。
+ * 安全区的 presence 订阅独立接收基线与插拔状态，不改变上述输入模式语义。
+ * 单例，首个订阅者到来时 on、最后一类监听全部离开时 off；系统调用失败只记日志。
  */
 import { inputDevice } from '@kit.InputKit';
 import { Logger } from '../../common/utils/Logger';
@@ -16,13 +17,17 @@ import { KeyboardChange, diffPhysicalKeyboards, isPhysicalKeyboardTypeName, keyb
 const LOG_TAG: string = 'ExtKeyboard';
 
 export type ExternalKeyboardListener = (change: KeyboardChange) => void;
+export type PhysicalKeyboardPresenceListener = (present: boolean) => void;
 
 export class ExternalKeyboardMonitor {
   private static instance: ExternalKeyboardMonitor | null = null;
   private readonly listeners: ExternalKeyboardListener[] = [];
+  private readonly presenceListeners: PhysicalKeyboardPresenceListener[] = [];
   private registered: boolean = false;
   /** 上次枚举到的物理字母键盘 deviceId；null = 尚无基线 */
   private baseline: number[] | null = null;
+  /** 上次向安全区订阅者广播的存在状态；null = 尚未广播 */
+  private presence: boolean | null = null;
   private readonly onChange = (_data: inputDevice.DeviceListener): void => {
     this.refresh();
   };
@@ -36,29 +41,60 @@ export class ExternalKeyboardMonitor {
 
   subscribe(cb: ExternalKeyboardListener): () => void {
     this.listeners.push(cb);
-    if (!this.registered) {
-      this.registered = true;
-      try {
-        inputDevice.on('change', this.onChange);
-      } catch (err) {
-        Logger.warn(`订阅输入设备变化失败：${JSON.stringify(err)}`, LOG_TAG);
-      }
-      this.refresh();
-    }
+    this.startMonitoring();
     return (): void => {
       const i: number = this.listeners.indexOf(cb);
       if (i >= 0) {
         this.listeners.splice(i, 1);
       }
-      if (this.listeners.length === 0 && this.registered) {
-        this.registered = false;
-        try {
-          inputDevice.off('change', this.onChange);
-        } catch (err) {
-          Logger.warn(`取消订阅输入设备变化失败：${JSON.stringify(err)}`, LOG_TAG);
-        }
-      }
+      this.stopMonitoringIfIdle();
     };
+  }
+
+  /** 当前是否存在实体字母键盘；首次异步枚举完成前为 false。 */
+  hasPhysicalKeyboard(): boolean {
+    return this.baseline !== null && this.baseline.length > 0;
+  }
+
+  /** 底部安全区专用：首帧基线与后续插拔都通知，不影响输入模式原有的 change 订阅。 */
+  subscribePresence(cb: PhysicalKeyboardPresenceListener): () => void {
+    this.presenceListeners.push(cb);
+    if (this.baseline !== null) {
+      cb(this.baseline.length > 0);
+    }
+    this.startMonitoring();
+    return (): void => {
+      const i: number = this.presenceListeners.indexOf(cb);
+      if (i >= 0) {
+        this.presenceListeners.splice(i, 1);
+      }
+      this.stopMonitoringIfIdle();
+    };
+  }
+
+  private startMonitoring(): void {
+    if (this.registered) {
+      return;
+    }
+    this.registered = true;
+    try {
+      inputDevice.on('change', this.onChange);
+    } catch (err) {
+      Logger.warn(`订阅输入设备变化失败：${JSON.stringify(err)}`, LOG_TAG);
+    }
+    this.refresh();
+  }
+
+  private stopMonitoringIfIdle(): void {
+    if (this.listeners.length > 0 || this.presenceListeners.length > 0 || !this.registered) {
+      return;
+    }
+    this.registered = false;
+    try {
+      inputDevice.off('change', this.onChange);
+    } catch (err) {
+      Logger.warn(`取消订阅输入设备变化失败：${JSON.stringify(err)}`, LOG_TAG);
+    }
   }
 
   /** 重新枚举设备并广播（插拔回调与首次订阅时调用） */
@@ -69,6 +105,14 @@ export class ExternalKeyboardMonitor {
       }
       const previous: number[] | null = this.baseline;
       this.baseline = ids;
+      const present: boolean = ids.length > 0;
+      if (this.presence !== present) {
+        this.presence = present;
+        const presenceSnapshot: PhysicalKeyboardPresenceListener[] = this.presenceListeners.slice();
+        for (const cb of presenceSnapshot) {
+          cb(present);
+        }
+      }
       if (previous === null) {
         return; // 基线不广播（见头注）
       }

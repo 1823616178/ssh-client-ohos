@@ -1,11 +1,8 @@
 /**
  * SettingsPage —— 通用设置（DESIGN §8）。
  *
- * 本次只落「后台与续航」一段（P1 的两个设置键此前没有任何界面可改）：
- *   - 后台保持连接（`keepAliveInBackground`，默认开）
- *   - 息屏 N 分钟后断开（`screenOffDisconnectMinutes`，默认关）
- *   - 终端页屏幕常亮（`keepScreenOnMode`，默认「有会话时」）
- * 主题 / 字号 / 关于 / 开源许可等留给后续任务往下追加分段。
+ * 设置分组：后台与续航、界面与操作、工具入口、关于与合规。
+ * 底部安全距离为本机偏好（`safeAreaEnabled`）；无实体键盘时页面自动按关闭处理。
  *
  * 改动即时生效：写 preferences 之后立刻 `BackgroundKeepAlive.refreshSettings()`，
  * 由策略机按新设置纠正当前姿态（例如在后台关掉保活开关 → 立即还电并走宽限断开），
@@ -42,6 +39,7 @@ struct SettingsPage {
   @Local private keepAliveInBackground: boolean = true;
   @Local private screenOffMinutes: number = 0;
   @Local private keepScreenOnMode: KeepScreenOnMode = 'session';
+  @Local private safeAreaEnabled: boolean = true;
 
   aboutToAppear(): void {
     this.reload();
@@ -55,6 +53,7 @@ struct SettingsPage {
     this.keepAliveInBackground = SettingsRepository.isKeepAliveInBackground();
     this.screenOffMinutes = SettingsRepository.getScreenOffDisconnectMinutes();
     this.keepScreenOnMode = SettingsRepository.getKeepScreenOnMode();
+    this.safeAreaEnabled = SettingsRepository.isSafeAreaEnabled();
   }
 
   /** 常亮档位落库 + 通知常亮服务（当前若正开着终端页，立刻按新档生效） */
@@ -95,14 +94,14 @@ struct SettingsPage {
     Column() {
       PageHeader({
         title: t(I18nKeys.SETTINGS_TITLE, '设置'),
-        subtitle: '后台续航、工具与关于',
+        subtitle: '界面、后台续航、工具与关于',
         backLabel: t(I18nKeys.NAV_BACK, '返回')
       })
-
 
       Scroll() {
         Column() {
           this.BackgroundSection()
+          this.DisplaySection()
           this.ToolsSection()
           this.AboutSection()
         }
@@ -197,6 +196,46 @@ struct SettingsPage {
     .borderRadius(Tokens.radius.md)
     .padding(Tokens.space.md)
     .width('100%')
+  }
+
+  /** 界面与操作 */
+  @Builder
+  DisplaySection() {
+    Column() {
+      Text('界面与操作')
+        .fontSize(Tokens.fontSize.title)
+        .fontColor(Tokens.Color.text)
+        .margin({ bottom: Tokens.space.xs2 })
+
+      Row() {
+        Column() {
+          Text('底部安全距离')
+            .fontSize(Tokens.fontSize.body)
+            .fontColor(Tokens.Color.text)
+          Text('无实体键盘时自动关闭；关闭后页面延伸至屏幕底部')
+            .fontSize(Tokens.fontSize.caption)
+            .fontColor(Tokens.Color.textDim)
+            .margin({ top: Tokens.space.xs2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.safeAreaEnabled })
+          .selectedColor(Tokens.Color.accent)
+          .onChange((isOn: boolean) => {
+            this.safeAreaEnabled = isOn;
+            SettingsRepository.setSafeAreaEnabled(isOn);
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .alignItems(HorizontalAlign.Start)
+    .backgroundColor(Tokens.Color.surface)
+    .borderRadius(Tokens.radius.md)
+    .padding(Tokens.space.md)
+    .width('100%')
+    .margin({ top: Tokens.space.sm })
   }
 
   /** 密钥 / 外观 / 配置工具入口 */
